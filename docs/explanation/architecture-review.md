@@ -1,5 +1,15 @@
 # Architecture Review (v0.1.3)
 
+> **Status (branch `claude/repo-architecture-review-jmqao6`):** every finding below has been addressed in code except the items listed under *Left open*. The workspace builds on Linux without GTK, `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` are clean, and all 745 tests pass (crt-core 21, crt-renderer 229, crt-theme 121, binary 287, integration 87).
+>
+> **Left open**
+> - The theme → backdrop-effect patch path still passes a string `EffectConfig` (D4's typed patch enum); CSS values themselves are now parsed typed, so the remaining string hop is lossless for numbers and colours.
+> - `src/bin/benchmark*.rs` are unchanged (still CPU-only loops; `CRT_BENCHMARK` is still read nowhere) and there is no headless full-frame benchmark yet.
+> - Linux golden images for the visual tests were not generated (no GPU in the review environment). Visual tests now use the bundled font and fail rather than skip when `CRT_REQUIRE_GPU=1`; CI sets it only on macOS.
+> - OSC 133 zones now follow scrolled text, but only until the scrollback buffer is full (absolute line indices stop advancing at the cap).
+>
+> **Not verified at runtime here.** This environment has no display or GPU, so the frame scheduler, the separable glow, HiDPI layout, the macOS `proc_pidinfo` cwd lookup and the input changes were validated by unit tests and review only. A manual smoke test on macOS and Linux is advised: idle CPU at 0 % with a static theme, 60 fps with the synthwave grid, tab switching, `ls --color` backgrounds, zsh paste, and Ctrl+C on Linux.
+
 A deep read of the whole workspace (~39k lines across `crt-core`, `crt-renderer`, `crt-theme` and the `crt` binary), aimed at two questions: where are the real bugs, and where is the code spending time or memory it does not need to. Every finding below was verified against the source at the cited line, and several theme-parser findings were additionally confirmed by executing the parser on the inputs described.
 
 The short version: the architecture is sound and the crate split is right. The problems are concentrated in a few places: the event loop never sleeps, the render loop redraws everything every frame and has a dead damage-tracking path, one class of GPU buffer is shared between passes in a way wgpu does not allow, and the CSS pipeline round-trips every value through strings three times. On Linux, keyboard handling is broken badly enough that the app is not usable as a shell.
