@@ -34,23 +34,24 @@ pub use effects::{
     BackdropEffect, EffectConfig, EffectsRenderer, GridEffect, MatrixEffect, MotionBehavior,
     ParticleEffect, Position, RainEffect, ShapeEffect, SpriteEffect, StarfieldEffect,
 };
-pub use golden::{ComparisonResult, assert_visual_match, compare_images, compare_with_golden, golden_path};
-pub use headless::{HeadlessError, HeadlessRenderer};
+pub use frame_arena::{ArenaSlice, FrameArena};
 pub use glyph_cache::{
     CachedGlyph, FontData, FontVariants, GlyphCache, GlyphKey, GlyphStyle, PositionedGlyph,
 };
-pub use frame_arena::{ArenaSlice, FrameArena};
+pub use golden::{
+    ComparisonResult, assert_visual_match, compare_images, compare_with_golden, golden_path,
+};
 pub use grid_renderer::GridRenderer;
-pub use shared_pipelines::SharedPipelines;
+pub use headless::{HeadlessError, HeadlessRenderer};
 pub use mock::{MockRenderer, RenderCall};
 pub use rect_renderer::RectRenderer;
+pub use shared_pipelines::SharedPipelines;
 pub use sprite_renderer::{
     OriginalSpriteValues, SpriteAnimationState, SpriteConfig, SpriteMotion, SpriteOverlayState,
     SpritePosition, SpriteRenderer, SpriteSheet, SpriteTexture,
 };
 pub use tab_bar::{
     DragFeedback, DragMode, EditState, Tab, TabBar, TabBarState, TabLayout, TabRect,
-    VelloTabBarRenderer,
 };
 pub use terminal_vello::{CursorShape, CursorState, TerminalVelloRenderer};
 pub use traits::{
@@ -152,7 +153,7 @@ pub struct BackgroundImageUniforms {
     pub uv_transform: [f32; 4],
     /// Opacity (0-1)
     pub opacity: f32,
-    /// Padding for alignment
+    /// `[repeat_x, repeat_y, 0]` flags (read by the shader) plus alignment padding
     pub _pad: [f32; 3],
 }
 
@@ -163,7 +164,10 @@ pub struct BackgroundImagePipeline {
 }
 
 impl BackgroundImagePipeline {
-    pub fn new_with_shared(device: &wgpu::Device, shared: &Arc<SharedBackgroundImagePipeline>) -> Self {
+    pub fn new_with_shared(
+        device: &wgpu::Device,
+        shared: &Arc<SharedBackgroundImagePipeline>,
+    ) -> Self {
         let uniforms = BackgroundImageUniforms {
             uv_transform: [1.0, 1.0, 0.0, 0.0],
             opacity: 1.0,
@@ -187,10 +191,13 @@ impl BackgroundImagePipeline {
         Self::new_with_shared(device, &shared)
     }
 
+    /// Bind the image with its own sampler (address modes follow the theme's
+    /// `background-repeat`).
     pub fn create_bind_group(
         &self,
         device: &wgpu::Device,
         texture_view: &wgpu::TextureView,
+        sampler: &wgpu::Sampler,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Background Image Bind Group"),
@@ -206,17 +213,25 @@ impl BackgroundImagePipeline {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&self.shared.sampler),
+                    resource: wgpu::BindingResource::Sampler(sampler),
                 },
             ],
         })
     }
 
-    pub fn update_uniforms(&self, queue: &wgpu::Queue, uv_transform: [f32; 4], opacity: f32) {
+    /// `repeat` is `[repeat_x, repeat_y]` as 0/1 flags; the shader discards
+    /// samples outside the image on axes that do not repeat.
+    pub fn update_uniforms(
+        &self,
+        queue: &wgpu::Queue,
+        uv_transform: [f32; 4],
+        opacity: f32,
+        repeat: [f32; 2],
+    ) {
         let uniforms = BackgroundImageUniforms {
             uv_transform,
             opacity,
-            _pad: [0.0; 3],
+            _pad: [repeat[0], repeat[1], 0.0],
         };
         queue.write_buffer(&self.uniform_buffer, 0, cast_slice(&[uniforms]));
     }
@@ -516,7 +531,6 @@ impl EffectPipeline {
         self.background.update_uniforms(queue, width, height);
         self.composite.update_uniforms(queue, width, height);
     }
-
 }
 
 /// Reference height for resolution-independent CRT effects (1080p baseline)

@@ -3,6 +3,11 @@
 //! The EffectsRenderer maintains a collection of backdrop effects,
 //! updates their animation state each frame, and renders them to a
 //! texture via the shared Vello renderer.
+//!
+//! Rendering is lazy: the vello scene is only re-encoded and re-rendered
+//! when something changed (configuration, target size, or an enabled effect
+//! that is actually animated). Static effects are rendered once and the
+//! cached target texture is reused on subsequent frames.
 
 use std::sync::{Arc, Mutex};
 
@@ -46,14 +51,24 @@ pub struct EffectsRenderer {
     /// Current target size
     target_size: (u32, u32),
 
-    /// Total elapsed time
-    time: f32,
+    /// Total elapsed time in seconds.
+    ///
+    /// Stored as `f64`: an `f32` accumulator quantises to ~4 ms after
+    /// roughly 18 hours and stops advancing entirely after ~6 days.
+    time: f64,
 
     /// Shared blit pipeline objects (pipeline, bind group layout, sampler)
     shared_blit: Arc<SharedEffectsBlitPipeline>,
 
     /// Current bind group (recreated when texture changes)
     blit_bind_group: Option<wgpu::BindGroup>,
+
+    /// Whether the scene must be re-rendered on the next `render()` call.
+    ///
+    /// Set by configuration changes, effect list changes, target recreation
+    /// and by `update()` whenever any enabled effect is animated. Cleared
+    /// after a successful vello render.
+    needs_render: bool,
 }
 
 impl EffectsRenderer {
@@ -72,6 +87,7 @@ impl EffectsRenderer {
             time: 0.0,
             shared_blit: shared_blit.clone(),
             blit_bind_group: None,
+            needs_render: true,
         }
     }
 
@@ -88,15 +104,21 @@ impl EffectsRenderer {
     /// Add an effect to the renderer
     pub fn add_effect(&mut self, effect: Box<dyn BackdropEffect>) {
         self.effects.push(effect);
+        self.needs_render = true;
     }
 
     /// Remove all effects
     pub fn clear_effects(&mut self) {
         self.effects.clear();
+        self.needs_render = true;
     }
 
     /// Get a mutable reference to effects for configuration
+    ///
+    /// Any mutation through this reference is assumed to change the output,
+    /// so the next `render()` re-renders the scene.
     pub fn effects_mut(&mut self) -> &mut Vec<Box<dyn BackdropEffect>> {
+        self.needs_render = true;
         &mut self.effects
     }
 
@@ -123,6 +145,8 @@ impl EffectsRenderer {
                 effect.is_enabled()
             );
         }
+
+        self.needs_render = true;
     }
 
     /// Update all effects' animation state
@@ -130,6 +154,7 @@ impl EffectsRenderer {
     /// # Arguments
     /// * `dt` - Delta time since last frame in seconds
     pub fn update(&mut self, dt: f32) {
+        let dt = dt as f64;
         self.time += dt;
 
         for effect in &mut self.effects {
@@ -137,11 +162,40 @@ impl EffectsRenderer {
                 effect.update(dt, self.time);
             }
         }
+
+        if any_animated(&self.effects) {
+            self.needs_render = true;
+        }
     }
 
     /// Check if any effects are enabled
     pub fn has_enabled_effects(&self) -> bool {
         self.effects.iter().any(|e| e.is_enabled())
+    }
+
+    /// Check if any enabled effect changes over time
+    pub fn has_animated_effects(&self) -> bool {
+        any_animated(&self.effects)
+    }
+
+    /// Whether the backdrop needs continuous redraws.
+    ///
+    /// `true` when at least one enabled effect is animated, or when a
+    /// pending change (configure/patch/resize) still has to be rendered.
+    /// The event loop can sleep instead of scheduling frames when this is
+    /// `false`.
+    pub fn is_animating(&self) -> bool {
+        self.needs_render || any_animated(&self.effects)
+    }
+
+    /// Whether the next `render()` call will re-render the vello scene
+    pub fn needs_render(&self) -> bool {
+        self.needs_render
+    }
+
+    /// Force the next `render()` call to re-render the vello scene
+    pub fn mark_dirty(&mut self) {
+        self.needs_render = true;
     }
 
     /// Apply a temporary patch configuration to a specific effect type
@@ -152,6 +206,7 @@ impl EffectsRenderer {
         for effect in &mut self.effects {
             if effect.effect_type() == effect_type {
                 effect.configure(config);
+                self.needs_render = true;
                 log::debug!(
                     "Applied patch to effect '{}' with {} properties",
                     effect_type,
@@ -200,10 +255,17 @@ impl EffectsRenderer {
                 ],
             });
 
+            // Release the old texture explicitly rather than waiting for GC
+            if let Some(old) = self.target_texture.take() {
+                old.destroy();
+            }
+
             self.target_texture = Some(texture);
             self.target_view = Some(view);
             self.blit_bind_group = Some(bind_group);
             self.target_size = (width, height);
+            // Fresh target has no content yet
+            self.needs_render = true;
         }
     }
 
@@ -220,6 +282,10 @@ impl EffectsRenderer {
     }
 
     /// Render all enabled effects to texture
+    ///
+    /// When nothing changed since the last successful render (no
+    /// configuration change, no resize and no animated effect), the vello
+    /// pass is skipped and the cached target is returned as-is.
     ///
     /// Returns the texture view for compositing, or None if no effects are enabled
     /// or the size is invalid.
@@ -242,8 +308,13 @@ impl EffectsRenderer {
             log::info!("Effects render starting: {}x{}", width, height);
         }
 
-        // Ensure target is sized
+        // Ensure target is sized (marks needs_render when recreated)
         self.ensure_target(device, width, height);
+
+        // Nothing changed: reuse the cached target
+        if !self.needs_render {
+            return self.target_view.as_ref();
+        }
 
         // Reset scene for new frame
         self.scene.reset();
@@ -276,6 +347,9 @@ impl EffectsRenderer {
             return None;
         }
 
+        // Only clear the flag after a successful render so a failed frame is retried
+        self.needs_render = false;
+
         // Log success once
         static LOGGED2: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !LOGGED2.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -283,89 +357,6 @@ impl EffectsRenderer {
         }
 
         self.target_view.as_ref()
-    }
-
-    /// Render all enabled effects directly to a target texture view
-    ///
-    /// This renders the effects scene directly to the provided target view,
-    /// which can be the frame's surface texture for direct rendering.
-    ///
-    /// Returns true if rendering occurred, false if skipped (no effects enabled
-    /// or invalid size).
-    pub fn render_to_view(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        target_view: &wgpu::TextureView,
-        width: u32,
-        height: u32,
-    ) -> bool {
-        // Skip if no effects enabled or invalid size
-        if !self.has_enabled_effects() || width == 0 || height == 0 {
-            return false;
-        }
-
-        // Prepare GPU resources for effects that need them (e.g., texture registration)
-        let mut did_gpu_setup = false;
-        {
-            let mut renderer_guard = match self.vello_renderer.lock() {
-                Ok(guard) => guard,
-                Err(_) => return false,
-            };
-            let renderer = match renderer_guard.as_mut() {
-                Some(r) => r,
-                None => return false,
-            };
-            for effect in &mut self.effects {
-                if effect.needs_gpu_resources() {
-                    effect.prepare_gpu_resources(device, queue, renderer);
-                    did_gpu_setup = true;
-                }
-            }
-        }
-
-        // Skip rendering on frames where we registered textures to avoid encoder conflicts
-        if did_gpu_setup {
-            log::debug!("Skipping render frame after GPU resource setup");
-            return false;
-        }
-
-        // Reset scene for new frame
-        self.scene.reset();
-
-        // Build scene from all enabled effects
-        let bounds = Rect::new(0.0, 0.0, width as f64, height as f64);
-
-        for effect in &self.effects {
-            if effect.is_enabled() {
-                effect.render(&mut self.scene, bounds);
-            }
-        }
-
-        // Render scene directly to target via shared Vello renderer
-        let mut renderer_guard = match self.vello_renderer.lock() {
-            Ok(guard) => guard,
-            Err(_) => return false,
-        };
-        let renderer = match renderer_guard.as_mut() {
-            Some(r) => r,
-            None => return false,
-        };
-
-        let params = RenderParams {
-            base_color: peniko::Color::TRANSPARENT,
-            width,
-            height,
-            antialiasing_method: AaConfig::Area,
-        };
-
-        match renderer.render_to_texture(device, queue, &self.scene, target_view, &params) {
-            Ok(_) => true,
-            Err(e) => {
-                log::error!("Failed to render effects to view: {:?}", e);
-                false
-            }
-        }
     }
 
     /// Get the current render target texture view
@@ -378,15 +369,21 @@ impl EffectsRenderer {
         self.target_size
     }
 
-    /// Get total elapsed time
-    pub fn elapsed_time(&self) -> f32 {
+    /// Get total elapsed time in seconds
+    pub fn elapsed_time(&self) -> f64 {
         self.time
     }
 
     /// Reset elapsed time
     pub fn reset_time(&mut self) {
         self.time = 0.0;
+        self.needs_render = true;
     }
+}
+
+/// True when at least one enabled effect reports itself as animated
+fn any_animated(effects: &[Box<dyn BackdropEffect>]) -> bool {
+    effects.iter().any(|e| e.is_enabled() && e.is_animated())
 }
 
 impl Drop for EffectsRenderer {
@@ -395,5 +392,61 @@ impl Drop for EffectsRenderer {
         if let Some(ref texture) = self.target_texture {
             texture.destroy();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal effect for exercising the dirty-tracking logic without a GPU
+    struct StubEffect {
+        enabled: bool,
+        animated: bool,
+    }
+
+    impl BackdropEffect for StubEffect {
+        fn effect_type(&self) -> &'static str {
+            "stub"
+        }
+        fn update(&mut self, _dt: f64, _time: f64) {}
+        fn render(&self, _scene: &mut Scene, _bounds: Rect) {}
+        fn configure(&mut self, _config: &EffectConfig) {}
+        fn is_enabled(&self) -> bool {
+            self.enabled
+        }
+        fn is_animated(&self) -> bool {
+            self.animated
+        }
+    }
+
+    fn stub(enabled: bool, animated: bool) -> Box<dyn BackdropEffect> {
+        Box::new(StubEffect { enabled, animated })
+    }
+
+    #[test]
+    fn any_animated_requires_enabled_and_animated() {
+        assert!(!any_animated(&[]));
+        assert!(!any_animated(&[stub(true, false)]));
+        assert!(!any_animated(&[stub(false, true)]));
+        assert!(any_animated(&[stub(true, true)]));
+        assert!(any_animated(&[stub(true, false), stub(true, true)]));
+    }
+
+    #[test]
+    fn default_is_animated_is_true() {
+        struct DefaultStub;
+        impl BackdropEffect for DefaultStub {
+            fn effect_type(&self) -> &'static str {
+                "d"
+            }
+            fn update(&mut self, _dt: f64, _time: f64) {}
+            fn render(&self, _scene: &mut Scene, _bounds: Rect) {}
+            fn configure(&mut self, _config: &EffectConfig) {}
+            fn is_enabled(&self) -> bool {
+                true
+            }
+        }
+        assert!(DefaultStub.is_animated());
     }
 }

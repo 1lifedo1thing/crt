@@ -107,8 +107,7 @@ impl HeadlessRenderer {
 
         // wgpu requires buffer copy rows to be aligned to 256 bytes.
         let unpadded_bytes_per_row = width * 4; // 4 bytes per RGBA pixel
-        let padded_bytes_per_row = (unpadded_bytes_per_row + COPY_BYTES_PER_ROW_ALIGNMENT - 1)
-            / COPY_BYTES_PER_ROW_ALIGNMENT
+        let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(COPY_BYTES_PER_ROW_ALIGNMENT)
             * COPY_BYTES_PER_ROW_ALIGNMENT;
 
         let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -228,9 +227,8 @@ impl HeadlessRenderer {
     pub fn capture_png(&self) -> Result<Vec<u8>, HeadlessError> {
         let pixels = self.capture_frame()?;
 
-        let img: ImageBuffer<Rgba<u8>, _> =
-            ImageBuffer::from_raw(self.width, self.height, pixels)
-                .ok_or_else(|| HeadlessError::PngEncode("pixel buffer size mismatch".into()))?;
+        let img: ImageBuffer<Rgba<u8>, _> = ImageBuffer::from_raw(self.width, self.height, pixels)
+            .ok_or_else(|| HeadlessError::PngEncode("pixel buffer size mismatch".into()))?;
 
         let mut png_bytes = Vec::new();
         let mut cursor = std::io::Cursor::new(&mut png_bytes);
@@ -243,7 +241,10 @@ impl HeadlessRenderer {
     /// Submit a command encoder and immediately capture the frame as raw RGBA.
     ///
     /// Convenience method that submits the encoder, then reads back pixels.
-    pub fn submit_and_capture(&self, encoder: wgpu::CommandEncoder) -> Result<Vec<u8>, HeadlessError> {
+    pub fn submit_and_capture(
+        &self,
+        encoder: wgpu::CommandEncoder,
+    ) -> Result<Vec<u8>, HeadlessError> {
         self.queue.submit(std::iter::once(encoder.finish()));
         self.capture_frame()
     }

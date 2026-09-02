@@ -162,7 +162,8 @@ impl GridRenderer {
     pub fn push_glyphs(&mut self, glyphs: &[PositionedGlyph], color: [f32; 4]) {
         for g in glyphs {
             self.extend_bounds(g);
-            self.instances.push(GlyphInstance::from_positioned(g, color));
+            self.instances
+                .push(GlyphInstance::from_positioned(g, color));
         }
         self.dirty |= !glyphs.is_empty();
     }
@@ -170,7 +171,8 @@ impl GridRenderer {
     /// Add a single positioned glyph
     pub fn push_glyph(&mut self, glyph: &PositionedGlyph, color: [f32; 4]) {
         self.extend_bounds(glyph);
-        self.instances.push(GlyphInstance::from_positioned(glyph, color));
+        self.instances
+            .push(GlyphInstance::from_positioned(glyph, color));
         self.dirty = true;
     }
 

@@ -22,8 +22,10 @@ pub fn render_bell_flash(
         state.gpu.config.height as f32,
     );
 
-    // Flash color from theme with fading alpha based on intensity
-    let flash_color = [color.r / 255.0, color.g / 255.0, color.b / 255.0, intensity];
+    // Flash color from theme (already 0..1 components) with the fading
+    // intensity as alpha.
+    let [r, g, b, _] = color.to_array();
+    let flash_color = [r, g, b, intensity];
 
     // Cover the entire screen
     state.gpu.rect_renderer.push_rect(
@@ -83,7 +85,7 @@ pub fn render_zoom_indicator(
 
     let padding_x = char_width * 1.5;
     let padding_y = line_height * 0.4;
-    let text_width = char_width * text.len() as f32;
+    let text_width = char_width * text.chars().count() as f32;
     let pill_width = text_width + padding_x * 2.0;
     let pill_height = line_height + padding_y * 2.0;
 
@@ -173,7 +175,11 @@ pub fn render_zoom_indicator(
             occlusion_query_set: None,
         });
 
-        state.gpu.tab_title_renderer.render_transient(&shared.queue, &mut pass, &mut state.gpu.arena);
+        state.gpu.tab_title_renderer.render_transient(
+            &shared.queue,
+            &mut pass,
+            &mut state.gpu.arena,
+        );
     }
 }
 
@@ -201,7 +207,7 @@ pub fn render_copy_indicator(
 
     let padding_x = char_width * 1.5;
     let padding_y = line_height * 0.4;
-    let text_width = char_width * text.len() as f32;
+    let text_width = char_width * text.chars().count() as f32;
     let pill_width = text_width + padding_x * 2.0;
     let pill_height = line_height + padding_y * 2.0;
 
@@ -292,7 +298,11 @@ pub fn render_copy_indicator(
             occlusion_query_set: None,
         });
 
-        state.gpu.tab_title_renderer.render_transient(&shared.queue, &mut pass, &mut state.gpu.arena);
+        state.gpu.tab_title_renderer.render_transient(
+            &shared.queue,
+            &mut pass,
+            &mut state.gpu.arena,
+        );
     }
 }
 
@@ -323,7 +333,7 @@ pub fn render_toast(
 
     let padding_x = char_width * 1.5;
     let padding_y = line_height * 0.5;
-    let text_width = char_width * message.len() as f32;
+    let text_width = char_width * message.chars().count() as f32;
     let pill_width = text_width + padding_x * 2.0;
     let pill_height = line_height + padding_y * 2.0;
 
@@ -423,6 +433,10 @@ pub fn render_toast(
             occlusion_query_set: None,
         });
 
-        state.gpu.tab_title_renderer.render_transient(&shared.queue, &mut pass, &mut state.gpu.arena);
+        state.gpu.tab_title_renderer.render_transient(
+            &shared.queue,
+            &mut pass,
+            &mut state.gpu.arena,
+        );
     }
 }

@@ -137,9 +137,14 @@ impl SpriteSheet {
         let rgba = img.to_rgba8();
         let (width, height) = rgba.dimensions();
 
-        // Validate dimensions
-        let expected_width = frame_width * columns;
-        let expected_height = frame_height * rows;
+        // A zero grid or frame count would panic with `% 0` / `/ 0` later
+        let (frame_width, frame_height, columns, rows, frame_count) =
+            Self::sanitize_layout(frame_width, frame_height, columns, rows, frame_count);
+
+        // Validate dimensions (saturating so absurd values fail the check
+        // instead of overflowing)
+        let expected_width = frame_width.saturating_mul(columns);
+        let expected_height = frame_height.saturating_mul(rows);
 
         if width < expected_width || height < expected_height {
             return Err(format!(
@@ -147,9 +152,6 @@ impl SpriteSheet {
                 width, height, columns, rows, frame_width, frame_height
             ));
         }
-
-        let max_frames = columns * rows;
-        let frame_count = frame_count.unwrap_or(max_frames).min(max_frames);
 
         log::info!(
             "Loaded sprite sheet {:?}: {}x{}, {}x{} frames, {} total",
@@ -173,10 +175,36 @@ impl SpriteSheet {
         })
     }
 
+    /// Clamp a frame layout so every derived divisor is at least 1.
+    ///
+    /// Returns `(frame_width, frame_height, columns, rows, frame_count)`.
+    pub fn sanitize_layout(
+        frame_width: u32,
+        frame_height: u32,
+        columns: u32,
+        rows: u32,
+        frame_count: Option<u32>,
+    ) -> (u32, u32, u32, u32, u32) {
+        let columns = columns.max(1);
+        let rows = rows.max(1);
+        let max_frames = columns.saturating_mul(rows);
+        let frame_count = frame_count.unwrap_or(max_frames).clamp(1, max_frames);
+        (
+            frame_width.max(1),
+            frame_height.max(1),
+            columns,
+            rows,
+            frame_count,
+        )
+    }
+
     /// Get UV coordinates for a frame (offset_x, offset_y, size_x, size_y)
     pub fn frame_uv(&self, frame: u32) -> [f32; 4] {
-        let col = frame % self.columns;
-        let row = frame / self.columns;
+        // Guard against hand-built sheets with a zero grid
+        let columns = self.columns.max(1);
+        let frame = frame % self.frame_count.max(1);
+        let col = frame % columns;
+        let row = frame / columns;
 
         let offset_x = (col * self.frame_width) as f32 / self.width as f32;
         let offset_y = (row * self.frame_height) as f32 / self.height as f32;
@@ -246,6 +274,16 @@ struct SpriteUniforms {
     frame_uv: [f32; 4],
     /// Opacity (x), padding (yzw)
     params: [f32; 4],
+}
+
+/// A sprite sheet together with its GPU texture and bind group.
+///
+/// Keeping these together lets `SpriteAnimationState` park the original
+/// sheet while a patch is active and swap it back without re-uploading.
+pub struct LoadedSprite {
+    pub texture: SpriteTexture,
+    pub bind_group: wgpu::BindGroup,
+    pub sheet: Arc<SpriteSheet>,
 }
 
 /// Sprite renderer using raw wgpu
@@ -381,6 +419,28 @@ impl SpriteRenderer {
         log::info!("Sprite sheet loaded and GPU resources created");
     }
 
+    /// Detach the currently loaded sheet and its GPU resources.
+    ///
+    /// The bind group only references the renderer's uniform buffer (which
+    /// outlives it), so it can be re-installed later with `install`.
+    pub fn take_loaded(&mut self) -> Option<LoadedSprite> {
+        let texture = self.texture.take()?;
+        let bind_group = self.bind_group.take()?;
+        let sheet = self.sheet.take()?;
+        Some(LoadedSprite {
+            texture,
+            bind_group,
+            sheet,
+        })
+    }
+
+    /// Re-install a sheet previously detached with `take_loaded`
+    pub fn install(&mut self, loaded: LoadedSprite) {
+        self.texture = Some(loaded.texture);
+        self.bind_group = Some(loaded.bind_group);
+        self.sheet = Some(loaded.sheet);
+    }
+
     /// Check if a sprite sheet is loaded
     pub fn is_loaded(&self) -> bool {
         self.sheet.is_some()
@@ -433,8 +493,8 @@ impl SpriteRenderer {
         let half_w = sprite_w / screen_width;
         let half_h = sprite_h / screen_height;
 
-        // Get frame UV
-        let frame_uv = sheet.frame_uv(frame % sheet.frame_count);
+        // Get frame UV (frame_uv wraps the index itself)
+        let frame_uv = sheet.frame_uv(frame);
 
         let uniforms = SpriteUniforms {
             transform: [ndc_x, ndc_y, half_w, half_h],
@@ -503,6 +563,8 @@ pub struct SpriteAnimationState {
     frame_time_accum: f32,
     /// Seconds per frame
     seconds_per_frame: f32,
+    /// Total elapsed time in seconds (monotonic; drives Wander motion)
+    elapsed: f64,
     /// Current position (for motion)
     pos_x: f32,
     pos_y: f32,
@@ -520,8 +582,9 @@ pub struct SpriteAnimationState {
     patch_applied: bool,
     /// Base directory for resolving relative sprite paths (from theme)
     base_dir: std::path::PathBuf,
-    /// Original sprite sheet for restoration after patch
-    original_sheet: Option<Arc<SpriteSheet>>,
+    /// Original sprite sheet plus its GPU resources, parked while a patch
+    /// with a different sheet is active; swapped back on restore.
+    original_loaded: Option<LoadedSprite>,
 }
 
 impl SpriteAnimationState {
@@ -583,6 +646,7 @@ impl SpriteAnimationState {
             total_frames,
             frame_time_accum: 0.0,
             seconds_per_frame,
+            elapsed: 0.0,
             pos_x: 0.0,
             pos_y: 0.0,
             vel_x,
@@ -593,8 +657,21 @@ impl SpriteAnimationState {
             original_values,
             patch_applied: false,
             base_dir,
-            original_sheet: None,
+            original_loaded: None,
         })
+    }
+
+    /// Wander velocity at a given elapsed time (pixels per second).
+    ///
+    /// Uses a monotonic clock so both components change sign over time;
+    /// deriving "time" from the frame accumulator produced a sawtooth that
+    /// never left the first quarter wave and pinned the sprite to an edge.
+    fn wander_velocity(elapsed: f64, motion_speed: f32) -> (f32, f32) {
+        let t = elapsed as f32;
+        (
+            (t * 0.7).sin() * 100.0 * motion_speed,
+            (t * 1.1).cos() * 60.0 * motion_speed,
+        )
     }
 
     /// Update animation state
@@ -613,11 +690,14 @@ impl SpriteAnimationState {
             self.position_initialized = true;
         }
 
+        self.elapsed += dt as f64;
+
         // Update animation frame
         self.frame_time_accum += dt;
+        let total_frames = self.total_frames.max(1);
         while self.frame_time_accum >= self.seconds_per_frame {
             self.frame_time_accum -= self.seconds_per_frame;
-            self.current_frame = (self.current_frame + 1) % self.total_frames;
+            self.current_frame = (self.current_frame + 1) % total_frames;
         }
 
         // Update position based on motion
@@ -673,9 +753,9 @@ impl SpriteAnimationState {
             }
             SpriteMotion::Wander => {
                 // Simple random-ish wandering using time-based sine waves
-                let time = self.frame_time_accum + self.current_frame as f32 * 0.1;
-                self.vel_x = (time * 0.7).sin() * 100.0 * self.config.motion_speed;
-                self.vel_y = (time * 1.1).cos() * 60.0 * self.config.motion_speed;
+                let (vx, vy) = Self::wander_velocity(self.elapsed, self.config.motion_speed);
+                self.vel_x = vx;
+                self.vel_y = vy;
 
                 self.pos_x += self.vel_x * dt;
                 self.pos_y += self.vel_y * dt;
@@ -788,11 +868,6 @@ impl SpriteAnimationState {
     ) {
         // Handle path change - reload texture
         if let Some(ref new_path) = patch.path {
-            // Store original sheet before replacing
-            if self.original_sheet.is_none() {
-                self.original_sheet = self.renderer.sheet.clone();
-            }
-
             // Resolve the path relative to base_dir (theme directory)
             let full_path = self.base_dir.join(new_path);
 
@@ -808,6 +883,12 @@ impl SpriteAnimationState {
                 self.config.frame_count,
             ) {
                 Ok(sheet) => {
+                    // Park the original sheet + GPU resources (first patch only;
+                    // later patches replace patched sheets, which are dropped)
+                    let previous = self.renderer.take_loaded();
+                    if self.original_loaded.is_none() {
+                        self.original_loaded = previous;
+                    }
                     self.renderer.load_sheet(device, queue, sheet);
                     log::info!("Sprite patch: loaded new sprite sheet");
                 }
@@ -871,20 +952,12 @@ impl SpriteAnimationState {
             return;
         }
 
-        // Restore original sprite sheet if it was changed
-        if let Some(ref original_sheet) = self.original_sheet.take() {
-            // Clone the sheet to reload
-            let sheet = SpriteSheet {
-                data: original_sheet.data.clone(),
-                width: original_sheet.width,
-                height: original_sheet.height,
-                frame_width: original_sheet.frame_width,
-                frame_height: original_sheet.frame_height,
-                columns: original_sheet.columns,
-                rows: original_sheet.rows,
-                frame_count: original_sheet.frame_count,
-            };
-            self.renderer.load_sheet(device, queue, sheet);
+        // Swap the original sheet + texture + bind group back in; no pixel
+        // copy or re-upload is needed.
+        let _ = (device, queue);
+        if let Some(original) = self.original_loaded.take() {
+            self.total_frames = original.sheet.frame_count;
+            self.renderer.install(original);
             log::info!("Restored original sprite sheet");
         }
 
@@ -960,16 +1033,19 @@ impl SpriteOverlayState {
             .map_err(|e| format!("Failed to load overlay sprite {:?}: {}", sprite_path, e))?;
         let (sheet_width, sheet_height) = img.dimensions();
 
-        let frame_width = sheet_width / config.columns;
-        let frame_height = sheet_height / config.rows;
+        // A zero grid would divide by zero here and `% 0` later
+        let columns = config.columns.max(1);
+        let rows = config.rows.max(1);
+        let frame_width = sheet_width / columns;
+        let frame_height = sheet_height / rows;
 
         // Load sprite sheet
         let sheet = SpriteSheet::load(
             &sprite_path,
             frame_width,
             frame_height,
-            config.columns,
-            config.rows,
+            columns,
+            rows,
             None, // Use all frames
         )?;
 
@@ -1085,7 +1161,7 @@ impl SpriteOverlayState {
 
             if self.current_frame >= self.total_frames {
                 self.completed = true;
-                self.current_frame = self.total_frames - 1; // Stay on last frame
+                self.current_frame = self.total_frames.saturating_sub(1); // Stay on last frame
                 log::debug!("Sprite overlay animation completed");
             }
         }
@@ -1138,5 +1214,86 @@ impl SpriteOverlayState {
     /// Get the position type
     pub fn position_type(&self) -> SpriteOverlayPosition {
         self.config.position
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sheet(columns: u32, rows: u32, frame_count: u32) -> SpriteSheet {
+        SpriteSheet {
+            data: Vec::new(),
+            width: 64 * columns.max(1),
+            height: 64 * rows.max(1),
+            frame_width: 64,
+            frame_height: 64,
+            columns,
+            rows,
+            frame_count,
+        }
+    }
+
+    #[test]
+    fn sanitize_layout_clamps_zero_values() {
+        let (fw, fh, cols, rows, count) = SpriteSheet::sanitize_layout(0, 0, 0, 0, Some(0));
+        assert_eq!((fw, fh, cols, rows, count), (1, 1, 1, 1, 1));
+
+        // frame_count is capped at columns * rows and floored at 1
+        let (_, _, _, _, count) = SpriteSheet::sanitize_layout(8, 8, 4, 2, Some(100));
+        assert_eq!(count, 8);
+        let (_, _, _, _, count) = SpriteSheet::sanitize_layout(8, 8, 4, 2, None);
+        assert_eq!(count, 8);
+        let (_, _, _, _, count) = SpriteSheet::sanitize_layout(8, 8, 4, 2, Some(3));
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn frame_uv_does_not_panic_on_zero_grid() {
+        // Hand-built sheet with a zero grid must not hit `% 0`
+        let s = sheet(0, 0, 0);
+        let uv = s.frame_uv(5);
+        assert!(uv.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn frame_uv_wraps_frame_index() {
+        let s = sheet(4, 2, 8);
+        assert_eq!(s.frame_uv(3), s.frame_uv(11));
+        // Frame 4 is first in the second row
+        let uv = s.frame_uv(4);
+        assert!((uv[0] - 0.0).abs() < 1e-6);
+        assert!((uv[1] - 0.5).abs() < 1e-6);
+        assert!((uv[2] - 0.25).abs() < 1e-6);
+        assert!((uv[3] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn wander_velocity_changes_sign_over_time() {
+        // Sample a few seconds of elapsed time: both axes must reverse.
+        let mut seen_pos_x = false;
+        let mut seen_neg_x = false;
+        let mut seen_pos_y = false;
+        let mut seen_neg_y = false;
+        let mut t = 0.0;
+        while t < 10.0 {
+            let (vx, vy) = SpriteAnimationState::wander_velocity(t, 1.0);
+            seen_pos_x |= vx > 1.0;
+            seen_neg_x |= vx < -1.0;
+            seen_pos_y |= vy > 1.0;
+            seen_neg_y |= vy < -1.0;
+            t += 0.05;
+        }
+        assert!(seen_pos_x && seen_neg_x, "x velocity never changed sign");
+        assert!(seen_pos_y && seen_neg_y, "y velocity never changed sign");
+    }
+
+    #[test]
+    fn wander_velocity_keeps_advancing_after_long_uptime() {
+        // A dedicated f64 accumulator keeps moving where the old sawtooth
+        // (frame_time_accum + frame * 0.1) reset every frame.
+        let a = SpriteAnimationState::wander_velocity(100_000.0, 1.0);
+        let b = SpriteAnimationState::wander_velocity(100_000.5, 1.0);
+        assert!((a.0 - b.0).abs() > 1e-3 || (a.1 - b.1).abs() > 1e-3);
     }
 }

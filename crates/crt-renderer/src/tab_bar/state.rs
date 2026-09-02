@@ -93,16 +93,23 @@ impl TabBarState {
     pub fn remove_tab(&mut self, id: u64) -> Option<Tab> {
         let idx = self.tabs.iter().position(|t| t.id == id)?;
         let tab = self.tabs.remove(idx);
-        if !self.tabs.is_empty() {
-            if self.active_tab >= self.tabs.len() {
-                self.active_tab = self.tabs.len() - 1;
-            } else if self.active_tab > idx {
-                self.active_tab -= 1;
-            }
-        } else {
-            self.active_tab = 0;
-        }
+        self.fix_active_after_removal(idx);
         Some(tab)
+    }
+
+    /// Re-anchor `active_tab` after the tab at `removed_idx` was removed.
+    ///
+    /// Shared by `remove_tab` and `close_tab` so both keep the same tab active:
+    /// removing a tab left of the active one shifts the active index down by
+    /// one; removing the active (or a later) tab clamps into range.
+    fn fix_active_after_removal(&mut self, removed_idx: usize) {
+        if self.tabs.is_empty() {
+            self.active_tab = 0;
+        } else if self.active_tab > removed_idx {
+            self.active_tab -= 1;
+        } else if self.active_tab >= self.tabs.len() {
+            self.active_tab = self.tabs.len() - 1;
+        }
     }
 
     /// Insert a pre-existing tab (preserving its ID) at the end.
@@ -112,12 +119,18 @@ impl TabBarState {
 
     /// Insert a pre-existing tab at a specific index.
     pub fn insert_existing_tab(&mut self, tab: Tab, index: usize) {
+        let was_empty = self.tabs.is_empty();
         let index = index.min(self.tabs.len());
         self.tabs.insert(index, tab);
-        // Adjust active_tab if insertion shifted it
-        if self.active_tab >= index {
+        if was_empty {
+            // Nothing was active before; the inserted tab becomes active.
+            self.active_tab = 0;
+        } else if self.active_tab >= index {
+            // Insertion shifted the active tab right by one.
             self.active_tab += 1;
         }
+        // Defensive: never leave the index out of range.
+        self.active_tab = self.active_tab.min(self.tabs.len() - 1);
     }
 
     /// Move a tab from one index to another, updating active_tab to follow.
@@ -156,9 +169,7 @@ impl TabBarState {
 
         if let Some(idx) = self.tabs.iter().position(|t| t.id == id) {
             self.tabs.remove(idx);
-            if self.active_tab >= self.tabs.len() {
-                self.active_tab = self.tabs.len() - 1;
-            }
+            self.fix_active_after_removal(idx);
             return true;
         }
         false
@@ -948,5 +959,62 @@ mod tests {
         target.insert_existing_tab(tab, 1);
         assert_eq!(tab_titles(&target), vec!["X", "B", "Y"]);
         assert_eq!(target.tabs()[1].id, 1); // ID preserved
+    }
+
+    #[test]
+    fn close_tab_left_of_active_keeps_active() {
+        let mut state = make_state_with_tabs(&["A", "B", "C"]);
+        state.select_tab_index(2); // C active
+        assert!(state.close_tab(0)); // close A (left of active)
+        assert_eq!(tab_titles(&state), vec!["B", "C"]);
+        assert_eq!(state.active_tab_index(), 1);
+        assert_eq!(state.active_tab_id(), Some(2));
+        assert_eq!(state.tabs()[state.active_tab_index()].title, "C");
+    }
+
+    #[test]
+    fn close_active_tab_selects_neighbor_in_range() {
+        let mut state = make_state_with_tabs(&["A", "B", "C"]);
+        state.select_tab_index(2);
+        assert!(state.close_tab(2)); // close the active last tab
+        assert_eq!(state.active_tab_index(), 1);
+        state.select_tab_index(0);
+        assert!(state.close_tab(0)); // close active first tab
+        assert_eq!(state.active_tab_index(), 0);
+        assert_eq!(state.tab_count(), 1);
+    }
+
+    #[test]
+    fn close_tab_right_of_active_keeps_active() {
+        let mut state = make_state_with_tabs(&["A", "B", "C"]);
+        state.select_tab_index(0);
+        assert!(state.close_tab(2));
+        assert_eq!(state.active_tab_index(), 0);
+        assert_eq!(state.active_tab_id(), Some(0));
+    }
+
+    #[test]
+    fn insert_existing_tab_into_empty_state_is_active() {
+        let mut state = TabBarState::empty();
+        assert_eq!(state.active_tab_id(), None);
+        state.insert_existing_tab(Tab::new(7, "Only"), 0);
+        assert_eq!(state.active_tab_index(), 0);
+        assert_eq!(state.active_tab_id(), Some(7));
+        assert!(state.active_tab_index() < state.tab_count());
+
+        // Index past the end is clamped and still leaves a valid active tab.
+        let mut state = TabBarState::empty();
+        state.insert_existing_tab(Tab::new(8, "Far"), 42);
+        assert_eq!(state.active_tab_id(), Some(8));
+        assert!(state.active_tab_index() < state.tab_count());
+    }
+
+    #[test]
+    fn remove_last_tab_then_insert_keeps_active_in_range() {
+        let mut state = TabBarState::with_initial_id(5);
+        assert!(state.remove_tab(5).is_some());
+        assert_eq!(state.tab_count(), 0);
+        state.insert_existing_tab(Tab::new(6, "Back"), 0);
+        assert_eq!(state.active_tab_id(), Some(6));
     }
 }

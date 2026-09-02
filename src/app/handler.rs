@@ -14,8 +14,8 @@ use super::{App, WakeReason};
 use crate::input::{
     KeyboardAction,
     drag::{self, TabDragState},
-    handle_cursor_moved, handle_keyboard_input, handle_mouse_input, handle_mouse_wheel,
-    handle_resize, handle_tab_click,
+    handle_cursor_moved_with_modifiers, handle_ime, handle_keyboard_event, handle_mouse_input,
+    handle_mouse_wheel_with_modifiers, handle_resize, handle_tab_click, set_modifiers,
 };
 use crate::render::render_frame;
 use crate::window;
@@ -145,6 +145,11 @@ impl ApplicationHandler<WakeReason> for App {
 
             WindowEvent::ModifiersChanged(m) => {
                 self.modifiers = m;
+                set_modifiers(&self.modifiers);
+            }
+
+            WindowEvent::Ime(ime) => {
+                handle_ime(state, &ime);
             }
 
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
@@ -167,13 +172,8 @@ impl ApplicationHandler<WakeReason> for App {
                 };
 
                 // Delegate to keyboard handler
-                let action = handle_keyboard_input(
-                    state,
-                    &event.logical_key,
-                    event.text.as_ref().map(|s| s.as_str()),
-                    &self.modifiers,
-                    &self.config.keybindings,
-                );
+                let action =
+                    handle_keyboard_event(state, &event, &self.modifiers, &self.config.keybindings);
 
                 // Handle actions that require App-level access
                 match action {
@@ -263,16 +263,12 @@ impl ApplicationHandler<WakeReason> for App {
                     // Resolve drop target across all windows
                     if drag_state.drag_active {
                         if let Some(ref window_rects) = drag_window_rects {
-                            let dragged_idx = state
-                                .gpu
-                                .tab_bar
-                                .tab_index(drag_state.tab_id)
-                                .unwrap_or(0);
+                            let dragged_idx =
+                                state.gpu.tab_bar.tab_index(drag_state.tab_id).unwrap_or(0);
                             let source_id = drag_state.source_window_id;
 
                             // Convert cursor to screen coordinates
-                            let cursor_screen = if let Ok(win_pos) = state.window.inner_position()
-                            {
+                            let cursor_screen = if let Ok(win_pos) = state.window.inner_position() {
                                 winit::dpi::PhysicalPosition::new(
                                     position.x + win_pos.x as f64,
                                     position.y + win_pos.y as f64,
@@ -304,7 +300,12 @@ impl ApplicationHandler<WakeReason> for App {
                         state.window.request_redraw();
                     }
                 }
-                handle_cursor_moved(state, position.x as f32, position.y as f32);
+                handle_cursor_moved_with_modifiers(
+                    state,
+                    position.x as f32,
+                    position.y as f32,
+                    self.modifiers.state(),
+                );
             }
 
             WindowEvent::MouseInput {
@@ -357,7 +358,10 @@ impl ApplicationHandler<WakeReason> for App {
                     let (cursor_x, cursor_y) = state.interaction.cursor_position;
                     let new_tab_clicked = button == MouseButton::Left
                         && button_state == ElementState::Pressed
-                        && state.gpu.tab_bar.hit_test_new_tab_button(cursor_x, cursor_y);
+                        && state
+                            .gpu
+                            .tab_bar
+                            .hit_test_new_tab_button(cursor_x, cursor_y);
 
                     if new_tab_clicked {
                         self.open_new_tab();
@@ -390,7 +394,7 @@ impl ApplicationHandler<WakeReason> for App {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
-                handle_mouse_wheel(state, delta);
+                handle_mouse_wheel_with_modifiers(state, delta, self.modifiers.state());
             }
 
             WindowEvent::RedrawRequested => {
@@ -442,7 +446,12 @@ impl ApplicationHandler<WakeReason> for App {
             let title = self
                 .windows
                 .get(&ds.source_window_id)
-                .and_then(|w| w.gpu.tab_bar.get_tab_title(ds.tab_id).map(|s| s.to_string()))
+                .and_then(|w| {
+                    w.gpu
+                        .tab_bar
+                        .get_tab_title(ds.tab_id)
+                        .map(|s| s.to_string())
+                })
                 .unwrap_or_else(|| "Tab".to_string());
             let x = ds.current_pos.x as i32;
             let y = ds.current_pos.y as i32;
@@ -581,7 +590,7 @@ impl App {
                 if let Some(tab) = state.gpu.tab_bar.remove_tab(drag.tab_id)
                     && let Some(shell) = state.shells.remove(&drag.tab_id)
                 {
-                    let content_hash = state.content_hashes.remove(&drag.tab_id).unwrap_or(0);
+                    state.text_rebuild.remove(&drag.tab_id);
                     state.render.dirty = true;
                     state.window.request_redraw();
 
@@ -596,7 +605,6 @@ impl App {
                     self.pending_detach = Some(DetachPayload {
                         tab,
                         shell,
-                        content_hash,
                         screen_position: screen_pos,
                     });
                     // Close source window if it's now empty
@@ -614,7 +622,7 @@ impl App {
                 if let Some(tab) = state.gpu.tab_bar.remove_tab(drag.tab_id)
                     && let Some(shell) = state.shells.remove(&drag.tab_id)
                 {
-                    let content_hash = state.content_hashes.remove(&drag.tab_id).unwrap_or(0);
+                    state.text_rebuild.remove(&drag.tab_id);
                     state.render.dirty = true;
                     state.window.request_redraw();
 
@@ -625,7 +633,6 @@ impl App {
                     self.pending_merge = Some(MergePayload {
                         tab,
                         shell,
-                        content_hash,
                         target_window_id,
                         insert_index,
                     });
@@ -656,7 +663,7 @@ impl App {
             target.shells.insert(tab_id, shell);
             target.gpu.tab_bar.select_tab(tab_id);
             target.render.dirty = true;
-            target.content_hashes.insert(tab_id, 0); // Force re-render
+            target.text_rebuild.insert(tab_id);
             target.window.request_redraw();
             target.window.focus_window();
             self.focused_window = Some(payload.target_window_id);

@@ -230,7 +230,11 @@ impl Terminal {
         while i < bytes.len() {
             match scan_osc133_at(bytes, i) {
                 Osc133Scan::None => i += 1,
-                Osc133Scan::Marker { cmd, exit_code, end } => {
+                Osc133Scan::Marker {
+                    cmd,
+                    exit_code,
+                    end,
+                } => {
                     // Parse everything before the marker so the cursor is where
                     // the shell expects when the marker is recorded.
                     self.parser.advance(&mut self.term, &bytes[fed..i]);

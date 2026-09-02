@@ -12,10 +12,9 @@ pub fn render_search_bar(
     encoder: &mut wgpu::CommandEncoder,
     frame_view: &wgpu::TextureView,
 ) {
+    // content_offset() is already in physical pixels
     let (_, content_offset_y) = state.gpu.tab_bar.content_offset();
     let s = state.scale_factor;
-    // content_offset_y is in logical pixels, scale to physical
-    let content_offset_y = content_offset_y * s;
 
     // Theme colors for search bar
     let ui_style = &state.gpu.effect_pipeline.theme().ui;
@@ -98,17 +97,23 @@ pub fn render_search_bar(
     // Render search text using tab glyph cache
     state.gpu.tab_title_renderer.clear();
 
-    // Build display text: query with cursor + match count
+    // Build display text: query with cursor + match count, truncated (from the
+    // left, so the cursor end stays visible) to what fits inside the box.
+    let cell_width = state.gpu.tab_glyph_cache.cell_width();
+    let max_chars = max_chars_in_box(bar_width, border_width + padding, cell_width);
     let query = &state.ui.search.query;
     let match_count = state.ui.search.matches.len();
     let current_match = state.ui.search.current_match + 1; // 1-indexed for display
 
     let display_text = if query.is_empty() {
-        "Find...".to_string()
-    } else if match_count > 0 {
-        format!("{}| ({}/{})", query, current_match, match_count)
+        fit_prefix("Find...", max_chars)
     } else {
-        format!("{}| (no matches)", query)
+        let suffix = if match_count > 0 {
+            format!("| ({}/{})", current_match, match_count)
+        } else {
+            "| (no matches)".to_string()
+        };
+        fit_input_line("", query, &suffix, max_chars)
     };
 
     // Render text - get fresh reference to ui_style for text colors
@@ -123,7 +128,9 @@ pub fn render_search_bar(
 
     let mut glyphs = Vec::new();
     let mut char_x = text_x;
-    let font_height = 14.0 * state.scale_factor;
+    // Centre on the real glyph line height (the tab glyph cache is 12px * scale
+    // with a 1.3 line height, not 14px).
+    let font_height = state.gpu.tab_glyph_cache.line_height();
     let text_baseline_y = text_y + (text_height - font_height) / 2.0;
 
     for c in display_text.chars() {
@@ -160,7 +167,10 @@ pub fn render_search_bar(
         occlusion_query_set: None,
     });
 
-    state.gpu.tab_title_renderer.render_transient(&shared.queue, &mut pass, &mut state.gpu.arena);
+    state
+        .gpu
+        .tab_title_renderer
+        .render_transient(&shared.queue, &mut pass, &mut state.gpu.arena);
 }
 
 /// Render window rename input bar overlay
@@ -170,10 +180,9 @@ pub fn render_window_rename(
     encoder: &mut wgpu::CommandEncoder,
     frame_view: &wgpu::TextureView,
 ) {
+    // content_offset() is already in physical pixels
     let (_, content_offset_y) = state.gpu.tab_bar.content_offset();
     let s = state.scale_factor;
-    // content_offset_y is in logical pixels, scale to physical
-    let content_offset_y = content_offset_y * s;
 
     // Theme colors for rename bar
     let ui_style = &state.gpu.effect_pipeline.theme().ui;
@@ -257,9 +266,11 @@ pub fn render_window_rename(
     // Render rename text using tab glyph cache
     state.gpu.tab_title_renderer.clear();
 
-    // Build display text: "Rename: " + input + cursor
+    // Build display text: "Rename: " + input + cursor, truncated so it fits.
+    let cell_width = state.gpu.tab_glyph_cache.cell_width();
+    let max_chars = max_chars_in_box(bar_width, border_width + padding, cell_width);
     let input = &state.ui.window_rename.input;
-    let display_text = format!("Rename: {}|", input);
+    let display_text = fit_input_line("Rename: ", input, "|", max_chars);
 
     // Render text - get fresh reference to ui_style for text colors
     let ui_style = &state.gpu.effect_pipeline.theme().ui;
@@ -268,9 +279,11 @@ pub fn render_window_rename(
 
     let mut glyphs = Vec::new();
     let mut char_x = text_x;
-    let font_height = 14.0 * state.scale_factor;
+    // Centre on the real glyph line height (the tab glyph cache is 12px * scale
+    // with a 1.3 line height, not 14px).
+    let font_height = state.gpu.tab_glyph_cache.line_height();
     let text_baseline_y = text_y + (text_height - font_height) / 2.0;
-    let label_len = "Rename: ".len();
+    let label_len = "Rename: ".chars().count().min(display_text.chars().count());
 
     for (idx, c) in display_text.chars().enumerate() {
         if let Some(glyph) = state
@@ -282,7 +295,7 @@ pub fn render_window_rename(
         }
 
         // Render label part first, then input part
-        if idx == label_len - 1 {
+        if label_len > 0 && idx == label_len - 1 {
             // Push label glyphs
             state
                 .gpu
@@ -321,5 +334,73 @@ pub fn render_window_rename(
         occlusion_query_set: None,
     });
 
-    state.gpu.tab_title_renderer.render_transient(&shared.queue, &mut pass, &mut state.gpu.arena);
+    state
+        .gpu
+        .tab_title_renderer
+        .render_transient(&shared.queue, &mut pass, &mut state.gpu.arena);
+}
+
+/// Number of whole character cells that fit inside a box of `box_width`
+/// physical pixels with `inset` pixels of border+padding on each side.
+fn max_chars_in_box(box_width: f32, inset: f32, cell_width: f32) -> usize {
+    let usable = box_width - inset * 2.0;
+    if usable <= 0.0 || cell_width <= 0.0 {
+        0
+    } else {
+        (usable / cell_width).floor() as usize
+    }
+}
+
+/// Take at most `max_chars` characters from the start of `text`.
+fn fit_prefix(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
+}
+
+/// Compose `prefix + input + suffix` so the result is at most `max_chars`
+/// characters. The input is trimmed from the left (its tail, where the cursor
+/// is, stays visible); if even prefix+suffix don't fit they are cut from the
+/// right.
+fn fit_input_line(prefix: &str, input: &str, suffix: &str, max_chars: usize) -> String {
+    let fixed = prefix.chars().count() + suffix.chars().count();
+    if fixed > max_chars {
+        return fit_prefix(&format!("{prefix}{suffix}"), max_chars);
+    }
+    let available = max_chars - fixed;
+    let input_len = input.chars().count();
+    let skip = input_len.saturating_sub(available);
+    let mut out = String::with_capacity(prefix.len() + input.len() + suffix.len());
+    out.push_str(prefix);
+    out.extend(input.chars().skip(skip));
+    out.push_str(suffix);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn max_chars_in_box_floors_and_clamps() {
+        assert_eq!(max_chars_in_box(300.0, 10.0, 7.0), 40); // 280 / 7
+        assert_eq!(max_chars_in_box(300.0, 10.0, 7.5), 37); // floor(37.33)
+        assert_eq!(max_chars_in_box(10.0, 10.0, 7.0), 0);
+        assert_eq!(max_chars_in_box(300.0, 10.0, 0.0), 0);
+    }
+
+    #[test]
+    fn fit_input_line_keeps_tail_and_fixed_parts() {
+        assert_eq!(fit_input_line("Rename: ", "abc", "|", 40), "Rename: abc|");
+        // 8 + 1 fixed, room for 3 input chars: keep the last three.
+        assert_eq!(
+            fit_input_line("Rename: ", "abcdef", "|", 12),
+            "Rename: def|"
+        );
+        // Search-style suffix.
+        assert_eq!(fit_input_line("", "hello", "| (1/2)", 9), "lo| (1/2)");
+        // Fixed parts alone overflow: cut from the right.
+        assert_eq!(fit_input_line("Rename: ", "x", "|", 4), "Rena");
+        assert_eq!(fit_input_line("", "", "|", 0), "");
+        // Multi-byte input counts characters, not bytes.
+        assert_eq!(fit_input_line("", "héllo", "|", 4), "llo|");
+    }
 }

@@ -523,7 +523,7 @@ mod tests {
 
     #[test]
     fn test_memory_stats() {
-        let stats = MemoryStats::current();
+        let _stats = MemoryStats::current();
         // On macOS, we should get some memory info
         #[cfg(target_os = "macos")]
         {

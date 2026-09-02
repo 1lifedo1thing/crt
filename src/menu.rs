@@ -454,7 +454,10 @@ pub fn build_menu_bar(
         Some(configured_accelerator(
             keybindings,
             KA::NextTab,
-            Accelerator::new(Some(AccelMods::SUPER | AccelMods::SHIFT), Code::BracketRight),
+            Accelerator::new(
+                Some(AccelMods::SUPER | AccelMods::SHIFT),
+                Code::BracketRight,
+            ),
         )),
     );
     let prev_tab = MenuItem::with_id(

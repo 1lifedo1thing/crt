@@ -100,7 +100,9 @@ impl ConfigWatcher {
         // Watch only what we care about: the config directory non-recursively
         // (for config.toml) and the themes directory. This keeps profiler
         // logs and other files in the config dir from generating events.
-        watcher.watch(&config_dir, RecursiveMode::NonRecursive).ok()?;
+        watcher
+            .watch(&config_dir, RecursiveMode::NonRecursive)
+            .ok()?;
         if let Err(e) = watcher.watch(&themes_dir, RecursiveMode::NonRecursive) {
             log::warn!("Could not watch themes directory {:?}: {}", themes_dir, e);
         }

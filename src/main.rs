@@ -9,6 +9,7 @@ mod config;
 mod font;
 mod gpu;
 mod input;
+#[cfg(target_os = "macos")]
 mod menu;
 pub mod profiling;
 mod render;

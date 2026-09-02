@@ -6,9 +6,13 @@ struct Params {
     uv_transform: vec4<f32>,
     // Opacity (0-1)
     opacity: f32,
+    // repeat_x: 1.0 when the image tiles horizontally (background-repeat),
+    // 0.0 to discard fragments outside the image on that axis.
+    // Carried in the uniform's first padding float.
+    repeat_x: f32,
+    // repeat_y: same for the vertical axis (second padding float)
+    repeat_y: f32,
     // Padding for alignment (use individual floats to avoid vec3 alignment issues)
-    _pad1: f32,
-    _pad2: f32,
     _pad3: f32,
 }
 
@@ -42,8 +46,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Transform UV: scale then offset
     let tex_uv = in.uv * scale + offset;
 
-    // Sample the texture
+    // Sample first so the texture read stays in uniform control flow
     let color = textureSample(image_texture, image_sampler, tex_uv);
+
+    // Non-repeating axes: fragments outside the image are transparent rather
+    // than smearing the edge texels (the sampler clamps to edge).
+    let outside_x = tex_uv.x < 0.0 || tex_uv.x > 1.0;
+    let outside_y = tex_uv.y < 0.0 || tex_uv.y > 1.0;
+    if ((params.repeat_x < 0.5 && outside_x) || (params.repeat_y < 0.5 && outside_y)) {
+        discard;
+    }
 
     // Apply opacity
     return vec4<f32>(color.rgb, color.a * params.opacity);

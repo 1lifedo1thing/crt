@@ -9,18 +9,17 @@ mod types;
 mod ui;
 
 // Re-export all public types for backward compatibility
-pub use interaction::{ContextMenu, ContextMenuItem, InteractionState, SearchMatch, SearchState};
+pub use interaction::{ContextMenu, ContextMenuItem, InteractionState, SearchMatch};
+#[cfg_attr(not(test), allow(unused_imports))]
 pub use overrides::{ActiveOverride, OverrideEventType, OverrideState};
 pub use render::{
-    CachedRenderState, CursorInfo, DecorationKind, PreparedCell, RenderContext, RenderLayout,
-    RenderState, TerminalRenderData, TextBufferUpdateResult, TextDecoration, prepare_render_cells,
+    CursorInfo, DecorationKind, RenderContext, RenderLayout, RenderState, TextBufferUpdateResult,
+    prepare_render_cells,
 };
 pub use types::{EffectId, TabId};
-pub use ui::{
-    BellState, CopyIndicator, Toast, ToastType, UiState, WindowRenameState, ZoomIndicator,
-};
+pub use ui::{BellState, ToastType, UiState};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -38,8 +37,9 @@ pub struct WindowState {
     pub gpu: WindowGpuState,
     // Map of tab_id -> shell (each window has its own tabs)
     pub shells: HashMap<TabId, ShellTerminal>,
-    // Content hash to skip reshaping when unchanged (per tab)
-    pub content_hashes: HashMap<TabId, u64>,
+    /// Tabs whose text layer must be rebuilt on their next frame regardless
+    /// of terminal damage (tab switch, hover/search/theme changes).
+    pub text_rebuild: HashSet<TabId>,
     // Window-specific sizing
     pub cols: usize,
     pub rows: usize,
@@ -69,7 +69,7 @@ impl WindowState {
     /// interval regardless of terminal content).
     pub fn is_animating(&self) -> bool {
         let gpu = &self.gpu;
-        gpu.effects_renderer.has_enabled_effects()
+        gpu.effects_renderer.is_animating()
             || gpu.sprite_state.is_some()
             || gpu
                 .background_image_state
@@ -104,9 +104,7 @@ impl WindowState {
 
         // A blinking cursor only needs a frame when it toggles.
         let vello = &self.gpu.terminal_vello;
-        if focused
-            && vello.blink_enabled()
-            && self.render.cached.cursor.is_some_and(|c| c.visible)
+        if focused && vello.blink_enabled() && self.render.cached.cursor.is_some_and(|c| c.visible)
         {
             return Some(vello.next_blink_toggle().max(earliest));
         }
@@ -149,8 +147,14 @@ impl WindowState {
     /// (hover underline, search highlight, theme change, ...).
     pub fn invalidate_text(&mut self) {
         if let Some(tab_id) = self.gpu.tab_bar.active_tab_id() {
-            self.content_hashes.insert(tab_id, 0);
+            self.text_rebuild.insert(tab_id);
         }
+        self.render.dirty = true;
+    }
+
+    /// Force every tab's text layer to be rebuilt (font, theme or DPI change).
+    pub fn request_text_rebuild_all(&mut self) {
+        self.text_rebuild.extend(self.shells.keys().copied());
         self.render.dirty = true;
     }
 
@@ -166,13 +170,11 @@ impl WindowState {
     ) -> Option<TextBufferUpdateResult> {
         let tab_id = self.gpu.tab_bar.active_tab_id()?;
 
-        // A zero entry means "force a full rebuild" (see `invalidate_text`).
-        let forced = self.content_hashes.get(&tab_id).copied().unwrap_or(0) == 0;
+        let forced = self.text_rebuild.remove(&tab_id);
         let damage = self.shells.get_mut(&tab_id)?.terminal_mut().take_damage();
         if damage.is_none() && !forced {
             return None;
         }
-        self.content_hashes.insert(tab_id, 1);
 
         let shell = self.shells.get(&tab_id)?;
         let terminal = shell.terminal();
@@ -302,15 +304,17 @@ impl WindowState {
         // Push glyph instances (rasterisation is cached in the glyph atlas)
         for cell in &prepared_cells {
             let style = GlyphStyle::new(cell.bold, cell.italic);
-            if let Some(glyph) = self
-                .gpu
-                .glyph_cache
-                .position_char_styled(cell.character, cell.x, cell.y, style)
+            if let Some(glyph) =
+                self.gpu
+                    .glyph_cache
+                    .position_char_styled(cell.character, cell.x, cell.y, style)
             {
                 if cell.use_glow {
                     self.gpu.grid_renderer.push_glyph(&glyph, cell.fg_color);
                 } else {
-                    self.gpu.output_grid_renderer.push_glyph(&glyph, cell.fg_color);
+                    self.gpu
+                        .output_grid_renderer
+                        .push_glyph(&glyph, cell.fg_color);
                 }
             }
         }
@@ -344,7 +348,7 @@ impl WindowState {
             Ok(shell) => {
                 log::info!("Shell spawned for tab {}", tab_id);
                 self.shells.insert(tab_id, shell);
-                self.content_hashes.insert(tab_id, 0);
+                self.text_rebuild.insert(tab_id);
             }
             Err(e) => {
                 log::error!("Failed to spawn shell for tab {}: {}", tab_id, e);
@@ -362,7 +366,7 @@ impl WindowState {
     /// Remove shell for a closed tab
     pub fn remove_shell_for_tab(&mut self, tab_id: u64) {
         self.shells.remove(&tab_id);
-        self.content_hashes.remove(&tab_id);
+        self.text_rebuild.remove(&tab_id);
         log::info!("Removed shell for tab {}", tab_id);
     }
 

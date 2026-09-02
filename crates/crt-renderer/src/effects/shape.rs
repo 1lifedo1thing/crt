@@ -299,12 +299,17 @@ impl ShapeEffect {
     }
 
     /// Draw a circle
+    ///
+    /// Built at the origin and translated so the glow layers (which scale
+    /// about the transform origin) grow around the shape's centre instead of
+    /// the screen origin.
     fn draw_circle(&self, scene: &mut Scene, center: Point, _angle: f64) {
-        let circle = Circle::new(center, self.size / 2.0);
+        let circle = Circle::new(Point::ORIGIN, self.size / 2.0);
+        let transform = Affine::translate(center.to_vec2());
 
         self.render_shape_with_glow(
             scene,
-            Affine::IDENTITY,
+            transform,
             |scene, transform, brush| {
                 scene.fill(Fill::NonZero, transform, brush, None, &circle);
             },
@@ -315,12 +320,15 @@ impl ShapeEffect {
     }
 
     /// Draw an ellipse
+    ///
+    /// Built at the origin and translated (see `draw_circle`).
     fn draw_ellipse(&self, scene: &mut Scene, center: Point, angle: f64) {
-        let ellipse = Ellipse::new(center, (self.size / 2.0, self.size / 4.0), angle);
+        let ellipse = Ellipse::new(Point::ORIGIN, (self.size / 2.0, self.size / 4.0), angle);
+        let transform = Affine::translate(center.to_vec2());
 
         self.render_shape_with_glow(
             scene,
-            Affine::IDENTITY,
+            transform,
             |scene, transform, brush| {
                 scene.fill(Fill::NonZero, transform, brush, None, &ellipse);
             },
@@ -527,8 +535,8 @@ impl BackdropEffect for ShapeEffect {
         "shape"
     }
 
-    fn update(&mut self, _dt: f32, time: f32) {
-        self.time = time as f64;
+    fn update(&mut self, _dt: f64, time: f64) {
+        self.time = time;
     }
 
     fn render(&self, scene: &mut Scene, bounds: Rect) {
@@ -626,6 +634,15 @@ impl BackdropEffect for ShapeEffect {
 
     fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    fn is_animated(&self) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        let moving = self.motion_type != MotionType::None && self.motion_speed > 0.0;
+        let rotating = self.rotation != RotationBehavior::None && self.rotation_speed != 0.0;
+        moving || rotating
     }
 }
 
@@ -730,5 +747,37 @@ mod tests {
         assert_eq!(c.g, 150);
         assert_eq!(c.b, 200);
         assert_eq!(c.a, 127);
+    }
+
+    #[test]
+    fn test_is_animated() {
+        let mut shape = ShapeEffect::default();
+        assert!(!shape.is_animated(), "disabled");
+        shape.enabled = true;
+        assert!(shape.is_animated(), "default bounce motion");
+        shape.motion_type = MotionType::None;
+        assert!(!shape.is_animated(), "no motion, no rotation");
+        shape.rotation = RotationBehavior::Spin;
+        assert!(shape.is_animated());
+        shape.rotation_speed = 0.0;
+        assert!(!shape.is_animated(), "spin at zero speed");
+        shape.motion_type = MotionType::Orbit;
+        shape.motion_speed = 0.0;
+        assert!(!shape.is_animated(), "motion at zero speed");
+    }
+
+    #[test]
+    fn test_circle_and_ellipse_render_without_panic() {
+        let mut shape = ShapeEffect {
+            enabled: true,
+            glow_radius: 20.0,
+            ..Default::default()
+        };
+        let bounds = Rect::new(0.0, 0.0, 800.0, 600.0);
+        for ty in [ShapeType::Circle, ShapeType::Ellipse] {
+            shape.shape_type = ty;
+            let mut scene = Scene::new();
+            shape.render(&mut scene, bounds);
+        }
     }
 }

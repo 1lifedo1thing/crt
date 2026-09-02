@@ -165,8 +165,7 @@ pub fn prepare_render_cells(
         };
 
         // Get foreground color
-        let mut fg_color =
-            ansi_color_to_rgba(fg_ansi, ctx.palette, ctx.default_fg, ctx.default_bg);
+        let mut fg_color = ansi_color_to_rgba(fg_ansi, ctx.palette, ctx.default_fg, ctx.default_bg);
 
         // Apply DIM flag by reducing alpha
         if flags.contains(CellFlags::DIM) {
@@ -174,13 +173,12 @@ pub fn prepare_render_cells(
         }
 
         // Get background color and add decoration if non-default
-        let is_spacer = flags
-            .intersects(CellFlags::WIDE_CHAR_SPACER | CellFlags::LEADING_WIDE_CHAR_SPACER);
+        let is_spacer =
+            flags.intersects(CellFlags::WIDE_CHAR_SPACER | CellFlags::LEADING_WIDE_CHAR_SPACER);
         let is_hidden = flags.contains(CellFlags::HIDDEN);
 
         if !is_spacer && !is_hidden {
-            let bg_color =
-                ansi_color_to_rgba(bg_ansi, ctx.palette, ctx.default_fg, ctx.default_bg);
+            let bg_color = ansi_color_to_rgba(bg_ansi, ctx.palette, ctx.default_fg, ctx.default_bg);
             if bg_color != ctx.default_bg {
                 decorations.push(TextDecoration {
                     x,
@@ -259,28 +257,29 @@ pub fn prepare_render_cells(
         }
 
         // Check if this cell is part of a search match
-        if ctx.search_active && !ctx.search_matches.is_empty() {
-            if let Some(highlight_style) = ctx.highlight_style {
-                for (match_idx, search_match) in ctx.search_matches.iter().enumerate() {
-                    if search_match.line == grid_line
-                        && col >= search_match.start_col
-                        && col < search_match.end_col
-                    {
-                        let highlight_color = if match_idx == ctx.current_match {
-                            highlight_style.current_background.to_array()
-                        } else {
-                            highlight_style.background.to_array()
-                        };
-                        decorations.push(TextDecoration {
-                            x,
-                            y,
-                            cell_width: ctx.layout.cell_width,
-                            cell_height: ctx.layout.line_height,
-                            color: highlight_color,
-                            kind: DecorationKind::Background,
-                        });
-                        break;
-                    }
+        if ctx.search_active
+            && !ctx.search_matches.is_empty()
+            && let Some(highlight_style) = ctx.highlight_style
+        {
+            for (match_idx, search_match) in ctx.search_matches.iter().enumerate() {
+                if search_match.line == grid_line
+                    && col >= search_match.start_col
+                    && col < search_match.end_col
+                {
+                    let highlight_color = if match_idx == ctx.current_match {
+                        highlight_style.current_background.to_array()
+                    } else {
+                        highlight_style.background.to_array()
+                    };
+                    decorations.push(TextDecoration {
+                        x,
+                        y,
+                        cell_width: ctx.layout.cell_width,
+                        cell_height: ctx.layout.line_height,
+                        color: highlight_color,
+                        kind: DecorationKind::Background,
+                    });
+                    break;
                 }
             }
         }
@@ -340,8 +339,6 @@ pub struct RenderState {
     pub focused: bool,
     /// Cached decorations from last content update
     pub cached: CachedRenderState,
-    /// Paste operation just occurred - normalize INVERSE flags on next render
-    pub paste_pending: bool,
     /// When the last frame started (frame pacing and animation `dt`)
     pub last_frame_at: std::time::Instant,
 }
@@ -354,7 +351,6 @@ impl Default for RenderState {
             occluded: false,
             focused: true,
             cached: CachedRenderState::default(),
-            paste_pending: false,
             last_frame_at: std::time::Instant::now(),
         }
     }

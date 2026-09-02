@@ -410,6 +410,7 @@ pub fn render_frame(state: &mut WindowState, shared: &mut SharedGpuState) {
             &shared.queue,
             uv_transform,
             bg_state.opacity(),
+            bg_state.repeat_flags(),
         );
 
         // Render background image
@@ -979,34 +980,32 @@ pub fn render_frame(state: &mut WindowState, shared: &mut SharedGpuState) {
     }
 
     // Final Pass: Apply CRT post-processing (if enabled)
-    if crt_enabled {
-        if let Some(bind_group) = &state.gpu.crt_bind_group {
-            // Update CRT uniforms
-            state.gpu.crt_pipeline.update_uniforms(
-                &shared.queue,
-                state.gpu.config.width as f32,
-                state.gpu.config.height as f32,
-            );
+    if crt_enabled && let Some(bind_group) = &state.gpu.crt_bind_group {
+        // Update CRT uniforms
+        state.gpu.crt_pipeline.update_uniforms(
+            &shared.queue,
+            state.gpu.config.width as f32,
+            state.gpu.config.height as f32,
+        );
 
-            // Render from CRT intermediate texture to actual frame
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("CRT Post-Process Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &frame_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
+        // Render from CRT intermediate texture to actual frame
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("CRT Post-Process Pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &frame_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
 
-            state.gpu.crt_pipeline.render(&mut pass, bind_group);
-        }
+        state.gpu.crt_pipeline.render(&mut pass, bind_group);
     }
 
     timing.render_us = render_start.elapsed().as_micros() as u64;
@@ -1072,16 +1071,50 @@ fn render_tab_titles(
     encoder: &mut wgpu::CommandEncoder,
     frame_view: &wgpu::TextureView,
 ) {
-    let tab_labels = state.gpu.tab_bar.get_tab_labels();
-    if tab_labels.is_empty() {
+    if state.gpu.tab_bar.tab_count() == 0 {
         return;
     }
 
-    state.gpu.tab_title_renderer.clear();
+    // Tab titles change rarely; rebuild the glyph list only when the tab
+    // bar reports a new version (titles, active tab, editing, layout, theme).
+    let version = state.gpu.tab_bar.titles_version();
+    if state.gpu.tab_titles_version != Some(version) {
+        state.gpu.tab_titles_version = Some(version);
+        build_tab_title_glyphs(state, shared);
+    }
 
-    let active_color = state.gpu.tab_bar.active_tab_color();
-    let inactive_color = state.gpu.tab_bar.inactive_tab_color();
-    let active_shadow = state.gpu.tab_bar.active_tab_text_shadow();
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("Tab Title Render Pass"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: frame_view,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Load,
+                store: wgpu::StoreOp::Store,
+            },
+            depth_slice: None,
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+    });
+
+    state
+        .gpu
+        .tab_title_renderer
+        .render(&shared.device, &shared.queue, &mut pass);
+}
+
+/// Rebuild the tab-title glyph instances (glow layers, titles, close and
+/// new-tab buttons) into `tab_title_renderer`.
+fn build_tab_title_glyphs(state: &mut WindowState, shared: &SharedGpuState) {
+    let gpu = &mut state.gpu;
+    let tab_labels = gpu.tab_bar.get_tab_labels();
+    gpu.tab_title_renderer.clear();
+
+    let active_color = gpu.tab_bar.active_tab_color();
+    let inactive_color = gpu.tab_bar.inactive_tab_color();
+    let active_shadow = gpu.tab_bar.active_tab_text_shadow();
 
     // Pre-allocate glyph buffer to avoid per-loop allocations
     // Typical tab title is ~30 chars max, so 64 is plenty
@@ -1114,16 +1147,12 @@ fn render_tab_titles(
                     glyph_buffer.clear();
                     let mut char_x = *x + ox;
                     for c in title.chars() {
-                        if let Some(glyph) =
-                            state.gpu.tab_glyph_cache.position_char(c, char_x, *y + oy)
-                        {
+                        if let Some(glyph) = gpu.tab_glyph_cache.position_char(c, char_x, *y + oy) {
                             glyph_buffer.push(glyph);
                         }
-                        char_x += state.gpu.tab_glyph_cache.cell_width();
+                        char_x += gpu.tab_glyph_cache.cell_width();
                     }
-                    state
-                        .gpu
-                        .tab_title_renderer
+                    gpu.tab_title_renderer
                         .push_glyphs(&glyph_buffer, glow_render_color);
                 }
             }
@@ -1135,10 +1164,10 @@ fn render_tab_titles(
         glyph_buffer.clear();
         let mut char_x = x;
         for c in title.chars() {
-            if let Some(glyph) = state.gpu.tab_glyph_cache.position_char(c, char_x, y) {
+            if let Some(glyph) = gpu.tab_glyph_cache.position_char(c, char_x, y) {
                 glyph_buffer.push(glyph);
             }
-            char_x += state.gpu.tab_glyph_cache.cell_width();
+            char_x += gpu.tab_glyph_cache.cell_width();
         }
 
         let text_color = if is_editing {
@@ -1153,58 +1182,30 @@ fn render_tab_titles(
         } else {
             inactive_color
         };
-        state
-            .gpu
-            .tab_title_renderer
+        gpu.tab_title_renderer
             .push_glyphs(&glyph_buffer, text_color);
     }
 
     // Render close button 'x' characters
-    let close_positions = state.gpu.tab_bar.get_close_button_labels();
+    let close_positions = gpu.tab_bar.get_close_button_labels();
     for (x, y) in close_positions {
-        if let Some(glyph) = state.gpu.tab_glyph_cache.position_char('x', x, y) {
-            state
-                .gpu
-                .tab_title_renderer
-                .push_glyphs(&[glyph], inactive_color);
+        if let Some(glyph) = gpu.tab_glyph_cache.position_char('x', x, y) {
+            gpu.tab_title_renderer.push_glyphs(&[glyph], inactive_color);
         }
     }
 
     // Render the "+" new-tab button glyph
-    if let Some((x, y)) = state.gpu.tab_bar.get_new_tab_button_label()
-        && let Some(glyph) = state.gpu.tab_glyph_cache.position_char('+', x, y)
+    if let Some((x, y)) = gpu.tab_bar.get_new_tab_button_label()
+        && let Some(glyph) = gpu.tab_glyph_cache.position_char('+', x, y)
     {
-        state
-            .gpu
-            .tab_title_renderer
-            .push_glyphs(&[glyph], inactive_color);
+        gpu.tab_title_renderer.push_glyphs(&[glyph], inactive_color);
     }
 
-    state.gpu.tab_glyph_cache.flush(&shared.queue);
-
-    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-        label: Some("Tab Title Render Pass"),
-        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-            view: frame_view,
-            resolve_target: None,
-            ops: wgpu::Operations {
-                load: wgpu::LoadOp::Load,
-                store: wgpu::StoreOp::Store,
-            },
-            depth_slice: None,
-        })],
-        depth_stencil_attachment: None,
-        timestamp_writes: None,
-        occlusion_query_set: None,
-    });
-
-    state
-        .gpu
-        .tab_title_renderer
-        .render(&shared.device, &shared.queue, &mut pass);
+    gpu.tab_glyph_cache.flush(&shared.queue);
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
     use crate::window::OverrideState;
@@ -1534,7 +1535,15 @@ mod tests {
         let patches = compute_effect_patches(&state, &theme);
         // Should have an Apply action for starfield
         assert!(!patches.is_empty());
-        let has_starfield_apply = patches.iter().any(|p| matches!(p, EffectPatchAction::Apply { effect_id: EffectId::Starfield, .. }));
+        let has_starfield_apply = patches.iter().any(|p| {
+            matches!(
+                p,
+                EffectPatchAction::Apply {
+                    effect_id: EffectId::Starfield,
+                    ..
+                }
+            )
+        });
         assert!(has_starfield_apply, "Expected Apply for starfield");
     }
 
@@ -1557,8 +1566,19 @@ mod tests {
         let theme = Theme::default();
         let patches = compute_effect_patches(&state, &theme);
         // Should NOT re-apply starfield since it's already patched
-        let has_starfield_apply = patches.iter().any(|p| matches!(p, EffectPatchAction::Apply { effect_id: EffectId::Starfield, .. }));
-        assert!(!has_starfield_apply, "Should not re-apply already-patched effect");
+        let has_starfield_apply = patches.iter().any(|p| {
+            matches!(
+                p,
+                EffectPatchAction::Apply {
+                    effect_id: EffectId::Starfield,
+                    ..
+                }
+            )
+        });
+        assert!(
+            !has_starfield_apply,
+            "Should not re-apply already-patched effect"
+        );
     }
 
     #[test]
@@ -1570,7 +1590,15 @@ mod tests {
         let mut theme = Theme::default();
         theme.starfield = Some(crt_theme::StarfieldEffect::default());
         let patches = compute_effect_patches(&state, &theme);
-        let has_starfield_restore = patches.iter().any(|p| matches!(p, EffectPatchAction::Restore { effect_id: EffectId::Starfield, .. }));
+        let has_starfield_restore = patches.iter().any(|p| {
+            matches!(
+                p,
+                EffectPatchAction::Restore {
+                    effect_id: EffectId::Starfield,
+                    ..
+                }
+            )
+        });
         assert!(has_starfield_restore, "Expected Restore for starfield");
     }
 
@@ -1581,8 +1609,19 @@ mod tests {
         state.set_patched(EffectId::Starfield);
         let theme = Theme::default(); // starfield is None in default theme
         let patches = compute_effect_patches(&state, &theme);
-        let has_starfield_restore = patches.iter().any(|p| matches!(p, EffectPatchAction::Restore { effect_id: EffectId::Starfield, .. }));
-        assert!(!has_starfield_restore, "No restore without base theme config");
+        let has_starfield_restore = patches.iter().any(|p| {
+            matches!(
+                p,
+                EffectPatchAction::Restore {
+                    effect_id: EffectId::Starfield,
+                    ..
+                }
+            )
+        });
+        assert!(
+            !has_starfield_restore,
+            "No restore without base theme config"
+        );
     }
 
     #[test]
@@ -1684,10 +1723,7 @@ mod tests {
             config,
         };
         match action {
-            EffectPatchAction::Apply {
-                effect_id,
-                config,
-            } => {
+            EffectPatchAction::Apply { effect_id, config } => {
                 assert_eq!(effect_id, EffectId::Starfield);
                 assert_eq!(config.get("density").unwrap(), "100");
             }

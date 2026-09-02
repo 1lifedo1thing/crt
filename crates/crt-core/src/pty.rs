@@ -4,7 +4,7 @@
 
 use std::io::{Read, Write};
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
 use portable_pty::{Child, CommandBuilder, PtySize, native_pty_system};

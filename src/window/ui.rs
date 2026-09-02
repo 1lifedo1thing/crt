@@ -19,6 +19,7 @@ pub struct WindowRenameState {
 
 impl WindowRenameState {
     /// Start renaming with current window title
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn start(&mut self, current_title: &str) {
         self.active = true;
         self.input = current_title.to_string();

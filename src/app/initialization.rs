@@ -2,7 +2,7 @@
 //!
 //! Contains the heavy `create_window()` function and scale factor handling.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::config::Config;
@@ -12,8 +12,8 @@ use crate::window::{self, WindowState};
 use crt_core::{ShellTerminal, Size};
 use crt_renderer::{
     BackgroundImagePipeline, BackgroundImageState, CrtPipeline, EffectsRenderer, FrameArena,
-    GlyphCache, GridEffect, GridRenderer, MatrixEffect, ParticleEffect, RainEffect, RectRenderer, ShapeEffect,
-    SpriteEffect, StarfieldEffect, Tab, TabBar,
+    GlyphCache, GridEffect, GridRenderer, MatrixEffect, ParticleEffect, RainEffect, RectRenderer,
+    ShapeEffect, SpriteEffect, StarfieldEffect, Tab, TabBar,
 };
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowId};
@@ -22,7 +22,6 @@ use winit::window::{Window, WindowId};
 pub(crate) struct DetachPayload {
     pub tab: Tab,
     pub shell: ShellTerminal,
-    pub content_hash: u64,
     pub screen_position: Option<winit::dpi::PhysicalPosition<i32>>,
 }
 
@@ -30,13 +29,12 @@ pub(crate) struct DetachPayload {
 pub(crate) struct MergePayload {
     pub tab: Tab,
     pub shell: ShellTerminal,
-    pub content_hash: u64,
     pub target_window_id: WindowId,
     pub insert_index: usize,
 }
 
-use super::effects::configure_effects_from_theme;
 use super::App;
+use super::effects::configure_effects_from_theme;
 
 #[cfg(target_os = "macos")]
 use winit::platform::macos::WindowAttributesExtMacOS;
@@ -67,7 +65,7 @@ impl App {
         );
 
         // Build window
-        let mut window_attrs = Window::default_attributes()
+        let window_attrs = Window::default_attributes()
             .with_title(&self.config.window.title)
             .with_inner_size(winit::dpi::LogicalSize::new(width, height));
 
@@ -85,6 +83,9 @@ impl App {
         let window_id = window.id();
         let size = window.inner_size();
         let scale_factor = window.scale_factor() as f32;
+        // Accept composed input (CJK IMEs, macOS emoji picker); commits arrive
+        // as WindowEvent::Ime.
+        window.set_ime_allowed(true);
 
         // Create GPU resources
         let surface = shared.instance.create_surface(window.clone()).unwrap();
@@ -126,7 +127,8 @@ impl App {
         grid_renderer.update_screen_size(&shared.queue, size.width as f32, size.height as f32);
 
         // Separate renderer for output text (rendered flat, no glow)
-        let mut output_grid_renderer = GridRenderer::new_with_shared(&shared.device, &pipelines.grid);
+        let mut output_grid_renderer =
+            GridRenderer::new_with_shared(&shared.device, &pipelines.grid);
         output_grid_renderer.set_glyph_cache(&shared.device, &glyph_cache);
         output_grid_renderer.update_screen_size(
             &shared.queue,
@@ -144,8 +146,7 @@ impl App {
 
         let mut tab_title_renderer = GridRenderer::new_with_shared(&shared.device, &pipelines.grid);
         tab_title_renderer.set_glyph_cache(&shared.device, &tab_glyph_cache);
-        tab_title_renderer
-            .update_screen_size(&shared.queue, size.width as f32, size.height as f32);
+        tab_title_renderer.update_screen_size(&shared.queue, size.width as f32, size.height as f32);
 
         // Effect pipeline for background rendering - get theme from registry
         let (theme_name, theme) = self.theme_registry.get_default_theme();
@@ -173,6 +174,7 @@ impl App {
         // Tab bar (always at top, initial tab gets a globally unique ID)
         let mut tab_bar = TabBar::with_initial_id(&shared.device, format, initial_tab_id);
         tab_bar.set_scale_factor(scale_factor);
+        tab_bar.set_font_metrics(tab_glyph_cache.cell_width(), tab_glyph_cache.line_height());
         tab_bar.set_theme(theme.tabs);
         tab_bar.resize(size.width as f32, size.height as f32);
 
@@ -215,13 +217,17 @@ impl App {
         let arena = FrameArena::new(&shared.device, 1024 * 1024, "Window Frame Arena");
 
         // Background image pipeline (always created, state only if theme has background image)
-        let background_image_pipeline = BackgroundImagePipeline::new_with_shared(&shared.device, &pipelines.background_image);
+        let background_image_pipeline =
+            BackgroundImagePipeline::new_with_shared(&shared.device, &pipelines.background_image);
         let (background_image_state, background_image_bind_group) =
             if let Some(ref bg_image) = theme.background_image {
                 match BackgroundImageState::new(&shared.device, &shared.queue, bg_image) {
                     Ok(state) => {
-                        let bind_group = background_image_pipeline
-                            .create_bind_group(&shared.device, &state.texture.view);
+                        let bind_group = background_image_pipeline.create_bind_group(
+                            &shared.device,
+                            &state.texture.view,
+                            state.texture.sampler(),
+                        );
                         log::info!("Loaded background image: {:?}", bg_image.path);
                         (Some(state), Some(bind_group))
                     }
@@ -273,6 +279,7 @@ impl App {
             output_grid_renderer,
             tab_glyph_cache,
             tab_title_renderer,
+            tab_titles_version: None,
             arena,
             effect_pipeline,
             effects_renderer,
@@ -294,7 +301,7 @@ impl App {
 
         // Create initial shell with semantic prompts if enabled
         let mut shells = HashMap::new();
-        let mut content_hashes = HashMap::new();
+        let mut text_rebuild = HashSet::new();
 
         // Inherit CWD from focused window if available, otherwise use config default
         let cwd = self
@@ -311,14 +318,14 @@ impl App {
                 self.config.shell.semantic_prompts
             );
             shells.insert(initial_tab_id, shell);
-            content_hashes.insert(initial_tab_id, 0);
+            text_rebuild.insert(initial_tab_id);
         }
 
         let window_state = WindowState {
             window,
             gpu,
             shells,
-            content_hashes,
+            text_rebuild,
             cols,
             rows,
             scale_factor,
@@ -381,7 +388,7 @@ impl App {
             if let Some(initial_tab_id) = state.gpu.tab_bar.active_tab_id() {
                 state.gpu.tab_bar.remove_tab(initial_tab_id);
                 state.shells.remove(&initial_tab_id);
-                state.content_hashes.remove(&initial_tab_id);
+                state.text_rebuild.remove(&initial_tab_id);
             }
 
             // Insert the detached tab+shell
@@ -393,18 +400,16 @@ impl App {
             let mut shell = payload.shell;
             shell.resize(Size::new(state.cols, state.rows));
             state.shells.insert(tab_id, shell);
-            state.content_hashes.insert(tab_id, payload.content_hash);
 
             // Position window at cursor if provided
             if let Some(pos) = payload.screen_position {
-                state.window.set_outer_position(winit::dpi::PhysicalPosition::new(
-                    pos.x, pos.y,
-                ));
+                state
+                    .window
+                    .set_outer_position(winit::dpi::PhysicalPosition::new(pos.x, pos.y));
             }
 
             state.render.dirty = true;
-            // Invalidate content hash so the terminal rerenders
-            state.content_hashes.insert(tab_id, 0);
+            state.text_rebuild.insert(tab_id);
         }
 
         log::info!("Created detached window {:?}", window_id);
@@ -470,8 +475,12 @@ pub(crate) fn handle_scale_factor_change(
 
     state.gpu.tab_glyph_cache = tab_glyph_cache;
 
-    // Update tab bar scale factor
+    // Update tab bar scale factor and text metrics
     state.gpu.tab_bar.set_scale_factor(new_scale);
+    state.gpu.tab_bar.set_font_metrics(
+        state.gpu.tab_glyph_cache.cell_width(),
+        state.gpu.tab_glyph_cache.line_height(),
+    );
 
     // Recalculate terminal dimensions with new cell sizes
     let size = state.window.inner_size();
@@ -498,9 +507,7 @@ pub(crate) fn handle_scale_factor_change(
 
     // Mark as dirty and invalidate content hashes
     state.render.dirty = true;
-    for hash in state.content_hashes.values_mut() {
-        *hash = 0;
-    }
+    state.request_text_rebuild_all();
     state.window.request_redraw();
 
     log::info!(

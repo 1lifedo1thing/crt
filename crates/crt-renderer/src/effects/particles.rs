@@ -156,6 +156,12 @@ pub struct ParticleEffect {
 
     /// Whether particles need regeneration
     needs_regeneration: bool,
+
+    /// Unit-size (radius 1, unrotated, centred on the origin) shape paths,
+    /// built once and drawn with an `Affine` per particle.
+    unit_star: BezPath,
+    unit_heart: BezPath,
+    unit_sparkle: BezPath,
 }
 
 impl Default for ParticleEffect {
@@ -174,6 +180,9 @@ impl Default for ParticleEffect {
             time: 0.0,
             seed: 98765,
             needs_regeneration: true,
+            unit_star: Self::unit_star_path(),
+            unit_heart: Self::unit_heart_path(),
+            unit_sparkle: Self::unit_sparkle_path(),
         }
     }
 }
@@ -195,19 +204,27 @@ impl ParticleEffect {
         (x as f64) / (u64::MAX as f64)
     }
 
+    /// Number of random values consumed per particle.
+    ///
+    /// Each particle owns a non-overlapping index range; a stride smaller
+    /// than the number of values consumed would make one particle's last
+    /// value equal the next particle's first (correlated neighbours).
+    const RNG_STRIDE: usize = 7;
+
     /// Generate particles
     fn generate_particles(&mut self) {
         self.particles.clear();
         self.particles.reserve(self.count);
 
         for i in 0..self.count {
-            let x = self.random(i * 6);
-            let y = self.random(i * 6 + 1);
-            let size = 0.5 + self.random(i * 6 + 2) * 1.0; // 0.5-1.5
-            let brightness = 0.4 + self.random(i * 6 + 3) * 0.6; // 0.4-1.0
-            let phase = self.random(i * 6 + 4) * PI * 2.0;
-            let rotation = self.random(i * 6 + 5) * PI * 2.0;
-            let speed = 0.6 + self.random(i * 6 + 6) * 0.8; // 0.6-1.4
+            let base = i * Self::RNG_STRIDE;
+            let x = self.random(base);
+            let y = self.random(base + 1);
+            let size = 0.5 + self.random(base + 2) * 1.0; // 0.5-1.5
+            let brightness = 0.4 + self.random(base + 3) * 0.6; // 0.4-1.0
+            let phase = self.random(base + 4) * PI * 2.0;
+            let rotation = self.random(base + 5) * PI * 2.0;
+            let speed = 0.6 + self.random(base + 6) * 0.8; // 0.6-1.4
 
             self.particles.push(Particle {
                 x,
@@ -281,90 +298,83 @@ impl ParticleEffect {
         }
     }
 
-    /// Draw a star shape
-    fn draw_star(center: Point, size: f64, rotation: f64) -> BezPath {
+    /// Unit five-pointed star (outer radius 1) centred on the origin
+    fn unit_star_path() -> BezPath {
         let mut path = BezPath::new();
         let points = 5;
-        let outer_radius = size;
-        let inner_radius = size * 0.4;
+        let outer_radius = 1.0;
+        let inner_radius = 0.4;
 
         for i in 0..(points * 2) {
-            let angle = rotation + (i as f64 * PI / points as f64) - PI / 2.0;
+            let angle = (i as f64 * PI / points as f64) - PI / 2.0;
             let radius = if i % 2 == 0 {
                 outer_radius
             } else {
                 inner_radius
             };
-            let x = center.x + angle.cos() * radius;
-            let y = center.y + angle.sin() * radius;
+            let p = Point::new(angle.cos() * radius, angle.sin() * radius);
 
             if i == 0 {
-                path.move_to(Point::new(x, y));
+                path.move_to(p);
             } else {
-                path.line_to(Point::new(x, y));
+                path.line_to(p);
             }
         }
         path.close_path();
         path
     }
 
-    /// Draw a heart shape
-    fn draw_heart(center: Point, size: f64, rotation: f64) -> BezPath {
+    /// Unit heart (fits a radius-1 circle) centred on the origin
+    fn unit_heart_path() -> BezPath {
         let mut path = BezPath::new();
 
         // Heart shape using bezier curves
-        let s = size * 0.8;
+        let s = 0.8;
 
-        // Transform points by rotation
-        let rotate = |x: f64, y: f64| -> Point {
-            let cos_r = rotation.cos();
-            let sin_r = rotation.sin();
-            Point::new(
-                center.x + x * cos_r - y * sin_r,
-                center.y + x * sin_r + y * cos_r,
-            )
-        };
-
-        path.move_to(rotate(0.0, -s * 0.3));
+        path.move_to(Point::new(0.0, -s * 0.3));
         // Left curve
         path.curve_to(
-            rotate(-s * 0.5, -s * 0.8),
-            rotate(-s, -s * 0.3),
-            rotate(-s * 0.5, s * 0.2),
+            Point::new(-s * 0.5, -s * 0.8),
+            Point::new(-s, -s * 0.3),
+            Point::new(-s * 0.5, s * 0.2),
         );
         // Bottom point
-        path.line_to(rotate(0.0, s));
+        path.line_to(Point::new(0.0, s));
         // Right curve
-        path.line_to(rotate(s * 0.5, s * 0.2));
+        path.line_to(Point::new(s * 0.5, s * 0.2));
         path.curve_to(
-            rotate(s, -s * 0.3),
-            rotate(s * 0.5, -s * 0.8),
-            rotate(0.0, -s * 0.3),
+            Point::new(s, -s * 0.3),
+            Point::new(s * 0.5, -s * 0.8),
+            Point::new(0.0, -s * 0.3),
         );
         path.close_path();
         path
     }
 
-    /// Draw a sparkle (4-pointed star)
-    fn draw_sparkle(center: Point, size: f64, rotation: f64) -> BezPath {
+    /// Unit sparkle (4-pointed star, outer radius 1) centred on the origin
+    fn unit_sparkle_path() -> BezPath {
         let mut path = BezPath::new();
-        let outer = size;
-        let inner = size * 0.2;
+        let outer = 1.0;
+        let inner = 0.2;
 
         for i in 0..8 {
-            let angle = rotation + (i as f64 * PI / 4.0);
+            let angle = i as f64 * PI / 4.0;
             let radius = if i % 2 == 0 { outer } else { inner };
-            let x = center.x + angle.cos() * radius;
-            let y = center.y + angle.sin() * radius;
+            let p = Point::new(angle.cos() * radius, angle.sin() * radius);
 
             if i == 0 {
-                path.move_to(Point::new(x, y));
+                path.move_to(p);
             } else {
-                path.line_to(Point::new(x, y));
+                path.line_to(p);
             }
         }
         path.close_path();
         path
+    }
+
+    /// Transform mapping a unit shape at the origin to a particle on screen
+    fn particle_transform(center: Point, size: f64, rotation: f64) -> Affine {
+        Affine::translate(center.to_vec2()) * Affine::rotate(rotation) * Affine::scale(size)
     }
 
     /// Draw a particle at the given position
@@ -427,33 +437,30 @@ impl ParticleEffect {
                 );
             }
             ParticleShape::Star => {
-                let path = Self::draw_star(center, size, rotation);
                 scene.fill(
                     Fill::NonZero,
-                    Affine::IDENTITY,
+                    Self::particle_transform(center, size, rotation),
                     &Brush::Solid(color),
                     None,
-                    &path,
+                    &self.unit_star,
                 );
             }
             ParticleShape::Heart => {
-                let path = Self::draw_heart(center, size, rotation);
                 scene.fill(
                     Fill::NonZero,
-                    Affine::IDENTITY,
+                    Self::particle_transform(center, size, rotation),
                     &Brush::Solid(color),
                     None,
-                    &path,
+                    &self.unit_heart,
                 );
             }
             ParticleShape::Sparkle => {
-                let path = Self::draw_sparkle(center, size, rotation);
                 scene.fill(
                     Fill::NonZero,
-                    Affine::IDENTITY,
+                    Self::particle_transform(center, size, rotation),
                     &Brush::Solid(color),
                     None,
-                    &path,
+                    &self.unit_sparkle,
                 );
             }
         }
@@ -465,8 +472,8 @@ impl BackdropEffect for ParticleEffect {
         "particles"
     }
 
-    fn update(&mut self, _dt: f32, time: f32) {
-        self.time = time as f64;
+    fn update(&mut self, _dt: f64, time: f64) {
+        self.time = time;
 
         if self.needs_regeneration {
             self.generate_particles();
@@ -505,8 +512,11 @@ impl BackdropEffect for ParticleEffect {
         }
 
         if let Some(count) = config.get_usize("count") {
+            // Clamp before comparing so an out-of-range value does not
+            // regenerate on every configure/patch/restore.
+            let count = count.clamp(1, 500);
             if count != self.count {
-                self.count = count.clamp(1, 500);
+                self.count = count;
                 self.needs_regeneration = true;
             }
         }
@@ -549,6 +559,11 @@ impl BackdropEffect for ParticleEffect {
 
     fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    fn is_animated(&self) -> bool {
+        // Every behaviour multiplies time by `speed`; zero speed freezes them all.
+        self.enabled && self.speed > 0.0
     }
 }
 
@@ -637,5 +652,60 @@ mod tests {
             ParticleBehavior::from_str("Fall"),
             Some(ParticleBehavior::Fall)
         );
+    }
+
+    #[test]
+    fn test_rng_stride_does_not_correlate_neighbours() {
+        // With the old stride of 6 (but 7 values per particle) the speed of
+        // particle i was derived from the same hash as the x of particle i+1.
+        let mut p = ParticleEffect {
+            count: 50,
+            ..Default::default()
+        };
+        p.generate_particles();
+        for pair in p.particles.windows(2) {
+            let speed_raw = (pair[0].speed - 0.6) / 0.8;
+            assert!(
+                (speed_raw - pair[1].x).abs() > 1e-9,
+                "neighbouring particles share RNG output"
+            );
+        }
+    }
+
+    #[test]
+    fn test_unit_shapes_are_unit_sized() {
+        use vello::kurbo::Shape;
+        for path in [
+            ParticleEffect::unit_star_path(),
+            ParticleEffect::unit_heart_path(),
+            ParticleEffect::unit_sparkle_path(),
+        ] {
+            let bbox = path.bounding_box();
+            assert!(bbox.width() <= 2.0 + 1e-9 && bbox.height() <= 2.0 + 1e-9);
+            assert!(bbox.x0 < 0.0 && bbox.x1 > 0.0, "centred on origin");
+        }
+    }
+
+    #[test]
+    fn test_out_of_range_count_does_not_regenerate_repeatedly() {
+        let mut p = ParticleEffect::default();
+        let mut config = EffectConfig::new();
+        config.insert("count", "10000");
+        p.configure(&config);
+        assert_eq!(p.count, 500);
+        p.update(0.0, 0.0);
+        assert!(!p.needs_regeneration);
+        p.configure(&config);
+        assert!(!p.needs_regeneration);
+    }
+
+    #[test]
+    fn test_is_animated() {
+        let mut p = ParticleEffect::default();
+        assert!(!p.is_animated());
+        p.enabled = true;
+        assert!(p.is_animated());
+        p.speed = 0.0;
+        assert!(!p.is_animated());
     }
 }

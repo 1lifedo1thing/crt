@@ -6,6 +6,7 @@
 mod effects;
 mod handler;
 mod initialization;
+#[cfg(target_os = "macos")]
 mod menu_actions;
 
 use std::collections::HashMap;
@@ -129,8 +130,7 @@ impl App {
     pub(crate) fn new(proxy: EventLoopProxy<WakeReason>) -> Self {
         let config = Config::load();
         let waker = Arc::new(Waker::new(proxy));
-        let config_watcher =
-            watcher::ConfigWatcher::new(Some(waker.wake_fn(WakeReason::Watcher)));
+        let config_watcher = watcher::ConfigWatcher::new(Some(waker.wake_fn(WakeReason::Watcher)));
 
         // Initialize theme registry from themes directory
         let theme_registry = ConfigPaths::from_env_or_default()
@@ -194,7 +194,7 @@ impl App {
                 let result = process_pty_updates(shell);
                 if result.content_changed && Some(*tab_id) == active {
                     state.render.dirty = true;
-                    state.content_hashes.insert(*tab_id, 0);
+                    state.text_rebuild.insert(*tab_id);
                 }
                 if let Some(title) = result.title_change {
                     state.gpu.tab_bar.set_tab_title(*tab_id, title);
@@ -210,7 +210,10 @@ impl App {
                     state.ui.bell.trigger();
                 }
                 if overrides.clear_command_fail {
-                    state.ui.overrides.clear_event(OverrideEventType::CommandFail);
+                    state
+                        .ui
+                        .overrides
+                        .clear_event(OverrideEventType::CommandFail);
                 }
                 for (event_type, properties) in overrides.activations {
                     state.ui.overrides.add(event_type, properties);
@@ -232,10 +235,13 @@ impl App {
     ) {
         use winit::window::Window;
 
-        let mut attrs = Window::default_attributes()
+        let attrs = Window::default_attributes()
             .with_title(title)
             .with_inner_size(winit::dpi::LogicalSize::new(150u32, 28u32))
-            .with_position(winit::dpi::PhysicalPosition::new(screen_x - 75, screen_y + 15))
+            .with_position(winit::dpi::PhysicalPosition::new(
+                screen_x - 75,
+                screen_y + 15,
+            ))
             .with_decorations(false)
             .with_resizable(false)
             .with_window_level(winit::window::WindowLevel::AlwaysOnTop);
@@ -321,10 +327,11 @@ impl App {
         if let Some(ref bg_image) = theme.background_image {
             match BackgroundImageState::new(device, queue, bg_image) {
                 Ok(bg_state) => {
-                    let bind_group = state
-                        .gpu
-                        .background_image_pipeline
-                        .create_bind_group(device, &bg_state.texture.view);
+                    let bind_group = state.gpu.background_image_pipeline.create_bind_group(
+                        device,
+                        &bg_state.texture.view,
+                        bg_state.texture.sampler(),
+                    );
                     log::info!("Loaded background image: {:?}", bg_image.path);
                     state.gpu.background_image_state = Some(bg_state);
                     state.gpu.background_image_bind_group = Some(bind_group);
@@ -446,10 +453,7 @@ impl App {
         if let Some(error) = config_error
             && let Some(state) = self.focused_window_mut()
         {
-            state
-                .ui
-                .toast
-                .show(error, crate::window::ToastType::Error);
+            state.ui.toast.show(error, crate::window::ToastType::Error);
         }
 
         // Check if theme changed
@@ -472,9 +476,7 @@ impl App {
         for state in self.windows.values_mut() {
             // Force redraw
             state.render.dirty = true;
-            for hash in state.content_hashes.values_mut() {
-                *hash = 0;
-            }
+            state.request_text_rebuild_all();
         }
     }
 
@@ -604,9 +606,7 @@ impl App {
 
             // Force full redraw
             state.render.dirty = true;
-            for hash in state.content_hashes.values_mut() {
-                *hash = 0;
-            }
+            state.request_text_rebuild_all();
             state.window.request_redraw();
         }
     }
@@ -678,10 +678,10 @@ impl App {
         if let Err(e) = result {
             log::warn!("Failed to open config file: {}", e);
             if let Some(state) = self.focused_window_mut() {
-                state
-                    .ui
-                    .toast
-                    .show(format!("Couldn't open config: {e}"), crate::window::ToastType::Error);
+                state.ui.toast.show(
+                    format!("Couldn't open config: {e}"),
+                    crate::window::ToastType::Error,
+                );
             }
         }
     }
@@ -700,6 +700,8 @@ impl App {
         }
 
         // Keep the menu item label in sync with the new state.
+        #[cfg(not(target_os = "macos"))]
+        let _ = now_fullscreen;
         #[cfg(target_os = "macos")]
         if let Some(ids) = self.menu_ids.as_ref() {
             ids.toggle_fullscreen_item.set_text(if now_fullscreen {
@@ -736,7 +738,5 @@ pub(crate) fn apply_theme_to_window(
         App::update_background_image(state, &shared.device, &shared.queue, theme);
     }
     state.ui.context_menu.current_theme = theme_name.to_string();
-    for hash in state.content_hashes.values_mut() {
-        *hash = 0;
-    }
+    state.request_text_rebuild_all();
 }

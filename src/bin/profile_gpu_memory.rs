@@ -16,9 +16,7 @@
 use std::io::Write;
 use std::time::Instant;
 
-use crt_renderer::{
-    CrtPipeline, GlyphCache, GlyphStyle, GridRenderer, RectRenderer,
-};
+use crt_renderer::{CrtPipeline, GlyphCache, GlyphStyle, GridRenderer, RectRenderer};
 
 fn main() {
     env_logger::init();
@@ -88,7 +86,7 @@ fn main() {
     );
 
     // Staging buffer (for readback)
-    let padded_row = ((width * 4 + 255) / 256) * 256;
+    let padded_row = (width * 4).div_ceil(256) * 256;
     let staging_bytes = (padded_row as u64) * (height as u64);
     let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("Staging Buffer"),
@@ -104,8 +102,8 @@ fn main() {
 
     // ── Load font and create glyph cache ─────────────────────────────
     let font_data = load_system_font();
-    let mut glyph_cache = GlyphCache::new(&device, &font_data, 14.0)
-        .expect("Failed to create glyph cache");
+    let mut glyph_cache =
+        GlyphCache::new(&device, &font_data, 14.0).expect("Failed to create glyph cache");
 
     let (glyph_count, utilization, atlas_w, atlas_h) = glyph_cache.atlas_stats();
     let atlas_bytes = (atlas_w as u64) * (atlas_h as u64); // R8 = 1 byte/pixel
@@ -142,8 +140,7 @@ fn main() {
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-            | wgpu::TextureUsages::TEXTURE_BINDING,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
     let _crt_view = crt_texture.create_view(&Default::default());
@@ -281,10 +278,9 @@ fn main() {
         // Submit GPU work
         glyph_cache.flush(&queue);
 
-        let mut encoder =
-            device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Frame Encoder"),
-            });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Frame Encoder"),
+        });
 
         // Clear pass
         {
@@ -383,7 +379,7 @@ fn main() {
         + staging_bytes                       // staging
         + final_atlas_bytes                   // glyph atlas
         + tex_bytes                           // CRT intermediate
-        + uniform_bytes;                      // uniforms
+        + uniform_bytes; // uniforms
 
     println!("  Resource                                  Size");
     println!("  ──────────────────────────────────────  ────────");
@@ -473,19 +469,17 @@ fn load_system_font() -> Vec<u8> {
             style: Style::Normal,
             ..Default::default()
         };
-        if let Some(face_id) = db.query(&query) {
-            if let Some(face) = db.face(face_id) {
-                let data = match &face.source {
-                    fontdb::Source::File(path) => std::fs::read(path).ok(),
-                    fontdb::Source::Binary(data) => Some(data.as_ref().as_ref().to_vec()),
-                    fontdb::Source::SharedFile(_path, data) => {
-                        Some(data.as_ref().as_ref().to_vec())
-                    }
-                };
-                if let Some(font_data) = data {
-                    println!("Font: {family}");
-                    return font_data;
-                }
+        if let Some(face_id) = db.query(&query)
+            && let Some(face) = db.face(face_id)
+        {
+            let data = match &face.source {
+                fontdb::Source::File(path) => std::fs::read(path).ok(),
+                fontdb::Source::Binary(data) => Some(data.as_ref().as_ref().to_vec()),
+                fontdb::Source::SharedFile(_path, data) => Some(data.as_ref().as_ref().to_vec()),
+            };
+            if let Some(font_data) = data {
+                println!("Font: {family}");
+                return font_data;
             }
         }
     }

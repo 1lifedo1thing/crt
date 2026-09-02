@@ -2,12 +2,6 @@
 //!
 //! Processes macOS menu bar actions (new tab, close, theme switching, etc.).
 
-use crate::input::{get_clipboard_content, get_terminal_selection_text, paste_to_terminal, set_clipboard_content};
-use crate::menu::MenuAction;
-use winit::event_loop::ActiveEventLoop;
-
-use super::{App, FONT_SCALE_STEP};
-
 #[cfg(target_os = "macos")]
 impl App {
     pub(crate) fn handle_menu_action(&mut self, action: MenuAction, event_loop: &ActiveEventLoop) {

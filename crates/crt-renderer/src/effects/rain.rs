@@ -134,17 +134,25 @@ impl RainEffect {
         (x as f64) / (u64::MAX as f64)
     }
 
+    /// Number of random values consumed per drop.
+    ///
+    /// The hash RNG is indexed, so each drop must own a non-overlapping
+    /// range of indices; otherwise one drop's last value is the next drop's
+    /// first value and neighbours become correlated.
+    const RNG_STRIDE: usize = 5;
+
     /// Generate raindrops
     fn generate_drops(&mut self) {
         self.drops.clear();
         self.drops.reserve(self.density);
 
         for i in 0..self.density {
-            let x = self.random(i * 4);
-            let y = self.random(i * 4 + 1);
-            let speed = 0.7 + self.random(i * 4 + 2) * 0.6; // 0.7-1.3
-            let length = 0.6 + self.random(i * 4 + 3) * 0.8; // 0.6-1.4
-            let brightness = 0.4 + self.random(i * 4 + 4) * 0.6; // 0.4-1.0
+            let base = i * Self::RNG_STRIDE;
+            let x = self.random(base);
+            let y = self.random(base + 1);
+            let speed = 0.7 + self.random(base + 2) * 0.6; // 0.7-1.3
+            let length = 0.6 + self.random(base + 3) * 0.8; // 0.6-1.4
+            let brightness = 0.4 + self.random(base + 4) * 0.6; // 0.4-1.0
 
             self.drops.push(Raindrop {
                 x,
@@ -236,8 +244,8 @@ impl BackdropEffect for RainEffect {
         "rain"
     }
 
-    fn update(&mut self, _dt: f32, time: f32) {
-        self.time = time as f64;
+    fn update(&mut self, _dt: f64, time: f64) {
+        self.time = time;
 
         if self.needs_regeneration {
             self.generate_drops();
@@ -277,8 +285,11 @@ impl BackdropEffect for RainEffect {
         }
 
         if let Some(density) = config.get_usize("density") {
+            // Clamp before comparing so an out-of-range value does not
+            // regenerate on every configure/patch/restore.
+            let density = density.clamp(10, 1000);
             if density != self.density {
-                self.density = density.clamp(10, 1000);
+                self.density = density;
                 self.needs_regeneration = true;
             }
         }
@@ -317,6 +328,10 @@ impl BackdropEffect for RainEffect {
 
     fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    fn is_animated(&self) -> bool {
+        self.enabled && self.speed > 0.0
     }
 }
 
@@ -403,5 +418,49 @@ mod tests {
         rain.configure(&config);
 
         assert_eq!(rain.angle, 60.0); // Clamped to max
+    }
+
+    #[test]
+    fn test_rng_stride_does_not_correlate_neighbours() {
+        // With the old stride of 4 (but 5 values per drop) the brightness of
+        // drop i was derived from the same hash as the x of drop i+1.
+        let mut rain = RainEffect {
+            density: 50,
+            ..Default::default()
+        };
+        rain.generate_drops();
+        for pair in rain.drops.windows(2) {
+            let brightness_raw = (pair[0].brightness - 0.4) / 0.6;
+            assert!(
+                (brightness_raw - pair[1].x).abs() > 1e-9,
+                "neighbouring drops share RNG output"
+            );
+        }
+    }
+
+    #[test]
+    fn test_out_of_range_density_does_not_regenerate_repeatedly() {
+        let mut rain = RainEffect::default();
+        let mut config = EffectConfig::new();
+        config.insert("density", "5000");
+        rain.configure(&config);
+        assert_eq!(rain.density, 1000);
+        rain.update(0.0, 0.0); // regenerates and clears the flag
+        assert!(!rain.needs_regeneration);
+        rain.configure(&config);
+        assert!(
+            !rain.needs_regeneration,
+            "same clamped value must not regenerate"
+        );
+    }
+
+    #[test]
+    fn test_is_animated_follows_speed() {
+        let mut rain = RainEffect::default();
+        assert!(!rain.is_animated(), "disabled effect is not animated");
+        rain.enabled = true;
+        assert!(rain.is_animated());
+        rain.speed = 0.0;
+        assert!(!rain.is_animated());
     }
 }

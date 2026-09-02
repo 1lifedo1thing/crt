@@ -28,8 +28,7 @@ fn main() {
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::new_heap();
 
-    #[cfg(not(feature = "dhat-heap"))]
-    {
+    if cfg!(not(feature = "dhat-heap")) {
         eprintln!("ERROR: Run with --features dhat-heap to enable heap profiling.");
         eprintln!("  cargo run --release --features dhat-heap --bin profile_memory");
         std::process::exit(1);

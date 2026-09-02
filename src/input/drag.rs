@@ -81,6 +81,11 @@ impl TabDragState {
 /// The logic: for each tab rect, if the cursor is past the midpoint, the
 /// insertion point is after that tab. The dragged tab is excluded from
 /// the comparison since it's "in flight".
+///
+/// Pass `dragged_index == usize::MAX` for a merge into *another* window's
+/// tab bar: no tab is removed there, so the insertion index may equal
+/// `tab_rects.len()` (append after the last tab). For a reorder the dragged
+/// tab is removed first, so the maximum index is `len - 1`.
 pub fn compute_reorder_index(
     cursor_x: f32,
     tab_rects: &[crt_renderer::TabRect],
@@ -108,8 +113,14 @@ pub fn compute_reorder_index(
         }
     }
 
-    // Clamp to valid range
-    target.min(tab_rects.len() - 1)
+    // Clamp to valid range: a merge inserts into an untouched bar (len is
+    // valid), a reorder first removes the dragged tab (len - 1 is the max).
+    let max_index = if dragged_index == usize::MAX {
+        tab_rects.len()
+    } else {
+        tab_rects.len() - 1
+    };
+    target.min(max_index)
 }
 
 /// A window's screen-space rectangle and tab bar region, used for drop target resolution.
@@ -187,8 +198,7 @@ pub fn resolve_drop_target(
                     return DragDropTarget::Pending;
                 }
                 let local_x = win.to_local_x(cx);
-                let insert_index =
-                    compute_reorder_index(local_x, &win.tab_rects, dragged_index);
+                let insert_index = compute_reorder_index(local_x, &win.tab_rects, dragged_index);
                 return DragDropTarget::Reorder { insert_index };
             } else {
                 if is_single_tab {
@@ -243,10 +253,10 @@ pub fn should_start_drag(
     }
     // Check hit test — only non-close-button hits
     // Single-tab windows CAN drag (for merging into another window)
-    if let Some((tab_id, is_close)) = tab_bar.hit_test(x, y) {
-        if !is_close {
-            return Some(tab_id);
-        }
+    if let Some((tab_id, is_close)) = tab_bar.hit_test(x, y)
+        && !is_close
+    {
+        return Some(tab_id);
     }
     None
 }
@@ -256,13 +266,11 @@ mod tests {
     use super::*;
 
     // WindowId doesn't have a public constructor, so we test the types we can.
-    // For TabDragState tests we use a helper that creates a state with a fake WindowId
-    // via unsafe — acceptable in tests since we never use the WindowId for actual windowing.
+    // For TabDragState tests we use `WindowId::dummy()`; we never use the id
+    // for actual windowing.
 
     fn make_drag(start_x: f64, start_y: f64) -> TabDragState {
-        // We can't construct a WindowId directly, but we can create one from a u64
-        // using the unsafe From impl that winit provides for testing.
-        let fake_window_id = unsafe { WindowId::dummy() };
+        let fake_window_id = WindowId::dummy();
         TabDragState::new(42, fake_window_id, PhysicalPosition::new(start_x, start_y))
     }
 
@@ -372,7 +380,7 @@ mod tests {
     // ── resolve_drop_target tests ───────────────────────────────
 
     fn make_window_rect(
-        id_num: u64,
+        _id_num: u64,
         x: i32,
         y: i32,
         w: u32,
@@ -392,7 +400,7 @@ mod tests {
             .collect();
         // We need a WindowId but can't construct one easily for non-source windows.
         // Use dummy for all and compare by index.
-        let window_id = unsafe { WindowId::dummy() };
+        let window_id = WindowId::dummy();
         super::WindowScreenRect {
             window_id,
             origin: PhysicalPosition::new(x, y),
@@ -457,14 +465,9 @@ mod tests {
 
     #[test]
     fn resolve_empty_windows_is_detach() {
-        let source_id = unsafe { WindowId::dummy() };
-        let target = super::resolve_drop_target(
-            PhysicalPosition::new(200.0, 200.0),
-            source_id,
-            0,
-            3,
-            &[],
-        );
+        let source_id = WindowId::dummy();
+        let target =
+            super::resolve_drop_target(PhysicalPosition::new(200.0, 200.0), source_id, 0, 3, &[]);
         assert_eq!(target, DragDropTarget::Detach);
     }
 
@@ -494,7 +497,10 @@ mod tests {
         // Set a reorder target
         drag.drop_target = DragDropTarget::Reorder { insert_index: 2 };
         assert!(drag.drag_active);
-        assert_eq!(drag.drop_target, DragDropTarget::Reorder { insert_index: 2 });
+        assert_eq!(
+            drag.drop_target,
+            DragDropTarget::Reorder { insert_index: 2 }
+        );
     }
 
     #[test]
@@ -565,6 +571,27 @@ mod tests {
         // Cursor way past all tabs — should target last position
         let idx = super::compute_reorder_index(10000.0, &rects, 0);
         assert_eq!(idx, 2); // Last valid index
+    }
+
+    #[test]
+    fn merge_index_past_last_tab_appends() {
+        let rects = make_tab_rects(3);
+        // Merge (no dragged tab in this bar): cursor past the last tab's
+        // midpoint must insert *after* it, i.e. at index len.
+        let idx = super::compute_reorder_index(10000.0, &rects, usize::MAX);
+        assert_eq!(idx, 3);
+        // Just past the last midpoint (x = 218 + 50 = 268) behaves the same.
+        let idx = super::compute_reorder_index(270.0, &rects, usize::MAX);
+        assert_eq!(idx, 3);
+        // Before the last midpoint → insert before the last tab.
+        let idx = super::compute_reorder_index(260.0, &rects, usize::MAX);
+        assert_eq!(idx, 2);
+    }
+
+    #[test]
+    fn merge_index_before_first_tab_is_zero() {
+        let rects = make_tab_rects(3);
+        assert_eq!(super::compute_reorder_index(0.0, &rects, usize::MAX), 0);
     }
 
     #[test]

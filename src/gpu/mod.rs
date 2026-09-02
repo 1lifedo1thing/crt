@@ -10,9 +10,9 @@
 
 mod texture_pool;
 
-pub use texture_pool::{PooledTexture, TexturePool};
 #[allow(unused_imports)]
 pub use texture_pool::TexturePoolStats;
+pub use texture_pool::{PooledTexture, TexturePool};
 
 use std::sync::{Arc, Mutex};
 
@@ -99,7 +99,10 @@ impl SharedGpuState {
     /// Subsequent calls are no-ops.
     pub fn ensure_shared_pipelines(&mut self, target_format: wgpu::TextureFormat) {
         if self.shared_pipelines.is_none() {
-            log::info!("Creating shared render pipelines for format {:?}", target_format);
+            log::info!(
+                "Creating shared render pipelines for format {:?}",
+                target_format
+            );
             self.shared_pipelines = Some(SharedPipelines::new(&self.device, target_format));
         }
     }
@@ -139,7 +142,6 @@ impl SharedGpuState {
     pub fn vello_renderer_arc(&self) -> Arc<Mutex<Option<vello::Renderer>>> {
         self.vello_renderer.clone()
     }
-
 }
 
 /// Per-window GPU state (surface tied to specific window)
@@ -156,10 +158,11 @@ pub struct WindowGpuState {
 
     // Fixed-size glyph cache for tab titles (doesn't scale with zoom)
     pub tab_glyph_cache: GlyphCache,
-    // Separate renderer for tab titles to avoid buffer conflicts
-    // (terminal and tab titles render in different passes but the GPU
-    // commands are batched, so they need separate instance buffers)
+    // Renderer for tab titles (owned buffer; rebuilt when the tab bar's
+    // titles_version changes) and, transiently, overlay text
     pub tab_title_renderer: GridRenderer,
+    /// `TabBar::titles_version()` the title glyphs were last built for
+    pub tab_titles_version: Option<u64>,
 
     // Per-frame bump allocator for transient vertex data (overlays, dialogs, tab bar)
     pub arena: FrameArena,

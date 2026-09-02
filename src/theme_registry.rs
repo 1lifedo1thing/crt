@@ -136,6 +136,7 @@ impl ThemeRegistry {
     }
 
     /// Get the default theme name
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn default_theme_name(&self) -> &str {
         &self.default_theme
     }
@@ -237,7 +238,11 @@ mod tests {
         assert_eq!(registry.reload_path(&path).as_deref(), Some("a"));
         // b is untouched (same Arc), a was re-parsed
         assert!(Arc::ptr_eq(&before_b, registry.get_theme("b").unwrap()));
-        assert!(registry.reload_path(&dir.path().join("notes.txt")).is_none());
+        assert!(
+            registry
+                .reload_path(&dir.path().join("notes.txt"))
+                .is_none()
+        );
         fs::remove_file(&path).unwrap();
         assert_eq!(registry.reload_path(&path).as_deref(), Some("a"));
         assert!(registry.get_theme("a").is_none());
@@ -260,7 +265,11 @@ mod tests {
 
     #[test]
     fn list_themes_sorted_alphabetically() {
-        let dir = setup_themes_dir(&[("zeta", MINIMAL_CSS), ("alpha", MINIMAL_CSS), ("mid", MINIMAL_CSS)]);
+        let dir = setup_themes_dir(&[
+            ("zeta", MINIMAL_CSS),
+            ("alpha", MINIMAL_CSS),
+            ("mid", MINIMAL_CSS),
+        ]);
         let registry = ThemeRegistry::new(dir.path().to_path_buf(), "alpha".to_string());
         assert_eq!(registry.list_themes(), vec!["alpha", "mid", "zeta"]);
     }

@@ -80,10 +80,17 @@ impl TabLayout {
         self.bar_height
     }
 
-    /// Get the content offset (x, y) in logical pixels
-    /// Content starts below the tab bar plus content padding
+    /// Get the content offset (x, y) in PHYSICAL pixels.
+    ///
+    /// Content starts below the tab bar plus content padding. The bar itself
+    /// is drawn `height() * scale_factor` tall, so this is the same quantity
+    /// scaled, plus the scaled content padding. Every consumer adds this to
+    /// physical (framebuffer) coordinates.
     pub fn content_offset(&self) -> (f32, f32) {
-        (0.0, self.bar_height + self.content_padding)
+        (
+            0.0,
+            (self.bar_height + self.content_padding) * self.scale_factor,
+        )
     }
 
     /// Set content padding from theme
@@ -244,6 +251,22 @@ mod tests {
     }
 
     #[test]
+    fn content_offset_is_physical_at_scale_2() {
+        let mut layout = TabLayout::new();
+        layout.set_scale_factor(2.0);
+        // height() stays logical...
+        assert_eq!(layout.height(), 36.0);
+        // ...but the content offset is physical: (36 + 4) * 2
+        assert_eq!(layout.content_offset(), (0.0, 80.0));
+
+        // And it lines up with the bar drawn `height() * scale` tall plus the
+        // scaled content padding.
+        layout.set_content_padding(6.0);
+        let (_, off) = layout.content_offset();
+        assert_eq!(off, layout.height() * 2.0 + 6.0 * 2.0);
+    }
+
+    #[test]
     fn resize_updates_screen_size() {
         let mut layout = TabLayout::new();
         layout.resize(1024.0, 768.0);
@@ -275,20 +298,33 @@ mod tests {
 
     #[test]
     fn calculate_rects_zero_tabs() {
-        let mut state = TabBarState::new();
-        // Remove the default tab by creating a fresh state with manipulated internals
-        // Actually, TabBarState always has at least 1 tab, so test with 1
+        let mut state = TabBarState::empty();
+        assert_eq!(state.tab_count(), 0);
         let theme = TabTheme::default();
         let mut layout = TabLayout::new();
         layout.resize(800.0, 600.0);
         layout.calculate_rects(&state, &theme);
-        assert_eq!(layout.tab_rects().len(), 1);
 
-        // Add more tabs
+        // No tabs: no rects, no "+" button, nothing hit-testable, dirty cleared.
+        assert!(layout.tab_rects().is_empty());
+        assert!(layout.new_tab_button_rect().is_none());
+        assert_eq!(layout.hit_test(10.0, 10.0), None);
+        assert!(!layout.hit_test_new_tab_button(10.0, 10.0));
+        assert!(!layout.is_dirty());
+
+        // Adding a tab afterwards lays out normally.
         state.add_tab(1, "A");
         layout.mark_dirty();
         layout.calculate_rects(&state, &theme);
-        assert_eq!(layout.tab_rects().len(), 2);
+        assert_eq!(layout.tab_rects().len(), 1);
+        assert!(layout.new_tab_button_rect().is_some());
+
+        // And going back to zero clears stale rects.
+        assert!(state.remove_tab(1).is_some());
+        layout.mark_dirty();
+        layout.calculate_rects(&state, &theme);
+        assert!(layout.tab_rects().is_empty());
+        assert!(layout.new_tab_button_rect().is_none());
     }
 
     #[test]
@@ -316,7 +352,9 @@ mod tests {
     fn new_tab_button_present_with_room() {
         // A few tabs on a wide screen leave room for the "+" button.
         let layout = layout_with_rects(3);
-        let button = layout.new_tab_button_rect().expect("button should be present");
+        let button = layout
+            .new_tab_button_rect()
+            .expect("button should be present");
         let last_tab = layout.tab_rects().last().unwrap();
         // Button sits to the right of the last tab.
         assert!(button.x >= last_tab.x + last_tab.width);
@@ -327,7 +365,10 @@ mod tests {
         ));
         // The button is not mistaken for a tab.
         assert_eq!(
-            layout.hit_test(button.x + button.width / 2.0, button.y + button.height / 2.0),
+            layout.hit_test(
+                button.x + button.width / 2.0,
+                button.y + button.height / 2.0
+            ),
             None
         );
     }
@@ -374,8 +415,10 @@ mod tests {
     fn hit_test_second_tab() {
         let layout = layout_with_rects(3);
         let second = &layout.tab_rects()[1];
-        let result =
-            layout.hit_test(second.x + second.width / 2.0, second.y + second.height / 2.0);
+        let result = layout.hit_test(
+            second.x + second.width / 2.0,
+            second.y + second.height / 2.0,
+        );
         assert_eq!(result, Some((1, false)));
     }
 

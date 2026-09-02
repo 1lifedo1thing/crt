@@ -19,11 +19,28 @@
 //! - `--grid-vanishing-spread: <number>` (0-1, how spread lines are at horizon)
 //! - `--grid-curved: true|false` (curved or straight vertical lines)
 
+use std::sync::Mutex;
+
 use vello::Scene;
 use vello::kurbo::{Affine, BezPath, Line, Point, Rect, Stroke};
 use vello::peniko::{Brush, Color};
 
 use super::{BackdropEffect, EffectConfig};
+
+/// Cached vertical-line geometry.
+///
+/// The vertical lines of the grid do not animate; they depend only on the
+/// bounds and the geometry configuration. They are rebuilt when either
+/// changes instead of allocating a `BezPath` per line per frame.
+#[derive(Default)]
+struct VerticalLineCache {
+    /// Bounds the cache was built for
+    bounds: Option<Rect>,
+    /// Configuration generation the cache was built for
+    generation: u64,
+    /// One entry per vertical line: (path, alpha 0-255)
+    lines: Vec<(BezPath, u8)>,
+}
 
 /// RGBA color stored as u8 components
 #[derive(Debug, Clone, Copy)]
@@ -84,6 +101,13 @@ pub struct GridEffect {
 
     /// Whether vertical lines curve (true) or are straight (false)
     curved: bool,
+
+    /// Bumped on every `configure` so the vertical-line cache can detect
+    /// geometry changes
+    generation: u64,
+
+    /// Cached vertical-line paths (see `VerticalLineCache`)
+    vertical_cache: Mutex<VerticalLineCache>,
 }
 
 impl Default for GridEffect {
@@ -102,6 +126,8 @@ impl Default for GridEffect {
             glow_intensity: 0.0,
             vanishing_spread: 0.3,
             curved: true,
+            generation: 0,
+            vertical_cache: Mutex::new(VerticalLineCache::default()),
         }
     }
 }
@@ -130,6 +156,85 @@ impl GridEffect {
         let grid_height = bottom_y - horizon_y;
         let perspective_t = t.powf(self.perspective);
         horizon_y + perspective_t * grid_height
+    }
+
+    /// Build the vertical line geometry for the given bounds.
+    ///
+    /// Returns one `(path, alpha)` entry per visible vertical line.
+    fn build_vertical_lines(&self, bounds: Rect) -> Vec<(BezPath, u8)> {
+        let width = bounds.width();
+        let height = bounds.height();
+        let horizon_y = bounds.y0 + height * self.horizon;
+        let bottom_y = bounds.y1;
+        let grid_height = bottom_y - horizon_y;
+        let center_x = bounds.x0 + width / 2.0;
+
+        // Vanishing spread: controls how much lines fan out from horizon to bottom
+        // Higher values = more spread at bottom relative to horizon
+        let spread = self.vanishing_spread.max(0.01);
+
+        // Calculate line count to fill the horizon
+        // At horizon we want full screen coverage, at bottom lines extend beyond
+        let base_line_count = (self.spacing * 2.0) as usize;
+        // Need more lines because outer ones go off-screen at bottom
+        let v_line_count = ((base_line_count as f64) * (spread + 1.0) / spread) as usize;
+        let half_count = (v_line_count / 2).max(1);
+
+        // Start vertical lines slightly below horizon
+        // Use half the horizontal line spacing so verticals begin at first h-line
+        let start_t = 0.5 / (self.spacing * 2.0);
+
+        let mut lines = Vec::with_capacity(v_line_count + 1);
+
+        for i in 0..=v_line_count {
+            // x_offset: -1 to 1 maps to full horizon width
+            let x_offset = (i as f64 - half_count as f64) / half_count as f64;
+
+            // Fade based on horizon position (center = brightest)
+            let center_fade = 1.0 - x_offset.abs() * 0.3;
+            let alpha =
+                (self.color.a as f64 / 255.0 * self.intensity * center_fade.max(0.0) * 255.0) as u8;
+
+            if alpha == 0 {
+                continue;
+            }
+
+            let mut path = BezPath::new();
+
+            if self.curved {
+                let curve_segments = 20;
+
+                for seg in 0..=curve_segments {
+                    // Start from first horizontal line, not the horizon itself
+                    let t = start_t + (1.0 - start_t) * (seg as f64 / curve_segments as f64);
+                    let y = horizon_y + t * grid_height;
+
+                    // At horizon (t=0): x = x_offset * width/2 (fills screen)
+                    // At bottom (t=1): x = x_offset * width/2 * (spread+1)/spread (extends beyond)
+                    let perspective_t = t.powf(self.perspective);
+                    let x = center_x + x_offset * width * 0.5 * (spread + perspective_t) / spread;
+
+                    if seg == 0 {
+                        path.move_to(Point::new(x, y));
+                    } else {
+                        path.line_to(Point::new(x, y));
+                    }
+                }
+            } else {
+                // Straight lines - start below horizon
+                let start_perspective = start_t.powf(self.perspective);
+                let start_x =
+                    center_x + x_offset * width * 0.5 * (spread + start_perspective) / spread;
+                let start_y = horizon_y + start_t * grid_height;
+                let bottom_x = center_x + x_offset * width * 0.5 * (spread + 1.0) / spread;
+                path.move_to(Point::new(start_x, start_y));
+                path.line_to(Point::new(bottom_x, bottom_y));
+            }
+
+            lines.push((path, alpha));
+        }
+
+        lines
     }
 
     /// Calculate fade factor based on distance from horizon
@@ -191,8 +296,8 @@ impl BackdropEffect for GridEffect {
         "grid"
     }
 
-    fn update(&mut self, _dt: f32, time: f32) {
-        self.time_offset = time as f64 * self.animation_speed;
+    fn update(&mut self, _dt: f64, time: f64) {
+        self.time_offset = time * self.animation_speed;
     }
 
     fn render(&self, scene: &mut Scene, bounds: Rect) {
@@ -200,7 +305,6 @@ impl BackdropEffect for GridEffect {
             return;
         }
 
-        let width = bounds.width();
         let height = bounds.height();
         let horizon_y = bounds.y0 + height * self.horizon;
         let bottom_y = bounds.y1;
@@ -209,8 +313,6 @@ impl BackdropEffect for GridEffect {
         if grid_height <= 0.0 {
             return;
         }
-
-        let center_x = bounds.x0 + width / 2.0;
 
         // Number of horizontal lines based on spacing
         let h_line_count = (self.spacing * 2.0) as usize;
@@ -246,70 +348,23 @@ impl BackdropEffect for GridEffect {
             self.stroke_with_glow(scene, &line, adjusted_width, line_color);
         }
 
-        // Vanishing spread: controls how much lines fan out from horizon to bottom
-        // Higher values = more spread at bottom relative to horizon
-        let spread = self.vanishing_spread.max(0.01);
+        // Draw vertical lines: fill horizon, fan out toward bottom.
+        // Their geometry is static, so it is cached per (bounds, config).
+        // A poisoned lock only means a previous panic mid-build; recover the
+        // guard and rebuild.
+        let mut cache = self
+            .vertical_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if cache.bounds != Some(bounds) || cache.generation != self.generation {
+            cache.lines = self.build_vertical_lines(bounds);
+            cache.bounds = Some(bounds);
+            cache.generation = self.generation;
+        }
 
-        // Calculate line count to fill the horizon
-        // At horizon we want full screen coverage, at bottom lines extend beyond
-        let base_line_count = (self.spacing * 2.0) as usize;
-        // Need more lines because outer ones go off-screen at bottom
-        let v_line_count = ((base_line_count as f64) * (spread + 1.0) / spread) as usize;
-        let half_count = (v_line_count / 2).max(1);
-
-        // Draw vertical lines: fill horizon, fan out toward bottom
-        for i in 0..=v_line_count {
-            // x_offset: -1 to 1 maps to full horizon width
-            let x_offset = (i as f64 - half_count as f64) / half_count as f64;
-
-            // Fade based on horizon position (center = brightest)
-            let center_fade = 1.0 - x_offset.abs() * 0.3;
-            let alpha =
-                (self.color.a as f64 / 255.0 * self.intensity * center_fade.max(0.0) * 255.0) as u8;
-
-            if alpha == 0 {
-                continue;
-            }
-
-            let line_color = self.color.with_alpha(alpha);
-
-            // Start vertical lines slightly below horizon
-            // Use half the horizontal line spacing so verticals begin at first h-line
-            let start_t = 0.5 / (self.spacing * 2.0);
-
-            if self.curved {
-                let curve_segments = 20;
-                let mut path = BezPath::new();
-
-                for seg in 0..=curve_segments {
-                    // Start from first horizontal line, not the horizon itself
-                    let t = start_t + (1.0 - start_t) * (seg as f64 / curve_segments as f64);
-                    let y = horizon_y + t * grid_height;
-
-                    // At horizon (t=0): x = x_offset * width/2 (fills screen)
-                    // At bottom (t=1): x = x_offset * width/2 * (spread+1)/spread (extends beyond)
-                    let perspective_t = t.powf(self.perspective);
-                    let x = center_x + x_offset * width * 0.5 * (spread + perspective_t) / spread;
-
-                    if seg == 0 {
-                        path.move_to(Point::new(x, y));
-                    } else {
-                        path.line_to(Point::new(x, y));
-                    }
-                }
-
-                self.stroke_with_glow(scene, &path, self.line_width, line_color);
-            } else {
-                // Straight lines - start below horizon
-                let start_perspective = start_t.powf(self.perspective);
-                let start_x =
-                    center_x + x_offset * width * 0.5 * (spread + start_perspective) / spread;
-                let start_y = horizon_y + start_t * grid_height;
-                let bottom_x = center_x + x_offset * width * 0.5 * (spread + 1.0) / spread;
-                let line = Line::new((start_x, start_y), (bottom_x, bottom_y));
-
-                self.stroke_with_glow(scene, &line, self.line_width, line_color);
-            }
+        for (path, alpha) in &cache.lines {
+            let line_color = self.color.with_alpha(*alpha);
+            self.stroke_with_glow(scene, path, self.line_width, line_color);
         }
     }
 
@@ -319,15 +374,17 @@ impl BackdropEffect for GridEffect {
         }
 
         if let Some(spacing) = config.get_f64("spacing") {
-            self.spacing = spacing;
+            // spacing < 1 would produce zero lines and a division by zero in start_t
+            self.spacing = spacing.max(1.0);
         }
 
         if let Some(line_width) = config.get_f64("line-width") {
-            self.line_width = line_width;
+            self.line_width = line_width.max(0.0);
         }
 
         if let Some(perspective) = config.get_f64("perspective") {
-            self.perspective = perspective;
+            // Negative exponents blow up t.powf() near the horizon
+            self.perspective = perspective.max(0.0);
         }
 
         if let Some(horizon) = config.get_f64("horizon") {
@@ -365,10 +422,17 @@ impl BackdropEffect for GridEffect {
                 self.color = color;
             }
         }
+
+        // Any of the above may change vertical-line geometry
+        self.generation = self.generation.wrapping_add(1);
     }
 
     fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    fn is_animated(&self) -> bool {
+        self.enabled && self.intensity > 0.0 && self.animation_speed != 0.0
     }
 }
 
@@ -487,5 +551,60 @@ mod tests {
             y_mid < linear_mid,
             "Perspective should compress toward horizon"
         );
+    }
+
+    #[test]
+    fn test_spacing_and_perspective_clamped() {
+        let mut grid = GridEffect::default();
+        let mut config = EffectConfig::new();
+        config.insert("spacing", "0");
+        config.insert("perspective", "-3");
+        grid.configure(&config);
+        assert_eq!(grid.spacing, 1.0);
+        assert_eq!(grid.perspective, 0.0);
+    }
+
+    #[test]
+    fn test_is_animated() {
+        let mut grid = GridEffect::default();
+        assert!(!grid.is_animated());
+        grid.enabled = true;
+        assert!(grid.is_animated());
+        grid.animation_speed = 0.0;
+        assert!(!grid.is_animated());
+    }
+
+    #[test]
+    fn test_vertical_cache_rebuilds_on_bounds_or_config_change() {
+        let mut grid = GridEffect {
+            enabled: true,
+            ..Default::default()
+        };
+        let bounds_a = Rect::new(0.0, 0.0, 800.0, 600.0);
+        let bounds_b = Rect::new(0.0, 0.0, 1024.0, 768.0);
+
+        let mut scene = Scene::new();
+        grid.render(&mut scene, bounds_a);
+        let (gen_a, n_a) = {
+            let c = grid.vertical_cache.lock().unwrap();
+            assert_eq!(c.bounds, Some(bounds_a));
+            (c.generation, c.lines.len())
+        };
+        assert!(n_a > 0);
+
+        // Same bounds/config: cache retained
+        grid.render(&mut scene, bounds_a);
+        assert_eq!(grid.vertical_cache.lock().unwrap().generation, gen_a);
+
+        // New bounds: rebuilt for the new bounds
+        grid.render(&mut scene, bounds_b);
+        assert_eq!(grid.vertical_cache.lock().unwrap().bounds, Some(bounds_b));
+
+        // Config change bumps generation and rebuilds
+        let mut config = EffectConfig::new();
+        config.insert("curved", "false");
+        grid.configure(&config);
+        grid.render(&mut scene, bounds_b);
+        assert_ne!(grid.vertical_cache.lock().unwrap().generation, gen_a);
     }
 }

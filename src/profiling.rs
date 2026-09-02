@@ -285,8 +285,7 @@ pub fn grid_snapshot_due() -> bool {
     }
     let mut due = false;
     with_profiler(|p| {
-        due = p.last_grid_snapshot.elapsed()
-            >= Duration::from_secs(GRID_SNAPSHOT_INTERVAL_SECS)
+        due = p.last_grid_snapshot.elapsed() >= Duration::from_secs(GRID_SNAPSHOT_INTERVAL_SECS)
     });
     due
 }
