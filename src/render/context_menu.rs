@@ -278,7 +278,7 @@ pub fn render(
         state
             .gpu
             .rect_renderer
-            .render(&shared.queue, &mut pass, &state.gpu.rect_instance_buffer);
+            .render_transient(&shared.queue, &mut pass, &mut state.gpu.arena);
     }
 
     // Render menu text
@@ -403,11 +403,7 @@ pub fn render(
             occlusion_query_set: None,
         });
 
-        state.gpu.tab_title_renderer.render(
-            &shared.queue,
-            &mut pass,
-            &state.gpu.overlay_text_instance_buffer,
-        );
+        state.gpu.tab_title_renderer.render_transient(&shared.queue, &mut pass, &mut state.gpu.arena);
     }
 }
 

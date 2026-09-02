@@ -11,8 +11,8 @@ use crate::gpu::{SharedGpuState, WindowGpuState};
 use crate::window::{self, WindowState};
 use crt_core::{ShellTerminal, Size, SpawnOptions};
 use crt_renderer::{
-    BackgroundImagePipeline, BackgroundImageState, CrtPipeline, EffectsRenderer, GlyphCache,
-    GridEffect, GridRenderer, MatrixEffect, ParticleEffect, RainEffect, RectRenderer, ShapeEffect,
+    BackgroundImagePipeline, BackgroundImageState, CrtPipeline, EffectsRenderer, FrameArena,
+    GlyphCache, GridEffect, GridRenderer, MatrixEffect, ParticleEffect, RainEffect, RectRenderer, ShapeEffect,
     SpriteEffect, StarfieldEffect, Tab, TabBar,
 };
 use winit::event_loop::ActiveEventLoop;
@@ -208,32 +208,11 @@ impl App {
         // to avoid buffer conflicts with tab bar rendering
         let overlay_rect_renderer = RectRenderer::new_with_shared(&shared.device, &pipelines.rect);
 
-        // Checkout instance buffers from pool (reused across window lifecycles)
-        use crate::gpu::BufferClass;
-        let grid_instance_buffer = shared
-            .buffer_pool
-            .checkout(BufferClass::GridInstance)
-            .expect("Buffer pool checkout failed");
-        let output_grid_instance_buffer = shared
-            .buffer_pool
-            .checkout(BufferClass::GridInstance)
-            .expect("Buffer pool checkout failed");
-        let tab_title_instance_buffer = shared
-            .buffer_pool
-            .checkout(BufferClass::GridInstance)
-            .expect("Buffer pool checkout failed");
-        let overlay_text_instance_buffer = shared
-            .buffer_pool
-            .checkout(BufferClass::GridInstance)
-            .expect("Buffer pool checkout failed");
-        let rect_instance_buffer = shared
-            .buffer_pool
-            .checkout(BufferClass::RectInstance)
-            .expect("Buffer pool checkout failed");
-        let overlay_rect_instance_buffer = shared
-            .buffer_pool
-            .checkout(BufferClass::RectInstance)
-            .expect("Buffer pool checkout failed");
+        // Rect renderer for cell backgrounds (owned buffer, uploaded on change)
+        let cell_bg_renderer = RectRenderer::new_with_shared(&shared.device, &pipelines.rect);
+
+        // Per-frame arena for transient vertex data (grows on demand)
+        let arena = FrameArena::new(&shared.device, 1024 * 1024, "Window Frame Arena");
 
         // Background image pipeline (always created, state only if theme has background image)
         let background_image_pipeline = BackgroundImagePipeline::new_with_shared(&shared.device, &pipelines.background_image);
@@ -294,18 +273,14 @@ impl App {
             output_grid_renderer,
             tab_glyph_cache,
             tab_title_renderer,
-            grid_instance_buffer,
-            output_grid_instance_buffer,
-            tab_title_instance_buffer,
-            overlay_text_instance_buffer,
+            arena,
             effect_pipeline,
             effects_renderer,
             tab_bar,
             terminal_vello,
+            cell_bg_renderer,
             rect_renderer,
             overlay_rect_renderer,
-            rect_instance_buffer,
-            overlay_rect_instance_buffer,
             background_image_pipeline,
             background_image_state,
             background_image_bind_group,

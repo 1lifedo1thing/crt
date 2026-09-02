@@ -54,7 +54,7 @@ pub fn render_bell_flash(
     state
         .gpu
         .rect_renderer
-        .render(&shared.queue, &mut pass, &state.gpu.rect_instance_buffer);
+        .render_transient(&shared.queue, &mut pass, &mut state.gpu.arena);
 }
 
 /// Render zoom indicator overlay (centered pill showing zoom percentage)
@@ -129,7 +129,7 @@ pub fn render_zoom_indicator(
         state
             .gpu
             .rect_renderer
-            .render(&shared.queue, &mut pass, &state.gpu.rect_instance_buffer);
+            .render_transient(&shared.queue, &mut pass, &mut state.gpu.arena);
     }
 
     // Render text using tab title renderer
@@ -173,11 +173,7 @@ pub fn render_zoom_indicator(
             occlusion_query_set: None,
         });
 
-        state.gpu.tab_title_renderer.render(
-            &shared.queue,
-            &mut pass,
-            &state.gpu.overlay_text_instance_buffer,
-        );
+        state.gpu.tab_title_renderer.render_transient(&shared.queue, &mut pass, &mut state.gpu.arena);
     }
 }
 
@@ -252,7 +248,7 @@ pub fn render_copy_indicator(
         state
             .gpu
             .rect_renderer
-            .render(&shared.queue, &mut pass, &state.gpu.rect_instance_buffer);
+            .render_transient(&shared.queue, &mut pass, &mut state.gpu.arena);
     }
 
     // Render text using tab title renderer
@@ -296,11 +292,7 @@ pub fn render_copy_indicator(
             occlusion_query_set: None,
         });
 
-        state.gpu.tab_title_renderer.render(
-            &shared.queue,
-            &mut pass,
-            &state.gpu.overlay_text_instance_buffer,
-        );
+        state.gpu.tab_title_renderer.render_transient(&shared.queue, &mut pass, &mut state.gpu.arena);
     }
 }
 
@@ -387,7 +379,7 @@ pub fn render_toast(
         state
             .gpu
             .rect_renderer
-            .render(&shared.queue, &mut pass, &state.gpu.rect_instance_buffer);
+            .render_transient(&shared.queue, &mut pass, &mut state.gpu.arena);
     }
 
     // Render text using tab title renderer
@@ -431,10 +423,6 @@ pub fn render_toast(
             occlusion_query_set: None,
         });
 
-        state.gpu.tab_title_renderer.render(
-            &shared.queue,
-            &mut pass,
-            &state.gpu.overlay_text_instance_buffer,
-        );
+        state.gpu.tab_title_renderer.render_transient(&shared.queue, &mut pass, &mut state.gpu.arena);
     }
 }

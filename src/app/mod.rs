@@ -319,7 +319,6 @@ impl App {
                 // This frees GPU memory from closed windows while keeping
                 // one texture per bucket for quick reuse on next window
                 shared.texture_pool.shrink();
-                shared.buffer_pool.shrink();
 
                 // Reset Vello renderer to free accumulated texture atlas memory
                 // This prevents unbounded growth from windows being opened/closed

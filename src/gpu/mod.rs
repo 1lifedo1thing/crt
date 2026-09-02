@@ -3,27 +3,23 @@
 //! Shared and per-window GPU resources for wgpu rendering.
 //!
 //! ## Module Structure
-//! - `buffer_pool` - Instance/uniform buffer pooling with RAII semantics
-//! - `texture_pool` - Render target texture pooling by size bucket
+//! - `texture_pool` - Render target texture pooling
+//!
+//! Vertex data uses `crt_renderer::FrameArena` (per-frame bump allocation for
+//! transient passes) and renderer-owned buffers for persistent content.
 
-mod buffer_pool;
 mod texture_pool;
 
-// Buffer pool exports - API ready, see buffer_pool.rs for full pool integration
-#[allow(unused_imports)]
-pub use buffer_pool::{BufferClass, BufferPool, PoolStats, PooledBuffer};
-
-// Texture pool - fully integrated
 pub use texture_pool::{PooledTexture, TexturePool};
 #[allow(unused_imports)]
-pub use texture_pool::{TextureBucket, TexturePoolStats};
+pub use texture_pool::TexturePoolStats;
 
 use std::sync::{Arc, Mutex};
 
 use crt_renderer::{
     BackgroundImagePipeline, BackgroundImageState, CrtPipeline, EffectPipeline, EffectsRenderer,
-    GlyphCache, GridRenderer, RectRenderer, SharedPipelines, SpriteAnimationState, TabBar,
-    TerminalVelloRenderer,
+    FrameArena, GlyphCache, GridRenderer, RectRenderer, SharedPipelines, SpriteAnimationState,
+    TabBar, TerminalVelloRenderer,
 };
 
 /// Shared GPU resources across all windows
@@ -36,10 +32,6 @@ pub struct SharedGpuState {
     /// (rounded corners, gradients, shadows, backdrop effects, etc.)
     /// Wrapped in Arc<Mutex> for sharing with EffectsRenderer
     pub vello_renderer: Arc<Mutex<Option<vello::Renderer>>>,
-    /// Buffer pool for reusing instance/uniform buffers
-    /// API ready - see buffer_pool.rs for full pool integration
-    #[allow(dead_code)]
-    pub buffer_pool: BufferPool,
     /// Texture pool for reusing render target textures (fully integrated)
     pub texture_pool: TexturePool,
     /// Shared render pipelines across all windows (created lazily on first window)
@@ -86,10 +78,6 @@ impl SharedGpuState {
         // (rounded corners, gradients, shadows, backdrop effects, complex paths)
         let vello_renderer = Arc::new(Mutex::new(None));
 
-        // Create buffer pool for reusing instance/uniform buffers
-        // Max 4 buffers per class keeps memory reasonable while allowing reuse
-        let buffer_pool = BufferPool::new(device.clone(), 4);
-
         // Create texture pool for reusing render target textures
         // Max 2 textures per bucket since textures are large (~8MB+ each)
         let texture_pool = TexturePool::new(device.clone(), 2);
@@ -100,7 +88,6 @@ impl SharedGpuState {
             device,
             queue,
             vello_renderer,
-            buffer_pool,
             texture_pool,
             shared_pipelines: None,
         }
@@ -204,11 +191,8 @@ pub struct WindowGpuState {
     // commands are batched, so they need separate instance buffers)
     pub tab_title_renderer: GridRenderer,
 
-    // Instance buffers for grid renderers (pooled for reuse across window lifecycles)
-    pub grid_instance_buffer: PooledBuffer,
-    pub output_grid_instance_buffer: PooledBuffer,
-    pub tab_title_instance_buffer: PooledBuffer,
-    pub overlay_text_instance_buffer: PooledBuffer,
+    // Per-frame bump allocator for transient vertex data (overlays, dialogs, tab bar)
+    pub arena: FrameArena,
 
     // Effect pipeline
     pub effect_pipeline: EffectPipeline,
@@ -222,16 +206,15 @@ pub struct WindowGpuState {
     // Terminal vello renderer for cursor and selection
     pub terminal_vello: TerminalVelloRenderer,
 
-    // Rect renderer for cell backgrounds and tab bar shapes
+    // Rect renderer for cell backgrounds (owned buffer, re-uploaded on content change)
+    pub cell_bg_renderer: RectRenderer,
+
+    // Rect renderer for tab bar shapes and transient UI (arena-backed)
     pub rect_renderer: RectRenderer,
 
     // Separate rect renderer for overlays (cursor, selection, underlines)
     // to avoid buffer conflicts with tab bar rendering
     pub overlay_rect_renderer: RectRenderer,
-
-    // Instance buffers for rect renderers (pooled for reuse across window lifecycles)
-    pub rect_instance_buffer: PooledBuffer,
-    pub overlay_rect_instance_buffer: PooledBuffer,
 
     // Background image rendering (optional)
     pub background_image_pipeline: BackgroundImagePipeline,

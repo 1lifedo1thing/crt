@@ -368,6 +368,8 @@ pub fn render_frame(state: &mut WindowState, shared: &mut SharedGpuState) {
     };
 
     let render_start = Instant::now();
+    // Per-frame transient vertex allocations start fresh (grows if last frame overflowed)
+    state.gpu.arena.begin(&shared.device);
     let mut encoder = shared.device.create_command_encoder(&Default::default());
 
     // Update effect uniforms
@@ -541,6 +543,7 @@ pub fn render_frame(state: &mut WindowState, shared: &mut SharedGpuState) {
     state.gpu.terminal_vello.update_blink();
 
     // Update cached decorations when content changes
+    let content_changed = update_result.is_some();
     if let Some(mut result) = update_result {
         // Use take() to avoid cloning the decorations vector
         state.render.cached.decorations = std::mem::take(&mut result.decorations);
@@ -548,27 +551,14 @@ pub fn render_frame(state: &mut WindowState, shared: &mut SharedGpuState) {
     }
 
     // Pass 3: Render cell backgrounds via RectRenderer (before text)
-    // Always render from cached decorations so they persist across frames
+    // The instance list is rebuilt only when the decorations changed; the
+    // renderer-owned buffer is re-uploaded only then.
     {
-        let bg_count = state
-            .render
-            .cached
-            .decorations
-            .iter()
-            .filter(|d| d.kind == DecorationKind::Background)
-            .count();
-        if bg_count > 0 {
-            state.gpu.rect_renderer.clear();
-            state.gpu.rect_renderer.update_screen_size(
-                &shared.queue,
-                state.gpu.config.width as f32,
-                state.gpu.config.height as f32,
-            );
-
-            // Add background rectangles from cached decorations
+        if content_changed {
+            state.gpu.cell_bg_renderer.clear();
             for decoration in &state.render.cached.decorations {
                 if decoration.kind == DecorationKind::Background {
-                    state.gpu.rect_renderer.push_rect(
+                    state.gpu.cell_bg_renderer.push_rect(
                         decoration.x,
                         decoration.y,
                         decoration.cell_width,
@@ -577,7 +567,13 @@ pub fn render_frame(state: &mut WindowState, shared: &mut SharedGpuState) {
                     );
                 }
             }
-
+        }
+        if state.gpu.cell_bg_renderer.instance_count() > 0 {
+            state.gpu.cell_bg_renderer.update_screen_size(
+                &shared.queue,
+                state.gpu.config.width as f32,
+                state.gpu.config.height as f32,
+            );
             // Render backgrounds directly to frame
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Background Rect Render Pass"),
@@ -595,11 +591,10 @@ pub fn render_frame(state: &mut WindowState, shared: &mut SharedGpuState) {
                 occlusion_query_set: None,
             });
 
-            state.gpu.rect_renderer.render(
-                &shared.queue,
-                &mut pass,
-                &state.gpu.rect_instance_buffer,
-            );
+            state
+                .gpu
+                .cell_bg_renderer
+                .render(&shared.device, &shared.queue, &mut pass);
         }
     }
 
@@ -622,11 +617,10 @@ pub fn render_frame(state: &mut WindowState, shared: &mut SharedGpuState) {
             occlusion_query_set: None,
         });
 
-        state.gpu.output_grid_renderer.render(
-            &shared.queue,
-            &mut pass,
-            &state.gpu.output_grid_instance_buffer,
-        );
+        state
+            .gpu
+            .output_grid_renderer
+            .render(&shared.device, &shared.queue, &mut pass);
     }
 
     // Pass 4: Render cursor line text to intermediate texture (for glow effect)
@@ -669,7 +663,7 @@ pub fn render_frame(state: &mut WindowState, shared: &mut SharedGpuState) {
         state
             .gpu
             .grid_renderer
-            .render(&shared.queue, &mut pass, &state.gpu.grid_instance_buffer);
+            .render(&shared.device, &shared.queue, &mut pass);
     }
 
     // Pass 4.5: Composite text texture onto frame with Gaussian blur glow
@@ -948,10 +942,10 @@ pub fn render_frame(state: &mut WindowState, shared: &mut SharedGpuState) {
                 occlusion_query_set: None,
             });
 
-            state.gpu.overlay_rect_renderer.render(
+            state.gpu.overlay_rect_renderer.render_transient(
                 &shared.queue,
                 &mut pass,
-                &state.gpu.overlay_rect_instance_buffer,
+                &mut state.gpu.arena,
             );
         }
     }
@@ -1026,10 +1020,10 @@ pub fn render_frame(state: &mut WindowState, shared: &mut SharedGpuState) {
                 occlusion_query_set: None,
             });
 
-            state.gpu.rect_renderer.render(
+            state.gpu.rect_renderer.render_transient(
                 &shared.queue,
                 &mut pass,
-                &state.gpu.rect_instance_buffer,
+                &mut state.gpu.arena,
             );
         }
     }
@@ -1299,11 +1293,10 @@ fn render_tab_titles(
         occlusion_query_set: None,
     });
 
-    state.gpu.tab_title_renderer.render(
-        &shared.queue,
-        &mut pass,
-        &state.gpu.tab_title_instance_buffer,
-    );
+    state
+        .gpu
+        .tab_title_renderer
+        .render(&shared.device, &shared.queue, &mut pass);
 }
 
 #[cfg(test)]

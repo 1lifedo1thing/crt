@@ -76,8 +76,6 @@ struct VisualTestContext {
     glyph_cache: GlyphCache,
     grid_renderer: GridRenderer,
     rect_renderer: RectRenderer,
-    grid_instance_buffer: wgpu::Buffer,
-    rect_instance_buffer: wgpu::Buffer,
 }
 
 impl VisualTestContext {
@@ -102,16 +100,11 @@ impl VisualTestContext {
         let mut rect_renderer = RectRenderer::new(device, format);
         rect_renderer.update_screen_size(headless.queue(), width as f32, height as f32);
 
-        let grid_instance_buffer = GridRenderer::create_instance_buffer(device);
-        let rect_instance_buffer = RectRenderer::create_instance_buffer(device);
-
         Some(Self {
             headless,
             glyph_cache,
             grid_renderer,
             rect_renderer,
-            grid_instance_buffer,
-            rect_instance_buffer,
         })
     }
 
@@ -212,11 +205,8 @@ impl VisualTestContext {
                 occlusion_query_set: None,
             });
 
-            self.rect_renderer.render(
-                self.headless.queue(),
-                &mut pass,
-                &self.rect_instance_buffer,
-            );
+            self.rect_renderer
+                .render(self.headless.device(), self.headless.queue(), &mut pass);
         }
 
         // Pass 3: Render text glyphs
@@ -237,11 +227,8 @@ impl VisualTestContext {
                 occlusion_query_set: None,
             });
 
-            self.grid_renderer.render(
-                self.headless.queue(),
-                &mut pass,
-                &self.grid_instance_buffer,
-            );
+            self.grid_renderer
+                .render(self.headless.device(), self.headless.queue(), &mut pass);
         }
 
         self.headless.queue().submit(std::iter::once(encoder.finish()));
@@ -655,8 +642,6 @@ fn render_with_crt_effect(width: u32, height: u32, crt_uniforms: CrtUniforms) ->
     grid_renderer.set_glyph_cache(device, &glyph_cache);
     grid_renderer.update_screen_size(queue, width as f32, height as f32);
 
-    let grid_instance_buffer = GridRenderer::create_instance_buffer(device);
-
     // Create intermediate texture for text content (CRT reads from this)
     let source_texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("CRT Source Texture"),
@@ -745,7 +730,7 @@ fn render_with_crt_effect(width: u32, height: u32, crt_uniforms: CrtUniforms) ->
             timestamp_writes: None,
             occlusion_query_set: None,
         });
-        grid_renderer.render(queue, &mut pass, &grid_instance_buffer);
+        grid_renderer.render(device, queue, &mut pass);
     }
 
     // Pass 2: Apply CRT post-processing to headless render target

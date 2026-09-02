@@ -1257,7 +1257,9 @@ pub fn get_clipboard_content() -> Option<String> {
         return Some(text);
     }
 
-    // Try to get file paths (files copied from Finder/Explorer)
+    // Try to get file paths (files copied from Finder). The clipboard-files
+    // crate needs GTK on Linux, so this path is macOS-only.
+    #[cfg(target_os = "macos")]
     if let Ok(files) = clipboard_files::read()
         && !files.is_empty()
     {

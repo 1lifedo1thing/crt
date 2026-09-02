@@ -87,7 +87,7 @@ pub fn render_search_bar(
         state
             .gpu
             .rect_renderer
-            .render(&shared.queue, &mut pass, &state.gpu.rect_instance_buffer);
+            .render_transient(&shared.queue, &mut pass, &mut state.gpu.arena);
     }
 
     // Calculate text position
@@ -160,11 +160,7 @@ pub fn render_search_bar(
         occlusion_query_set: None,
     });
 
-    state.gpu.tab_title_renderer.render(
-        &shared.queue,
-        &mut pass,
-        &state.gpu.overlay_text_instance_buffer,
-    );
+    state.gpu.tab_title_renderer.render_transient(&shared.queue, &mut pass, &mut state.gpu.arena);
 }
 
 /// Render window rename input bar overlay
@@ -250,7 +246,7 @@ pub fn render_window_rename(
         state
             .gpu
             .rect_renderer
-            .render(&shared.queue, &mut pass, &state.gpu.rect_instance_buffer);
+            .render_transient(&shared.queue, &mut pass, &mut state.gpu.arena);
     }
 
     // Calculate text position
@@ -325,9 +321,5 @@ pub fn render_window_rename(
         occlusion_query_set: None,
     });
 
-    state.gpu.tab_title_renderer.render(
-        &shared.queue,
-        &mut pass,
-        &state.gpu.overlay_text_instance_buffer,
-    );
+    state.gpu.tab_title_renderer.render_transient(&shared.queue, &mut pass, &mut state.gpu.arena);
 }

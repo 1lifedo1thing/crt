@@ -15,6 +15,7 @@
 
 pub mod background_image;
 pub mod effects;
+pub mod frame_arena;
 pub mod glyph_cache;
 pub mod golden;
 pub mod grid_renderer;
@@ -38,6 +39,7 @@ pub use headless::{HeadlessError, HeadlessRenderer};
 pub use glyph_cache::{
     CachedGlyph, FontVariants, GlyphCache, GlyphKey, GlyphStyle, PositionedGlyph,
 };
+pub use frame_arena::{ArenaSlice, FrameArena};
 pub use grid_renderer::GridRenderer;
 pub use shared_pipelines::SharedPipelines;
 pub use mock::{MockRenderer, RenderCall};
