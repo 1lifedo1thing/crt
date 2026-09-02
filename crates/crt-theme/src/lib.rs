@@ -6,6 +6,7 @@
 #![allow(clippy::should_implement_trait)]
 
 pub mod parser;
+pub use parser::{ParseReport, ThemeError, log_warnings, parse_theme_report};
 
 use bytemuck::{Pod, Zeroable};
 use std::path::Path;
@@ -90,9 +91,9 @@ impl Color {
     pub fn to_rgba_string(&self) -> String {
         format!(
             "rgba({}, {}, {}, {})",
-            (self.r * 255.0) as u8,
-            (self.g * 255.0) as u8,
-            (self.b * 255.0) as u8,
+            (self.r * 255.0).round() as u8,
+            (self.g * 255.0).round() as u8,
+            (self.b * 255.0).round() as u8,
             self.a
         )
     }
@@ -1904,6 +1905,9 @@ impl Default for SpriteOverlay {
 pub struct EventOverride {
     /// Duration in milliseconds. 0 = persist until cleared by another event
     pub duration_ms: u32,
+    /// Whether `duration_ms` was explicitly given (so a later `--duration: 0`
+    /// can override an earlier non-zero value when blocks cascade).
+    pub duration_set: bool,
 
     /// Patches to existing backdrop sprite (keeps position/motion)
     pub sprite_patch: Option<SpritePatch>,
@@ -1943,9 +1947,10 @@ pub struct EventOverride {
 impl EventOverride {
     /// Merge another EventOverride into this one (CSS cascade: later values win)
     pub fn merge(&mut self, other: EventOverride) {
-        // Duration: non-zero wins
-        if other.duration_ms > 0 {
+        // Duration: an explicitly set (or non-zero) duration wins
+        if other.duration_set || other.duration_ms > 0 {
             self.duration_ms = other.duration_ms;
+            self.duration_set = true;
         }
 
         // Merge patch structs using trait
@@ -2114,9 +2119,12 @@ impl Theme {
         }
     }
 
-    /// Load theme from CSS string
+    /// Load theme from CSS string.  Non-fatal problems are logged with `log::warn!`;
+    /// use [`parser::parse_theme_report`] to inspect them instead.
     pub fn from_css(css: &str) -> Result<Self, parser::ThemeParseError> {
-        parser::parse_theme(css)
+        let report = parser::parse_theme_report(css)?;
+        parser::log_warnings(&report.warnings);
+        Ok(report.theme)
     }
 
     /// Load theme from CSS string with base directory for resolving relative paths
@@ -2124,7 +2132,7 @@ impl Theme {
         css: &str,
         base_dir: impl AsRef<Path>,
     ) -> Result<Self, parser::ThemeParseError> {
-        let mut theme = parser::parse_theme(css)?;
+        let mut theme = Self::from_css(css)?;
         let base_path = base_dir.as_ref().to_path_buf();
         // Set base_dir on background_image if present
         if let Some(ref mut bg) = theme.background_image {

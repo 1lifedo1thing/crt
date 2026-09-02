@@ -33,25 +33,21 @@ The composite pass then samples from `text_texture` to draw the text onto the ma
 
 Without this optimization, a 60 fps terminal with an animated background would re-rasterize every glyph 60 times per second regardless of whether anything had changed. With it, glyph rasterization only happens when the terminal content changes, which on a normal interactive session is far less than once per frame.
 
-## Damage Tracking and Content Hashing
+## Damage Tracking
 
-CRT uses two mechanisms to decide whether text re-rendering is needed: damage flags and content hashing.
+The text layer is rebuilt only when something changed. `alacritty_terminal` records damage as it parses: which visible lines changed, cursor movement, selection changes, and scrolls or resizes (reported as full damage). Once per frame `Terminal::take_damage()` consumes and resets that record; if it reports no damage and nothing in the UI has forced a rebuild (hover underline, search highlight, theme change), `update_text_buffer` returns early and the previously uploaded glyph instances are drawn again.
 
-**Damage flags** (`state.render.dirty`) are set eagerly whenever something changes: PTY output arrives, the user types, the window is resized, a theme is applied, or animations are running. Effects and sprite animations unconditionally set `dirty = true` every frame because they need continuous re-rendering.
-
-**Content hashing** is a secondary check used specifically for the text layer. Each tab maintains a `u64` hash of its terminal content. Before re-rendering text, the renderer computes the hash of the current cell grid. If the hash matches the cached value, the text texture is not rewritten even if `dirty` was set. This avoids redundant glyph uploads on frames where the animation engine set `dirty` but the terminal content did not actually change.
-
-Hash collisions are theoretically possible but extremely unlikely in practice — two different terminal screen states producing the same 64-bit hash would require adversarial construction. In the rare case of a collision, the visual effect is a single frame of stale text, which resolves on the next content-driven update.
+Because the damage record already covers attribute-only changes (a colour changing under the same character), there is no separate content hash. The `render.dirty` flag means "terminal content may have changed"; it is set when PTY output was parsed for the active tab and cleared when the text layer is rebuilt.
 
 ## Glyph Caching
 
 Font rendering on the CPU is expensive. Rasterizing a glyph involves loading the font file, scaling the outline to the target size, applying anti-aliasing, and producing a pixel bitmap. Doing this for every character on every frame would be untenable.
 
-`GlyphCache` rasterizes each glyph once and stores the bitmap in a GPU texture atlas. The atlas is a large RGBA8 texture (typically 2048×2048 pixels) where each glyph occupies a rectangular region. The `AtlasPacker` assigns regions using a simple shelf-packing algorithm (row-by-row, advancing to a new row when the current one fills).
+`GlyphCache` rasterizes each glyph once and stores the bitmap in a GPU texture atlas. The atlas is a 1024×1024 single-channel (`R8Unorm`) texture where each glyph occupies a rectangular region. The `AtlasPacker` assigns regions using a simple shelf-packing algorithm (row-by-row, advancing to a new row when the current one fills). When the atlas fills, it is cleared and repopulated from the glyphs currently on screen.
 
 Glyph lookup uses a `GlyphKey` consisting of character code, size (in tenths of a point for integer representation), and style flags (bold, italic). The cache returns a `CachedGlyph` containing normalized UV coordinates into the atlas and the offset needed to position the glyph within its cell.
 
-CRT uses **swash** for glyph rasterization (subpixel-quality rendering using the font's outline data) and **fontdue** for metrics (advance widths, line height, bearing). These are separate crates with different strengths: swash produces better-looking bitmaps, fontdue is faster for metric queries.
+CRT uses **swash** for both glyph rasterization and font metrics. The cell width is the advance width of `M`, which is the same metric used after a zoom, so the layout does not shift the first time the font size changes. Font file bytes are loaded once per family and shared between windows and glyph caches as `Arc<[u8]>`.
 
 The glyph cache pre-populates ASCII characters (code points 32–127) during initialization. This means the first frame renders immediately without any cache misses for the common case of plain ASCII text.
 
@@ -89,29 +85,21 @@ Pool depth is capped at 2 textures per size bucket. This means at most 2 idle te
 
 The same pattern applies to `BufferPool` for GPU buffers (instance data, uniforms), though buffer pooling is less critical than texture pooling because buffers are smaller and cheaper to allocate.
 
-## Frame Rate Management
+## Frame Scheduling
 
-CRT uses two different frame rates depending on window focus state.
+The event loop sleeps. It runs with `ControlFlow::Wait` (or `WaitUntil` when a deadline is pending) and is woken by three things:
 
-**Focused window: ~60 fps.** The event loop runs in `Poll` mode with no sleep. After processing events, `about_to_wait` checks whether enough time has elapsed since the last frame (~16.67 ms) before requesting a redraw. This produces approximately 60 fps without busy-spinning. The actual rate is capped by the display's vsync in the `Present` step.
+- **PTY output.** Each PTY reader thread calls a wake function after queueing a chunk. The wake is coalesced through an atomic flag, so a burst of small reads produces one user event. On wake, `App::drain_ptys` parses output for *every* tab of every window, so background tabs never fall behind and their output queue (bounded, so a runaway job blocks on `write` instead of growing the heap) never fills.
+- **File changes.** The config watcher wakes the loop; events are debounced on the trailing edge so a save is read only once it is complete.
+- **Deadlines.** Each window reports `next_frame_deadline`: "now" when its content is dirty, the next 16.6 ms tick (100 ms when unfocused) while an effect, sprite, animated image, CRT flicker, bell flash or override is running, the next blink toggle when only the cursor blinks, and nothing at all otherwise. The loop waits until the earliest deadline.
 
-**Unfocused windows: ~1 fps.** A separate timer (`last_unfocused_frame_time`) throttles unfocused windows to approximately one frame per second. On each of these slow frames, PTY output is still processed (keeping shells responsive), but most visual work is skipped.
+An idle terminal with a static theme therefore uses no CPU and no GPU between keystrokes. The 60 fps cap for animated windows is what keeps Metal's drawable allocations bounded on macOS; it is enforced by the deadline, not by spinning.
 
-This distinction matters significantly for battery life and thermal management on laptops. A terminal emulator with multiple windows running interactive shells should not consume meaningful CPU or GPU when the user is looking at something else.
+**Occluded windows** are skipped entirely; their PTYs are still drained.
 
-**Occluded windows: skip rendering.** When a window is reported as occluded (hidden behind other windows, minimized), the render function returns immediately after processing PTY output. The `WindowState.render.occluded` flag is set from `WindowEvent::Occluded`.
+## Vello Resource Use
 
-## Vello Memory Management
-
-Vello maintains internal texture atlases for compositing the 2D paths it renders. These atlases grow as more paths are rendered but do not automatically shrink. Left unmanaged, running backdrop effects (which render to a Vello scene every frame) would cause unbounded GPU memory growth over time.
-
-CRT addresses this with two defenses:
-
-1. **Periodic renderer reset.** Every 300 frames (~5 seconds at 60 fps), when effects are active, the `vello::Renderer` is dropped and recreated. This releases all internal atlas textures. The recreated renderer starts fresh with no accumulated state. The cost of recreation is paid once every few seconds rather than once per frame.
-
-2. **Window-close reset.** When a window closes, `App::close_window()` calls `reset_vello_renderer()` in addition to shrinking the texture and buffer pools. This prevents memory from accumulating across window open/close cycles.
-
-3. **Lazy initialization.** The Vello renderer is not created at startup. `SharedGpuState::ensure_vello_renderer()` is only called when effects are about to render. This means a plain CRT session with no backdrop effects (the default for some themes) never pays the ~187 MB Vello initialization cost.
+The vello renderer is created lazily the first time a backdrop effect needs it and lives for the process. Backdrop effects re-encode their scene only when something animates or their configuration changed; a static grid or starfield reuses the previously rendered target.
 
 ## The Text Rendering Sub-Pipeline
 
