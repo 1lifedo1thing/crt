@@ -74,7 +74,7 @@ pub(crate) struct CollectedCell {
 
 /// A cell prepared for rendering, with computed colors and routing.
 /// This is renderer-agnostic — no GPU types involved.
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct PreparedCell {
     /// The character to render
     pub character: char,
@@ -324,10 +324,6 @@ pub struct CachedRenderState {
     pub(crate) line_texts: std::collections::BTreeMap<i32, String>,
     /// Reusable cell collection buffer (cleared and reused each update)
     pub(crate) collected_cells: Vec<CollectedCell>,
-    /// Per-line cached prepared cells from previous frame (for partial damage reuse)
-    pub(crate) line_cells: std::collections::HashMap<i32, Vec<PreparedCell>>,
-    /// Per-line cached decorations from previous frame
-    pub(crate) line_decorations: std::collections::HashMap<i32, Vec<TextDecoration>>,
 }
 
 /// Render state (dirty tracking, frame count, visibility)
