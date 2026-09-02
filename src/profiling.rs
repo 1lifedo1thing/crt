@@ -275,6 +275,22 @@ pub fn record_grid_snapshot(snapshot: GridSnapshot) {
     with_profiler(|p| p.record_grid_snapshot(snapshot));
 }
 
+/// Whether a grid snapshot would be recorded right now.
+///
+/// Check this *before* building a snapshot: copying the scrollback is the
+/// expensive part and the rate limit would otherwise be applied after it.
+pub fn grid_snapshot_due() -> bool {
+    if !is_enabled() {
+        return false;
+    }
+    let mut due = false;
+    with_profiler(|p| {
+        due = p.last_grid_snapshot.elapsed()
+            >= Duration::from_secs(GRID_SNAPSHOT_INTERVAL_SECS)
+    });
+    due
+}
+
 /// Timing statistics
 #[derive(Debug, Default)]
 struct TimingStats {

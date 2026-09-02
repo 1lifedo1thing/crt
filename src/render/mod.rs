@@ -169,10 +169,6 @@ fn to_effect_config<T: ToEffectConfig>(source: &T) -> EffectConfig {
     config
 }
 
-/// How often to reset vello renderer to clean up atlas resources (in frames)
-/// At 60fps, 300 frames = every 5 seconds
-const VELLO_RESET_INTERVAL: u32 = 300;
-
 /// Render a single frame for a window
 pub fn render_frame(state: &mut WindowState, shared: &mut SharedGpuState) {
     // Skip rendering for fully occluded windows (covered by other windows)
@@ -184,6 +180,14 @@ pub fn render_frame(state: &mut WindowState, shared: &mut SharedGpuState) {
     let mut timing = FrameTiming::default();
     state.render.frame_count = state.render.frame_count.saturating_add(1);
 
+    // Real elapsed time since the previous frame drives animations; clamped
+    // so a pause (occlusion, sleep) does not fast-forward effects.
+    let dt = frame_start
+        .duration_since(state.render.last_frame_at)
+        .as_secs_f32()
+        .clamp(0.0, 0.1);
+    state.render.last_frame_at = frame_start;
+
     // Log every 300 frames (~5 seconds at 60fps) or on frame 1
     if state.render.frame_count == 1 || state.render.frame_count.is_multiple_of(300) {
         log::debug!(
@@ -194,76 +198,15 @@ pub fn render_frame(state: &mut WindowState, shared: &mut SharedGpuState) {
         );
     }
 
-    // Periodically reset vello renderer to clean up accumulated texture atlas resources
-    // This prevents unbounded GPU memory growth from vello's internal caches
-    // NOTE: The primary memory fix is frame throttling in main.rs (see about_to_wait).
-    // This reset is a secondary defense against vello atlas accumulation.
-    if state
-        .render
-        .frame_count
-        .is_multiple_of(VELLO_RESET_INTERVAL)
-        && state.gpu.effects_renderer.has_enabled_effects()
-    {
-        shared.reset_vello_renderer();
-    }
+    let active_tab_id = state.gpu.tab_bar.active_tab_id();
 
     // Update backdrop effects animation
-    const ASSUMED_DT: f32 = 1.0 / 60.0; // ~60fps assumption for animation timestep
     let update_start = Instant::now();
-    let dt = ASSUMED_DT;
     state.gpu.effects_renderer.update(dt);
     timing.effects_us = update_start.elapsed().as_micros() as u64;
 
-    // Keep redrawing if effects are animating
-    if state.gpu.effects_renderer.has_enabled_effects() {
-        state.render.dirty = true;
-    }
-
-    // Keep redrawing if sprite animation is active (uses raw wgpu, no memory growth)
-    if state.gpu.sprite_state.is_some() {
-        state.render.dirty = true;
-    }
-
-    // Process PTY output from active shell
-    let active_tab_id = state.gpu.tab_bar.active_tab_id();
-    if let Some(tab_id) = active_tab_id
-        && let Some(shell) = state.shells.get_mut(&tab_id)
-    {
-        let pty_result = process_pty_updates(shell);
-        if pty_result.content_changed {
-            state.render.dirty = true;
-            // Invalidate content hash to ensure re-render captures all changes
-            state.content_hashes.insert(tab_id, 0);
-        }
-        if let Some(title) = pty_result.title_change {
-            state.gpu.tab_bar.set_tab_title(tab_id, title);
-        }
-        // Compute and apply shell event overrides
-        let theme = state.gpu.effect_pipeline.theme();
-        let overrides = compute_shell_event_overrides(&pty_result.shell_events, theme);
-        if overrides.bell_triggered {
-            state.ui.bell.trigger();
-        }
-        if overrides.clear_command_fail {
-            state
-                .ui
-                .overrides
-                .clear_event(OverrideEventType::CommandFail);
-        }
-        for (event_type, properties) in overrides.activations {
-            state.ui.overrides.add(event_type, properties);
-        }
-    }
-
-    // Keep redrawing while bell flash is active
-    if state.ui.bell.is_active() {
-        state.render.dirty = true;
-    }
-
-    // Update overrides and keep redrawing while any are active
-    if state.ui.overrides.update() {
-        state.render.dirty = true;
-    }
+    // Expire finished overrides
+    state.ui.overrides.update();
 
     // Compute and apply effect patches from override state
     let theme = state.gpu.effect_pipeline.theme();
@@ -276,7 +219,6 @@ pub fn render_frame(state: &mut WindowState, shared: &mut SharedGpuState) {
                     .effects_renderer
                     .apply_effect_patch(effect_id.as_str(), &config);
                 state.ui.overrides.set_patched(effect_id);
-                state.render.dirty = true;
             }
             EffectPatchAction::Restore { effect_id, config } => {
                 state
@@ -287,28 +229,6 @@ pub fn render_frame(state: &mut WindowState, shared: &mut SharedGpuState) {
                 log::debug!("Restored {} to base theme", effect_id.as_str());
             }
         }
-    }
-
-    // Keep redrawing while overlay indicators are visible (for fade animation)
-    if state.ui.zoom_indicator.is_visible()
-        || state.ui.copy_indicator.is_visible()
-        || state.ui.toast.is_visible()
-    {
-        state.render.dirty = true;
-    }
-
-    // Force re-renders during first 60 frames
-    if state.render.frame_count < 60 {
-        state.render.dirty = true;
-        if let Some(tab_id) = active_tab_id {
-            state.content_hashes.insert(tab_id, 0);
-        }
-    }
-
-    // Skip GPU rendering when window is occluded (minimized, hidden, or fully covered)
-    // PTY processing above still runs to keep shells responsive
-    if state.render.occluded {
-        return;
     }
 
     // Update text buffer and get cursor/decoration info
@@ -471,9 +391,6 @@ pub fn render_frame(state: &mut WindowState, shared: &mut SharedGpuState) {
         });
 
         sprite_state.render(&mut pass, &shared.queue, width, height);
-
-        // Keep redrawing while sprite is animated
-        state.render.dirty = true;
     }
 
     // Pass 1.5: Render background image (if configured)
@@ -481,16 +398,8 @@ pub fn render_frame(state: &mut WindowState, shared: &mut SharedGpuState) {
         &mut state.gpu.background_image_state,
         &state.gpu.background_image_bind_group,
     ) {
-        // Update animation if this is an animated GIF
-        if bg_state.update(&shared.queue) {
-            // Animation frame changed, need to redraw
-            state.render.dirty = true;
-        }
-
-        // Keep redrawing for animations
-        if bg_state.image.is_animated() {
-            state.render.dirty = true;
-        }
+        // Advance the animation if this is an animated GIF
+        bg_state.update(&shared.queue);
 
         // Update uniforms with UV transform and opacity
         let uv_transform = bg_state.calculate_uv_transform(
@@ -623,11 +532,28 @@ pub fn render_frame(state: &mut WindowState, shared: &mut SharedGpuState) {
             .render(&shared.device, &shared.queue, &mut pass);
     }
 
-    // Pass 4: Render cursor line text to intermediate texture (for glow effect)
-    {
-        // Clear the text texture first
-        let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("Clear Text Texture Pass"),
+    // Pass 4: cursor-line text -> text texture, then horizontal glow blur.
+    // Both only run when the text changed (or the blur target was resized);
+    // the vertical blur + composite in pass 4.5 runs every frame because the
+    // background beneath it is redrawn every frame. All glow work is
+    // scissored to the rows that actually hold glyphs.
+    let blur_recreated = state.gpu.effect_pipeline.composite.ensure_blur_target(
+        &shared.device,
+        state.gpu.config.width,
+        state.gpu.config.height,
+    );
+    let glow_region = state.gpu.grid_renderer.bounds().and_then(|b| {
+        crt_renderer::GlowRegion::from_bounds(
+            b,
+            state.gpu.effect_pipeline.composite.glow_radius(),
+            state.gpu.config.width,
+            state.gpu.config.height,
+        )
+    });
+    if content_changed || blur_recreated {
+        // Clear the text texture, then render the cursor-line text into it
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Terminal Text Render Pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: state.gpu.text_texture.view(),
                 resolve_target: None,
@@ -641,39 +567,23 @@ pub fn render_frame(state: &mut WindowState, shared: &mut SharedGpuState) {
             timestamp_writes: None,
             occlusion_query_set: None,
         });
-        drop(pass);
-
-        // Render terminal text to the texture
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("Terminal Text Render Pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: state.gpu.text_texture.view(),
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
-                    store: wgpu::StoreOp::Store,
-                },
-                depth_slice: None,
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
-
         state
             .gpu
             .grid_renderer
             .render(&shared.device, &shared.queue, &mut pass);
+        drop(pass);
+
+        if let Some(region) = glow_region {
+            state.gpu.effect_pipeline.composite.render_hblur(
+                &mut encoder,
+                &state.gpu.composite_bind_group,
+                region,
+            );
+        }
     }
 
-    // Pass 4.5: Composite text texture onto frame with Gaussian blur glow
-    {
-        state.gpu.effect_pipeline.composite.update_uniforms(
-            &shared.queue,
-            state.gpu.config.width as f32,
-            state.gpu.config.height as f32,
-        );
-
+    // Pass 4.5: Composite text texture onto frame with the vertical glow blur
+    if let Some(region) = glow_region {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Text Composite Pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -690,11 +600,11 @@ pub fn render_frame(state: &mut WindowState, shared: &mut SharedGpuState) {
             occlusion_query_set: None,
         });
 
-        state
-            .gpu
-            .effect_pipeline
-            .composite
-            .render(&mut pass, &state.gpu.composite_bind_group);
+        state.gpu.effect_pipeline.composite.render(
+            &mut pass,
+            &state.gpu.composite_bind_group,
+            Some(region),
+        );
     }
 
     // Pass 5: Render cursor, selection, underlines, strikethroughs via RectRenderer
@@ -1097,11 +1007,6 @@ pub fn render_frame(state: &mut WindowState, shared: &mut SharedGpuState) {
 
             state.gpu.crt_pipeline.render(&mut pass, bind_group);
         }
-
-        // Keep redrawing for CRT flicker effect
-        if state.gpu.crt_pipeline.is_enabled() {
-            state.render.dirty = true;
-        }
     }
 
     timing.render_us = render_start.elapsed().as_micros() as u64;
@@ -1115,8 +1020,8 @@ pub fn render_frame(state: &mut WindowState, shared: &mut SharedGpuState) {
     timing.total_us = frame_start.elapsed().as_micros() as u64;
     profiling::record_frame(timing);
 
-    // Record grid snapshot for debugging (rate limited internally)
-    if profiling::is_enabled()
+    // Record grid snapshot for debugging (rate limited; checked before the copy)
+    if profiling::grid_snapshot_due()
         && let Some(tab_id) = state.gpu.tab_bar.active_tab_id()
         && let Some(shell) = state.shells.get(&tab_id)
     {

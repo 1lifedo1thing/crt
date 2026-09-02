@@ -37,7 +37,7 @@ pub use effects::{
 pub use golden::{ComparisonResult, assert_visual_match, compare_images, compare_with_golden, golden_path};
 pub use headless::{HeadlessError, HeadlessRenderer};
 pub use glyph_cache::{
-    CachedGlyph, FontVariants, GlyphCache, GlyphKey, GlyphStyle, PositionedGlyph,
+    CachedGlyph, FontData, FontVariants, GlyphCache, GlyphKey, GlyphStyle, PositionedGlyph,
 };
 pub use frame_arena::{ArenaSlice, FrameArena};
 pub use grid_renderer::GridRenderer;
@@ -64,8 +64,8 @@ use std::sync::Arc;
 use bytemuck::cast_slice;
 use crt_theme::Theme;
 use shared_pipelines::{
-    SharedBackgroundImagePipeline, SharedBackgroundPipeline, SharedCompositePipeline,
-    SharedCrtPipeline,
+    GLOW_BLUR_FORMAT, SharedBackgroundImagePipeline, SharedBackgroundPipeline,
+    SharedCompositePipeline, SharedCrtPipeline,
 };
 use wgpu::util::DeviceExt;
 
@@ -74,13 +74,14 @@ pub struct BackgroundPipeline {
     shared: Arc<SharedBackgroundPipeline>,
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
-    theme: Theme,
-    start_time: std::time::Instant,
+    theme: Arc<Theme>,
+    /// (width, height, theme pointer) of the last uniform write
+    uploaded: Option<(f32, f32, *const Theme)>,
 }
 
 impl BackgroundPipeline {
     pub fn new_with_shared(device: &wgpu::Device, shared: &Arc<SharedBackgroundPipeline>) -> Self {
-        let theme = Theme::default();
+        let theme = Arc::new(Theme::default());
         let uniforms = theme.to_uniforms(1.0, 1.0, 0.0);
 
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -103,7 +104,7 @@ impl BackgroundPipeline {
             uniform_buffer,
             bind_group,
             theme,
-            start_time: std::time::Instant::now(),
+            uploaded: None,
         }
     }
 
@@ -112,7 +113,7 @@ impl BackgroundPipeline {
         Self::new_with_shared(device, &shared)
     }
 
-    pub fn set_theme(&mut self, theme: Theme) {
+    pub fn set_theme(&mut self, theme: Arc<Theme>) {
         self.theme = theme;
     }
 
@@ -120,10 +121,20 @@ impl BackgroundPipeline {
         &self.theme
     }
 
-    pub fn update_uniforms(&self, queue: &wgpu::Queue, width: f32, height: f32) {
-        let time = self.start_time.elapsed().as_secs_f32();
-        let uniforms = self.theme.to_uniforms(width, height, time);
+    pub fn theme_arc(&self) -> &Arc<Theme> {
+        &self.theme
+    }
+
+    /// Write the theme uniforms if the size or theme changed since the last
+    /// write (the shader does not read `time`).
+    pub fn update_uniforms(&mut self, queue: &wgpu::Queue, width: f32, height: f32) {
+        let key = (width, height, Arc::as_ptr(&self.theme));
+        if self.uploaded == Some(key) {
+            return;
+        }
+        let uniforms = self.theme.to_uniforms(width, height, 0.0);
         queue.write_buffer(&self.uniform_buffer, 0, cast_slice(&[uniforms]));
+        self.uploaded = Some(key);
     }
 
     pub fn render<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>) {
@@ -225,13 +236,63 @@ impl BackgroundImagePipeline {
 pub struct CompositePipeline {
     shared: Arc<SharedCompositePipeline>,
     uniform_buffer: wgpu::Buffer,
-    theme: Theme,
-    start_time: std::time::Instant,
+    theme: Arc<Theme>,
+    /// (width, height, theme pointer) of the last uniform write
+    uploaded: Option<(f32, f32, *const Theme)>,
+    /// Horizontally-blurred alpha target (sized to the frame)
+    blur: Option<GlowBlurTarget>,
+}
+
+/// Intermediate texture for the separable glow blur.
+struct GlowBlurTarget {
+    texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+    size: (u32, u32),
+}
+
+impl Drop for GlowBlurTarget {
+    fn drop(&mut self) {
+        self.texture.destroy();
+    }
+}
+
+/// Pixel-space scissor for the glow passes: the rows that hold glyphs,
+/// expanded by the blur radius.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GlowRegion {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl GlowRegion {
+    /// Region covering `bounds` (min_x, min_y, max_x, max_y) grown by
+    /// `radius` pixels and clamped to `width` x `height`. `None` if empty.
+    pub fn from_bounds(bounds: [f32; 4], radius: f32, width: u32, height: u32) -> Option<Self> {
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let grow = radius.max(0.0) + 1.0;
+        let x0 = (bounds[0] - grow).floor().max(0.0) as u32;
+        let y0 = (bounds[1] - grow).floor().max(0.0) as u32;
+        let x1 = ((bounds[2] + grow).ceil().max(0.0) as u32).min(width);
+        let y1 = ((bounds[3] + grow).ceil().max(0.0) as u32).min(height);
+        if x1 <= x0 || y1 <= y0 {
+            return None;
+        }
+        Some(Self {
+            x: x0,
+            y: y0,
+            width: x1 - x0,
+            height: y1 - y0,
+        })
+    }
 }
 
 impl CompositePipeline {
     pub fn new_with_shared(device: &wgpu::Device, shared: &Arc<SharedCompositePipeline>) -> Self {
-        let theme = Theme::default();
+        let theme = Arc::new(Theme::default());
         let uniforms = theme.to_uniforms(1.0, 1.0, 0.0);
 
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -244,7 +305,8 @@ impl CompositePipeline {
             shared: shared.clone(),
             uniform_buffer,
             theme,
-            start_time: std::time::Instant::now(),
+            uploaded: None,
+            blur: None,
         }
     }
 
@@ -253,7 +315,92 @@ impl CompositePipeline {
         Self::new_with_shared(device, &shared)
     }
 
-    pub fn set_theme(&mut self, theme: Theme) {
+    /// Ensure the blur target matches the frame size. Returns true when it
+    /// was (re)created, in which case the horizontal blur must be re-run.
+    pub fn ensure_blur_target(&mut self, device: &wgpu::Device, width: u32, height: u32) -> bool {
+        let size = (width.max(1), height.max(1));
+        if self.blur.as_ref().is_some_and(|b| b.size == size) {
+            return false;
+        }
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Glow Blur Texture"),
+            size: wgpu::Extent3d {
+                width: size.0,
+                height: size.1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: GLOW_BLUR_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&Default::default());
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Glow Blur Bind Group"),
+            layout: &self.shared.blur_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.shared.sampler),
+                },
+            ],
+        });
+        self.blur = Some(GlowBlurTarget {
+            texture,
+            bind_group,
+            size,
+        });
+        true
+    }
+
+    /// Glow radius in pixels the shader will sample over (0 when no glow).
+    pub fn glow_radius(&self) -> f32 {
+        match self.theme.text_shadow {
+            Some(shadow) if shadow.intensity > 0.0 => shadow.radius.min(50.0),
+            _ => 0.0,
+        }
+    }
+
+    /// Run the horizontal blur into the blur texture (call when the text
+    /// texture changed). `region` limits the work to the rows with glyphs.
+    pub fn render_hblur(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        text_bind_group: &wgpu::BindGroup,
+        region: GlowRegion,
+    ) {
+        let Some(blur) = &self.blur else {
+            return;
+        };
+        let view = blur.texture.create_view(&Default::default());
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Glow HBlur Pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_scissor_rect(region.x, region.y, region.width, region.height);
+        pass.set_pipeline(&self.shared.hblur_pipeline);
+        pass.set_bind_group(0, text_bind_group, &[]);
+        pass.draw(0..4, 0..1);
+    }
+
+    pub fn set_theme(&mut self, theme: Arc<Theme>) {
         self.theme = theme;
     }
 
@@ -286,19 +433,35 @@ impl CompositePipeline {
         })
     }
 
-    pub fn update_uniforms(&self, queue: &wgpu::Queue, width: f32, height: f32) {
-        let time = self.start_time.elapsed().as_secs_f32();
-        let uniforms = self.theme.to_uniforms(width, height, time);
+    /// Write the theme uniforms if the size or theme changed since the last
+    /// write (the shader does not read `time`).
+    pub fn update_uniforms(&mut self, queue: &wgpu::Queue, width: f32, height: f32) {
+        let key = (width, height, Arc::as_ptr(&self.theme));
+        if self.uploaded == Some(key) {
+            return;
+        }
+        let uniforms = self.theme.to_uniforms(width, height, 0.0);
         queue.write_buffer(&self.uniform_buffer, 0, cast_slice(&[uniforms]));
+        self.uploaded = Some(key);
     }
 
+    /// Vertical blur + text composite. `region`, when given, scissors the
+    /// pass to the rows holding glyphs.
     pub fn render<'a>(
         &'a self,
         render_pass: &mut wgpu::RenderPass<'a>,
         bind_group: &'a wgpu::BindGroup,
+        region: Option<GlowRegion>,
     ) {
+        let Some(blur) = &self.blur else {
+            return;
+        };
+        if let Some(r) = region {
+            render_pass.set_scissor_rect(r.x, r.y, r.width, r.height);
+        }
         render_pass.set_pipeline(&self.shared.pipeline);
         render_pass.set_bind_group(0, bind_group, &[]);
+        render_pass.set_bind_group(1, &blur.bind_group, &[]);
         render_pass.draw(0..4, 0..1);
     }
 }
@@ -328,7 +491,7 @@ impl EffectPipeline {
         }
     }
 
-    pub fn set_theme(&mut self, theme: Theme) {
+    pub fn set_theme(&mut self, theme: Arc<Theme>) {
         self.background.set_theme(theme.clone());
         self.composite.set_theme(theme);
     }
@@ -337,10 +500,8 @@ impl EffectPipeline {
         self.background.theme()
     }
 
-    pub fn theme_mut(&mut self) -> &mut Theme {
-        // This is a bit awkward but maintains compatibility
-        // In the future, theme should be stored once and shared
-        panic!("Use set_theme() instead of theme_mut() with new architecture");
+    pub fn theme_arc(&self) -> &Arc<Theme> {
+        self.background.theme_arc()
     }
 
     pub fn create_bind_group(
@@ -351,19 +512,11 @@ impl EffectPipeline {
         self.composite.create_bind_group(device, text_texture_view)
     }
 
-    pub fn update_uniforms(&self, queue: &wgpu::Queue, width: f32, height: f32) {
+    pub fn update_uniforms(&mut self, queue: &wgpu::Queue, width: f32, height: f32) {
         self.background.update_uniforms(queue, width, height);
         self.composite.update_uniforms(queue, width, height);
     }
 
-    // Old render method - kept for compatibility but should migrate to new approach
-    pub fn render<'a>(
-        &'a self,
-        _render_pass: &mut wgpu::RenderPass<'a>,
-        _bind_group: &'a wgpu::BindGroup,
-    ) {
-        panic!("Use render_background() and render_composite() separately");
-    }
 }
 
 /// Reference height for resolution-independent CRT effects (1080p baseline)

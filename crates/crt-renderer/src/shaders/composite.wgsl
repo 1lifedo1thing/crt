@@ -1,5 +1,10 @@
-// Composite shader - applies glow blur to text texture
-// This is expensive (25 texture samples) so only runs when text changes
+// Composite shader - glow blur for the cursor-line text layer.
+//
+// The Gaussian is separable: `fs_hblur` writes the horizontally blurred text
+// alpha into an R8 texture (only when the text changed), and `fs_main` blurs
+// that vertically and composites the text on top. 17 + 17 taps per pixel
+// instead of 17 x 17, and the app scissors both passes to the rows that hold
+// glyphs.
 
 struct Params {
     screen_size: vec2<f32>,
@@ -23,6 +28,10 @@ struct Params {
 @group(0) @binding(1) var text_texture: texture_2d<f32>;
 @group(0) @binding(2) var text_sampler: sampler;
 
+// Horizontally blurred alpha (written by fs_hblur, read by fs_main)
+@group(1) @binding(0) var blur_texture: texture_2d<f32>;
+@group(1) @binding(1) var blur_sampler: sampler;
+
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
@@ -38,34 +47,47 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     return out;
 }
 
-// 324-sample (18x18) Gaussian blur for smooth glow effect
-fn sample_blur(uv: vec2<f32>, radius: f32) -> f32 {
-    let texel_size = 1.0 / params.screen_size;
-    let effective_radius = min(radius, 50.0);
-    let sigma = effective_radius / 3.0;
+// Number of taps on each side of the centre (17 taps total)
+const SAMPLES: i32 = 8;
+
+fn effective_radius() -> f32 {
+    return min(params.glow_radius, 50.0);
+}
+
+fn gauss_weight(i: i32, sigma: f32) -> f32 {
+    let d = f32(i);
+    return exp(-(d * d) / (2.0 * sigma * sigma));
+}
+
+// One-dimensional 17-tap Gaussian of `channel` along `dir` (in texels).
+fn blur_1d(tex: texture_2d<f32>, samp: sampler, uv: vec2<f32>, dir: vec2<f32>, use_alpha: bool) -> f32 {
+    let radius = effective_radius();
+    let sigma = radius / 3.0;
+    let step = dir * (1.0 / params.screen_size) * (radius / f32(SAMPLES));
 
     var total = 0.0;
     var weight_sum = 0.0;
-
-    // 18x18 grid: -8 to 9 (using 9 for 18 total)
-    let samples = 8i;
-    for (var x = -samples; x <= samples; x++) {
-        for (var y = -samples; y <= samples; y++) {
-            // Spread samples evenly across the radius
-            let offset = vec2<f32>(f32(x), f32(y)) * texel_size * (effective_radius / 8.0);
-            let dist = length(vec2<f32>(f32(x), f32(y)));
-            let w = exp(-(dist * dist) / (2.0 * sigma * sigma));
-
-            let sample_color = textureSample(text_texture, text_sampler, uv + offset);
-            // Use alpha channel for glow source (text has alpha where glyphs are)
-            total += sample_color.a * w;
-            weight_sum += w;
-        }
+    for (var i = -SAMPLES; i <= SAMPLES; i++) {
+        let w = gauss_weight(i, sigma);
+        let s = textureSample(tex, samp, uv + step * f32(i));
+        let v = select(s.r, s.a, use_alpha);
+        total += v * w;
+        weight_sum += w;
     }
-
     return total / weight_sum;
 }
 
+// Pass 1: horizontal blur of the text alpha into the R8 blur texture.
+@fragment
+fn fs_hblur(in: VertexOutput) -> @location(0) vec4<f32> {
+    if params.glow_intensity <= 0.0 {
+        return vec4<f32>(0.0);
+    }
+    let a = blur_1d(text_texture, text_sampler, in.uv, vec2<f32>(1.0, 0.0), true);
+    return vec4<f32>(a, 0.0, 0.0, 1.0);
+}
+
+// Pass 2: vertical blur of the horizontal result, then text on top.
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Sample the text texture (contains colored glyphs)
@@ -78,7 +100,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // Glow effect (if enabled) - render glow behind text
     if params.glow_intensity > 0.0 {
-        let blur = sample_blur(in.uv, params.glow_radius);
+        let blur = blur_1d(blur_texture, blur_sampler, in.uv, vec2<f32>(0.0, 1.0), false);
         let glow_alpha = blur * params.glow_intensity * 2.0;
         color = params.glow_color.rgb;
         alpha = min(glow_alpha, 0.8);

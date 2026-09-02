@@ -958,7 +958,7 @@ fn visual_theme_background_gradient() {
     let format = headless.format();
 
     // Create and render the background pipeline (gradient + animated grid)
-    let bg_pipeline = BackgroundPipeline::new(device, format);
+    let mut bg_pipeline = BackgroundPipeline::new(device, format);
     bg_pipeline.update_uniforms(queue, 320.0, 240.0);
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {

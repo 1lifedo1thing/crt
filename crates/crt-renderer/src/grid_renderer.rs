@@ -68,6 +68,8 @@ pub struct GridRenderer {
     /// Instances changed since the last owned upload
     dirty: bool,
     owned: OwnedInstanceBuffer,
+    /// Pixel bounds of pending instances: (min_x, min_y, max_x, max_y)
+    bounds: Option<[f32; 4]>,
     /// Cached screen size to avoid redundant uniform updates
     cached_screen_size: (f32, f32),
 }
@@ -87,6 +89,7 @@ impl GridRenderer {
             instances: Vec::new(),
             dirty: false,
             owned: OwnedInstanceBuffer::new("Grid Instance Buffer"),
+            bounds: None,
             cached_screen_size: (0.0, 0.0),
         }
     }
@@ -144,19 +147,37 @@ impl GridRenderer {
             self.dirty = true;
         }
         self.instances.clear();
+        self.bounds = None;
+    }
+
+    fn extend_bounds(&mut self, g: &PositionedGlyph) {
+        let b = self.bounds.get_or_insert([g.x, g.y, g.x, g.y]);
+        b[0] = b[0].min(g.x);
+        b[1] = b[1].min(g.y);
+        b[2] = b[2].max(g.x + g.width);
+        b[3] = b[3].max(g.y + g.height);
     }
 
     /// Add positioned glyphs from layout
     pub fn push_glyphs(&mut self, glyphs: &[PositionedGlyph], color: [f32; 4]) {
-        self.instances
-            .extend(glyphs.iter().map(|g| GlyphInstance::from_positioned(g, color)));
+        for g in glyphs {
+            self.extend_bounds(g);
+            self.instances.push(GlyphInstance::from_positioned(g, color));
+        }
         self.dirty |= !glyphs.is_empty();
     }
 
     /// Add a single positioned glyph
     pub fn push_glyph(&mut self, glyph: &PositionedGlyph, color: [f32; 4]) {
+        self.extend_bounds(glyph);
         self.instances.push(GlyphInstance::from_positioned(glyph, color));
         self.dirty = true;
+    }
+
+    /// Pixel bounds of the pending glyphs as (min_x, min_y, max_x, max_y),
+    /// or `None` when there are no glyphs.
+    pub fn bounds(&self) -> Option<[f32; 4]> {
+        self.bounds
     }
 
     /// Update screen size uniform (only writes if size changed)

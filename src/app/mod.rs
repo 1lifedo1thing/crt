@@ -9,19 +9,78 @@ mod initialization;
 mod menu_actions;
 
 use std::collections::HashMap;
-use std::time::Instant;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::config::{Config, ConfigPaths};
 use crate::gpu::SharedGpuState;
 use crate::input::drag::TabDragState;
+use crate::render::{compute_shell_event_overrides, process_pty_updates};
 use crate::theme_registry::ThemeRegistry;
 use crate::watcher;
-use crate::window::WindowState;
+use crate::window::{OverrideEventType, WindowState};
+use crt_core::{SpawnOptions, WakeFn};
 use crt_renderer::{
     BackgroundImageState, SpriteAnimationState, SpriteConfig, SpriteMotion, SpritePosition,
 };
 use crt_theme::Theme;
+use winit::event_loop::EventLoopProxy;
 use winit::window::WindowId;
+
+/// Why a background thread woke the event loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WakeReason {
+    /// A PTY reader queued output
+    Pty,
+    /// The config watcher saw a file change
+    Watcher,
+}
+
+/// Wakes the winit loop from other threads, coalescing bursts.
+///
+/// A flag per reason means a thousand small PTY reads produce one queued
+/// user event rather than a thousand; the flag is cleared when the event is
+/// handled, so the next read wakes us again.
+pub(crate) struct Waker {
+    proxy: EventLoopProxy<WakeReason>,
+    pty_pending: AtomicBool,
+    watcher_pending: AtomicBool,
+}
+
+impl Waker {
+    fn new(proxy: EventLoopProxy<WakeReason>) -> Self {
+        Self {
+            proxy,
+            pty_pending: AtomicBool::new(false),
+            watcher_pending: AtomicBool::new(false),
+        }
+    }
+
+    fn flag(&self, reason: WakeReason) -> &AtomicBool {
+        match reason {
+            WakeReason::Pty => &self.pty_pending,
+            WakeReason::Watcher => &self.watcher_pending,
+        }
+    }
+
+    /// Send a wake if one for this reason is not already queued.
+    pub(crate) fn wake(&self, reason: WakeReason) {
+        if !self.flag(reason).swap(true, Ordering::AcqRel) {
+            let _ = self.proxy.send_event(reason);
+        }
+    }
+
+    /// Called when the user event is handled; lets the next wake through.
+    pub(crate) fn acknowledge(&self, reason: WakeReason) {
+        self.flag(reason).store(false, Ordering::Release);
+    }
+
+    /// A `WakeFn` for threads that cannot see winit types.
+    pub(crate) fn wake_fn(self: &Arc<Self>, reason: WakeReason) -> WakeFn {
+        let waker = self.clone();
+        Arc::new(move || waker.wake(reason))
+    }
+}
 
 #[cfg(target_os = "macos")]
 use muda::Menu;
@@ -40,16 +99,14 @@ pub(crate) struct App {
     pub(crate) focused_window: Option<WindowId>,
     pub(crate) config: Config,
     /// Current theme (stored for event override access)
-    pub(crate) theme: Theme,
+    pub(crate) theme: Arc<Theme>,
     /// Registry of available themes for runtime switching
     pub(crate) theme_registry: ThemeRegistry,
     pub(crate) modifiers: winit::event::Modifiers,
     pub(crate) pending_new_window: bool,
     pub(crate) config_watcher: Option<watcher::ConfigWatcher>,
-    /// Last frame time for throttling focused window redraws (~60fps)
-    pub(crate) last_frame_time: Instant,
-    /// Last frame time for unfocused windows (~1fps for PTY updates)
-    pub(crate) last_unfocused_frame_time: Instant,
+    /// Wakes the event loop from PTY reader threads and the watcher
+    pub(crate) waker: Arc<Waker>,
     /// Global tab ID counter — ensures IDs are unique across all windows
     pub(crate) next_tab_id: u64,
     /// Active tab drag state (lives on App for cross-window visibility)
@@ -69,9 +126,11 @@ pub(crate) struct App {
 }
 
 impl App {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(proxy: EventLoopProxy<WakeReason>) -> Self {
         let config = Config::load();
-        let config_watcher = watcher::ConfigWatcher::new();
+        let waker = Arc::new(Waker::new(proxy));
+        let config_watcher =
+            watcher::ConfigWatcher::new(Some(waker.wake_fn(WakeReason::Watcher)));
 
         // Initialize theme registry from themes directory
         let theme_registry = ConfigPaths::from_env_or_default()
@@ -86,13 +145,12 @@ impl App {
             shared_gpu: None,
             focused_window: None,
             config,
-            theme: Theme::default(), // Will be loaded properly in resumed()
+            theme: Arc::new(Theme::default()), // Will be loaded properly in resumed()
             theme_registry,
             modifiers: winit::event::Modifiers::default(),
             pending_new_window: false,
             config_watcher,
-            last_frame_time: Instant::now(),
-            last_unfocused_frame_time: Instant::now(),
+            waker,
             next_tab_id: 0,
             drag_state: None,
             pending_detach: None,
@@ -111,6 +169,54 @@ impl App {
         let id = self.next_tab_id;
         self.next_tab_id += 1;
         id
+    }
+
+    /// Spawn options for a new shell in `cwd`, wired to wake the event loop.
+    pub(crate) fn spawn_options(&self, cwd: Option<std::path::PathBuf>) -> SpawnOptions {
+        SpawnOptions {
+            shell: self.config.shell.program.clone(),
+            cwd,
+            semantic_prompts: self.config.shell.semantic_prompts,
+            shell_assets_dir: Config::shell_assets_dir(),
+            wake: Some(self.waker.wake_fn(WakeReason::Pty)),
+        }
+    }
+
+    /// Drain PTY output for every tab of every window.
+    ///
+    /// Background tabs are parsed too, so their shells never block on a
+    /// full output queue and their titles/bells are not lost. Only the
+    /// active tab's changes mark the window's text layer dirty.
+    pub(crate) fn drain_ptys(&mut self) {
+        for state in self.windows.values_mut() {
+            let active = state.gpu.tab_bar.active_tab_id();
+            for (tab_id, shell) in state.shells.iter_mut() {
+                let result = process_pty_updates(shell);
+                if result.content_changed && Some(*tab_id) == active {
+                    state.render.dirty = true;
+                    state.content_hashes.insert(*tab_id, 0);
+                }
+                if let Some(title) = result.title_change {
+                    state.gpu.tab_bar.set_tab_title(*tab_id, title);
+                }
+                if result.shell_events.is_empty() {
+                    continue;
+                }
+                // A completed command may have changed the shell's directory
+                shell.invalidate_cwd();
+                let theme = state.gpu.effect_pipeline.theme();
+                let overrides = compute_shell_event_overrides(&result.shell_events, theme);
+                if overrides.bell_triggered {
+                    state.ui.bell.trigger();
+                }
+                if overrides.clear_command_fail {
+                    state.ui.overrides.clear_event(OverrideEventType::CommandFail);
+                }
+                for (event_type, properties) in overrides.activations {
+                    state.ui.overrides.add(event_type, properties);
+                }
+            }
+        }
     }
 
     /// Create a small floating overlay window for drag feedback.
@@ -316,13 +422,7 @@ impl App {
                 let _ = shared.device.poll(wgpu::PollType::Wait);
 
                 // Shrink texture pool to release excess pooled textures
-                // This frees GPU memory from closed windows while keeping
-                // one texture per bucket for quick reuse on next window
                 shared.texture_pool.shrink();
-
-                // Reset Vello renderer to free accumulated texture atlas memory
-                // This prevents unbounded growth from windows being opened/closed
-                shared.reset_vello_renderer();
             }
 
             if self.focused_window == Some(window_id) {
@@ -381,18 +481,31 @@ impl App {
     /// Reload themes from disk and apply to all windows
     pub(crate) fn reload_theme(&mut self) {
         log::info!("Reloading themes from disk...");
-
-        // Reload all themes in the registry
         self.theme_registry.reload_all();
+        self.reapply_registry_themes(None);
+    }
 
+    /// Reload the one theme file that changed and re-apply it to the
+    /// windows using it (other themes are left untouched).
+    pub(crate) fn reload_theme_file(&mut self, path: &std::path::Path) {
+        let Some(name) = self.theme_registry.reload_path(path) else {
+            return;
+        };
+        log::info!("Theme '{}' changed on disk", name);
+        self.reapply_registry_themes(Some(&name));
+    }
+
+    /// Push the registry's current theme objects to windows. With `only`,
+    /// just the windows using that theme are updated.
+    fn reapply_registry_themes(&mut self, only: Option<&str>) {
         // Collect window updates to avoid borrow issues
         let window_themes: Vec<_> = self
             .windows
             .iter()
+            .filter(|(_, state)| only.is_none_or(|n| state.theme_name == n))
             .map(|(id, state)| (*id, state.theme_name.clone()))
             .collect();
 
-        // Update each window with its reloaded theme
         for (window_id, theme_name) in window_themes {
             let theme = self
                 .theme_registry
@@ -407,17 +520,8 @@ impl App {
                 });
 
             if let Some(state) = self.windows.get_mut(&window_id) {
-                // Update window theme
-                state.set_theme(&theme_name, theme.clone());
-
-                // Update backdrop effects from theme
-                effects::configure_effects_from_theme(&mut state.gpu.effects_renderer, &theme);
-
-                // Force full redraw
-                for hash in state.content_hashes.values_mut() {
-                    *hash = 0;
-                }
-
+                apply_theme_to_window(state, self.shared_gpu.as_ref(), &theme_name, &theme);
+                state.window.request_redraw();
                 log::debug!("Theme '{}' reloaded for window {:?}", theme_name, window_id);
             }
         }
@@ -425,8 +529,6 @@ impl App {
         // Update App.theme for backward compatibility (event overrides)
         let (_, default_theme) = self.theme_registry.get_default_theme();
         self.theme = default_theme;
-
-        log::debug!("Themes reloaded for {} windows", self.windows.len());
     }
 
     /// Adjust the focused window's font scale by `delta`, reflowing the grid and
@@ -549,13 +651,11 @@ impl App {
     /// tab's working directory and selecting the new tab. Shared by the
     /// keyboard shortcut, the macOS menu, and the tab bar "+" button.
     pub(crate) fn open_new_tab(&mut self) {
-        let shell_program = self.config.shell.program.clone();
-        let semantic_prompts = self.config.shell.semantic_prompts;
-        let shell_assets_dir = Config::shell_assets_dir();
         let new_tab_id = self.next_tab_id();
+        let cwd = self.focused_window_mut().and_then(|s| s.active_shell_cwd());
+        let spawn_options = self.spawn_options(cwd);
 
         if let Some(state) = self.focused_window_mut() {
-            let cwd = state.active_shell_cwd();
             let tab_num = state.gpu.tab_bar.tab_count() + 1;
             state
                 .gpu
@@ -565,12 +665,6 @@ impl App {
                 .gpu
                 .tab_bar
                 .select_tab_index(state.gpu.tab_bar.tab_count() - 1);
-            let spawn_options = crt_core::SpawnOptions {
-                shell: shell_program,
-                cwd,
-                semantic_prompts,
-                shell_assets_dir,
-            };
             state.create_shell_for_tab(new_tab_id, spawn_options);
             state.render.dirty = true;
             state.window.request_redraw();
@@ -626,7 +720,7 @@ pub(crate) fn apply_theme_to_window(
     state: &mut WindowState,
     shared_gpu: Option<&SharedGpuState>,
     theme_name: &str,
-    theme: &Theme,
+    theme: &Arc<Theme>,
 ) {
     log::info!("Switching theme to: {}", theme_name);
     state.set_theme(theme_name, theme.clone());

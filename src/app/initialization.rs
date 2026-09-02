@@ -9,7 +9,7 @@ use crate::config::Config;
 use crate::font;
 use crate::gpu::{SharedGpuState, WindowGpuState};
 use crate::window::{self, WindowState};
-use crt_core::{ShellTerminal, Size, SpawnOptions};
+use crt_core::{ShellTerminal, Size};
 use crt_renderer::{
     BackgroundImagePipeline, BackgroundImageState, CrtPipeline, EffectsRenderer, FrameArena,
     GlyphCache, GridEffect, GridRenderer, MatrixEffect, ParticleEffect, RainEffect, RectRenderer, ShapeEffect,
@@ -303,12 +303,7 @@ impl App {
             .and_then(|state| state.active_shell_cwd())
             .or_else(|| self.config.shell.working_directory.clone());
 
-        let spawn_options = SpawnOptions {
-            shell: self.config.shell.program.clone(),
-            cwd,
-            semantic_prompts: self.config.shell.semantic_prompts,
-            shell_assets_dir: Config::shell_assets_dir(),
-        };
+        let spawn_options = self.spawn_options(cwd);
         if let Ok(shell) = ShellTerminal::with_options(Size::new(cols, rows), spawn_options) {
             log::info!(
                 "Shell spawned for initial tab {} (semantic_prompts={})",
@@ -328,27 +323,23 @@ impl App {
             rows,
             scale_factor,
             font_scale: 1.0,
-            render: window::RenderState {
-                dirty: true,
-                frame_count: 0,
-                occluded: false,
-                focused: true,
-                cached: Default::default(),
-                paste_pending: false,
-            },
+            render: window::RenderState::default(),
             interaction: Default::default(),
             ui: window::UiState {
                 search: Default::default(),
                 bell: window::BellState::from_config(&self.config.bell),
-                context_menu: window::ContextMenu {
-                    themes: self
-                        .theme_registry
-                        .list_themes()
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect(),
-                    current_theme: theme_name.to_string(),
-                    ..Default::default()
+                context_menu: {
+                    let mut menu = window::ContextMenu::default();
+                    menu.set_themes(
+                        self.theme_registry
+                            .list_themes()
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect(),
+                    );
+                    menu.current_theme = theme_name.to_string();
+                    menu.set_scale(scale_factor);
+                    menu
                 },
                 zoom_indicator: Default::default(),
                 copy_indicator: Default::default(),
@@ -359,7 +350,7 @@ impl App {
             },
             custom_title: None,
             theme: theme.clone(),
-            theme_name: theme_name.to_string(),
+            theme_name: theme_name.clone(),
         };
 
         self.windows.insert(window_id, window_state);

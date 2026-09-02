@@ -1,43 +1,39 @@
 //! GPU texture pooling with RAII semantics
 //!
 //! Pools render target textures for reuse across window lifecycles.
-//! Textures are organized by size buckets (power-of-two rounding) and format.
+//! Textures are keyed by their exact size and format: a render target that is
+//! larger than the surface would be sampled at a fractional scale by the
+//! composite and CRT passes (visible as row-dependent blur), so no rounding
+//! is applied. The pool holds a small global number of textures so an
+//! interactive resize cannot leave one behind for every size crossed.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 
-/// Texture size bucket for pooling
-///
-/// Textures are bucketed by power-of-two size to enable reuse
-/// across slightly different window sizes.
+/// Texture pool key: exact size and format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TextureBucket {
-    /// Width rounded up to next power of two (min 256)
+    /// Exact width in pixels (min 1)
     pub width: u32,
-    /// Height rounded up to next power of two (min 256)
+    /// Exact height in pixels (min 1)
     pub height: u32,
     /// Texture format
     pub format: wgpu::TextureFormat,
 }
 
 impl TextureBucket {
-    /// Create a bucket for the given dimensions
-    ///
-    /// Uses 64-pixel alignment for modest pooling benefit without
-    /// the 2x pixel overhead of power-of-two bucketing.
+    /// Create a key for the given dimensions (exact, no rounding).
     pub fn from_size(width: u32, height: u32, format: wgpu::TextureFormat) -> Self {
         Self {
-            width: align_to_64(width).max(256),
-            height: align_to_64(height).max(256),
+            width: width.max(1),
+            height: height.max(1),
             format,
         }
     }
 }
 
-/// Round up to next multiple of 64 (GPU-friendly alignment)
-fn align_to_64(n: u32) -> u32 {
-    (n + 63) & !63
-}
+/// Maximum textures kept idle in the pool across all sizes.
+const MAX_POOLED_TOTAL: usize = 4;
 
 /// Internal pool state
 struct TexturePoolInner {
@@ -121,12 +117,42 @@ impl TexturePoolInner {
         }
     }
 
+    fn pooled_total(&self) -> usize {
+        self.pools.values().map(Vec::len).sum()
+    }
+
+    /// Destroy one idle texture: the largest, on the theory that a window
+    /// being resized will not return to it soon.
+    fn evict_one(&mut self) {
+        let largest = self
+            .pools
+            .iter()
+            .filter(|(_, v)| !v.is_empty())
+            .map(|(b, _)| *b)
+            .max_by_key(|b| b.width as u64 * b.height as u64);
+        if let Some(bucket) = largest
+            && let Some(entry) = self.pools.get_mut(&bucket).and_then(|v| v.pop())
+        {
+            log::debug!(
+                "Evicting pooled texture {}x{} {:?}",
+                bucket.width,
+                bucket.height,
+                bucket.format
+            );
+            entry.texture.destroy();
+        }
+        self.pools.retain(|_, v| !v.is_empty());
+    }
+
     fn return_texture(
         &mut self,
         bucket: TextureBucket,
         texture: wgpu::Texture,
         view: wgpu::TextureView,
     ) {
+        while self.pooled_total() >= MAX_POOLED_TOTAL {
+            self.evict_one();
+        }
         let pool = self.pools.entry(bucket).or_default();
         if pool.len() < self.max_per_bucket {
             self.stats.returns += 1;
@@ -151,7 +177,7 @@ impl TexturePoolInner {
 
     fn shrink(&mut self) {
         for (bucket, pool) in &mut self.pools {
-            // Keep at most 1 texture per bucket when shrinking
+            // Keep at most 1 texture per size when shrinking
             while pool.len() > 1 {
                 if let Some(entry) = pool.pop() {
                     log::debug!(
@@ -164,6 +190,7 @@ impl TexturePoolInner {
                 }
             }
         }
+        self.pools.retain(|_, v| !v.is_empty());
     }
 }
 
@@ -317,25 +344,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_align_to_64() {
-        assert_eq!(align_to_64(0), 0);
-        assert_eq!(align_to_64(1), 64);
-        assert_eq!(align_to_64(64), 64);
-        assert_eq!(align_to_64(65), 128);
-        assert_eq!(align_to_64(1920), 1920); // Already aligned
-        assert_eq!(align_to_64(1080), 1088); // 1080 -> 1088
-    }
-
-    #[test]
-    fn test_texture_bucket() {
-        // 1920x1080 -> 1920x1088 (minimal overhead vs 2048x2048)
+    fn test_texture_bucket_is_exact() {
+        // Exact sizes: a larger render target would be resampled by the
+        // composite/CRT passes and blur the frame.
         let bucket = TextureBucket::from_size(1920, 1080, wgpu::TextureFormat::Rgba8Unorm);
         assert_eq!(bucket.width, 1920);
-        assert_eq!(bucket.height, 1088);
+        assert_eq!(bucket.height, 1080);
 
-        // Small sizes get rounded up to 256 minimum
         let small = TextureBucket::from_size(100, 50, wgpu::TextureFormat::Rgba8Unorm);
-        assert_eq!(small.width, 256);
-        assert_eq!(small.height, 256);
+        assert_eq!(small.width, 100);
+        assert_eq!(small.height, 50);
+
+        // Zero is clamped to a valid texture size
+        let zero = TextureBucket::from_size(0, 0, wgpu::TextureFormat::Rgba8Unorm);
+        assert_eq!((zero.width, zero.height), (1, 1));
     }
 }

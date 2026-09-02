@@ -131,7 +131,7 @@ pub struct RenderContext<'a> {
     pub highlight_style: Option<&'a crt_theme::HighlightStyle>,
     pub has_semantic_zones: bool,
     /// Function to determine semantic zone for a grid line
-    pub get_line_zone: Box<dyn Fn(i32) -> SemanticZone + 'a>,
+    pub get_line_zone: &'a dyn Fn(i32) -> SemanticZone,
 }
 
 /// Prepare terminal render data from collected cells.
@@ -333,9 +333,8 @@ pub struct CachedRenderState {
 /// Render state (dirty tracking, frame count, visibility)
 ///
 /// Groups state related to rendering decisions and caching.
-#[derive(Default)]
 pub struct RenderState {
-    /// Whether the window needs redrawing
+    /// Whether terminal content changed and the text layer must be rebuilt
     pub dirty: bool,
     /// Frame counter for periodic operations
     pub frame_count: u32,
@@ -347,6 +346,22 @@ pub struct RenderState {
     pub cached: CachedRenderState,
     /// Paste operation just occurred - normalize INVERSE flags on next render
     pub paste_pending: bool,
+    /// When the last frame started (frame pacing and animation `dt`)
+    pub last_frame_at: std::time::Instant,
+}
+
+impl Default for RenderState {
+    fn default() -> Self {
+        Self {
+            dirty: true,
+            frame_count: 0,
+            occluded: false,
+            focused: true,
+            cached: CachedRenderState::default(),
+            paste_pending: false,
+            last_frame_at: std::time::Instant::now(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -418,7 +433,7 @@ mod tests {
             current_match: 0,
             highlight_style: None,
             has_semantic_zones: false,
-            get_line_zone: Box::new(|_| SemanticZone::Unknown),
+            get_line_zone: &|_| SemanticZone::Unknown,
         };
 
         let (prepared, decorations) = prepare_render_cells(&cells, &ctx);
@@ -509,7 +524,7 @@ mod tests {
             current_match: 0,
             highlight_style: None,
             has_semantic_zones: false,
-            get_line_zone: Box::new(|_| SemanticZone::Unknown),
+            get_line_zone: &|_| SemanticZone::Unknown,
         };
 
         // Hovered → both cells underlined.

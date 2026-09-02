@@ -24,6 +24,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hasher;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crt_core::{CellFlags, ShellTerminal, Size, SpawnOptions};
 use crt_renderer::GlyphStyle;
@@ -55,14 +56,67 @@ pub struct WindowState {
     pub ui: UiState,
     // Custom window title (None = use default "CRT Terminal")
     pub custom_title: Option<String>,
-    // Per-window theme
-    pub theme: Theme,
+    // Per-window theme (shared with the render pipelines)
+    pub theme: Arc<Theme>,
     pub theme_name: String,
 }
 
+/// Minimum interval between frames of the focused window (~60 fps)
+pub const FOCUSED_FRAME_INTERVAL: Duration = Duration::from_micros(16_666);
+/// Minimum interval between frames of unfocused windows (10 fps)
+pub const UNFOCUSED_FRAME_INTERVAL: Duration = Duration::from_millis(100);
+
 impl WindowState {
+    /// Whether something on screen changes continuously (needs a frame every
+    /// interval regardless of terminal content).
+    pub fn is_animating(&self) -> bool {
+        let gpu = &self.gpu;
+        gpu.effects_renderer.has_enabled_effects()
+            || gpu.sprite_state.is_some()
+            || gpu
+                .background_image_state
+                .as_ref()
+                .is_some_and(|bg| bg.image.is_animated())
+            || gpu.crt_pipeline.is_enabled()
+            || self.ui.bell.is_active()
+            || self.ui.overrides.has_active()
+            || self.ui.zoom_indicator.is_visible()
+            || self.ui.copy_indicator.is_visible()
+            || self.ui.toast.is_visible()
+    }
+
+    /// When this window next needs a frame, if ever.
+    ///
+    /// `None` means the loop may sleep until an event arrives. A deadline in
+    /// the past means "redraw now" (subject to the per-focus frame cap).
+    pub fn next_frame_deadline(&self, now: Instant, focused: bool) -> Option<Instant> {
+        if self.render.occluded {
+            return None;
+        }
+        let interval = if focused {
+            FOCUSED_FRAME_INTERVAL
+        } else {
+            UNFOCUSED_FRAME_INTERVAL
+        };
+        let earliest = self.render.last_frame_at + interval;
+
+        if self.render.dirty || self.is_animating() {
+            return Some(earliest.max(now.min(earliest)));
+        }
+
+        // A blinking cursor only needs a frame when it toggles.
+        let vello = &self.gpu.terminal_vello;
+        if focused
+            && vello.blink_enabled()
+            && self.render.cached.cursor.is_some_and(|c| c.visible)
+        {
+            return Some(vello.next_blink_toggle().max(earliest));
+        }
+        None
+    }
+
     /// Set the theme for this window, updating all GPU resources
-    pub fn set_theme(&mut self, name: &str, theme: Theme) {
+    pub fn set_theme(&mut self, name: &str, theme: Arc<Theme>) {
         self.theme_name = name.to_string();
         self.theme = theme.clone();
 
@@ -335,6 +389,7 @@ impl WindowState {
 
         // Prepare render data using pure function (no GPU calls)
         let has_semantic_zones = terminal.has_semantic_zones();
+        let line_zone = |grid_line: i32| terminal.get_line_zone(grid_line);
         let theme = self.gpu.effect_pipeline.theme();
         let ctx = RenderContext {
             layout: RenderLayout {
@@ -362,7 +417,7 @@ impl WindowState {
                 None
             },
             has_semantic_zones,
-            get_line_zone: Box::new(|grid_line| terminal.get_line_zone(grid_line)),
+            get_line_zone: &line_zone,
         };
 
         // Damage-aware rendering: only prepare cells for changed lines,

@@ -7,7 +7,7 @@
 
 pub mod pty;
 
-pub use pty::{Pty, PtyBackend, ShellType, SpawnOptions};
+pub use pty::{Pty, PtyBackend, ShellType, SpawnOptions, WakeFn};
 
 // Re-export alacritty_terminal types needed for rendering
 pub use alacritty_terminal::event::Event as TerminalEvent;
@@ -26,11 +26,31 @@ pub use alacritty_terminal::vte::ansi::Color as AnsiColor;
 pub use alacritty_terminal::vte::ansi::CursorShape;
 pub use alacritty_terminal::vte::ansi::NamedColor;
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event, EventListener};
 use crossbeam_queue::SegQueue;
+
+/// What part of the visible grid changed since the last `take_damage`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TextInvalidation {
+    /// Nothing changed
+    None,
+    /// Only these viewport lines changed (0 = top of the visible screen)
+    Lines(Vec<usize>),
+    /// Everything changed (scroll, resize, mode switch, first frame)
+    Full,
+}
+
+impl TextInvalidation {
+    pub fn is_none(&self) -> bool {
+        matches!(self, TextInvalidation::None)
+    }
+}
 
 /// Semantic zone type from OSC 133 shell integration
 ///
@@ -124,13 +144,17 @@ pub struct Terminal {
     event_proxy: TerminalEventProxy,
     parser: ansi::Processor,
     size: Size,
-    /// Semantic zones per line (from OSC 133)
-    /// Maps line number (can be negative for scrollback) to zone type
-    line_zones: BTreeMap<i32, SemanticZone>,
+    /// Semantic zones per line (from OSC 133), keyed by absolute line index
+    /// (`history_size + screen_line` at the time the marker was seen) so the
+    /// entries stay attached to their text as the grid scrolls.
+    line_zones: BTreeMap<i64, SemanticZone>,
     /// Current semantic zone state (for marking new content)
     current_zone: SemanticZone,
     /// Pending shell events for theme triggers (bell, command success/fail)
     pending_shell_events: Vec<ShellEvent>,
+    /// Bytes held back from the previous chunk because they might be the
+    /// start of an OSC 133 sequence split across two reads.
+    osc_carry: Vec<u8>,
 }
 
 impl Terminal {
@@ -150,6 +174,7 @@ impl Terminal {
             line_zones: BTreeMap::new(),
             current_zone: SemanticZone::Unknown,
             pending_shell_events: Vec::new(),
+            osc_carry: Vec::new(),
         }
     }
 
@@ -172,101 +197,84 @@ impl Terminal {
     ///
     /// Selection is preserved across output processing to support copy/paste
     /// during active shell output (e.g., during builds, long-running commands).
+    ///
+    /// OSC 133 markers are handled *at their position in the stream*: bytes
+    /// before a marker are parsed first so the cursor line recorded for the
+    /// zone is correct, and a marker split across two reads is reassembled.
     pub fn process_input(&mut self, bytes: &[u8]) {
-        // Scan for OSC 133 sequences before passing to parser
-        self.scan_osc133(bytes);
-
         // Preserve selection across output processing
         // Alacritty_terminal clears selection when lines are cleared or screen is modified,
         // but we want to keep it for copy/paste convenience
         let saved_selection = self.term.selection.clone();
 
-        // Pass through to terminal parser unchanged
-        self.parser.advance(&mut self.term, bytes);
+        if self.osc_carry.is_empty() {
+            self.process_with_markers(bytes);
+        } else {
+            let mut joined = std::mem::take(&mut self.osc_carry);
+            joined.extend_from_slice(bytes);
+            self.process_with_markers(&joined);
+        }
 
         // Restore selection if it was cleared during processing
-        // Only restore if we had a selection and it was cleared
         if saved_selection.is_some() && self.term.selection.is_none() {
             self.term.selection = saved_selection;
         }
+
+        self.prune_zones();
     }
 
-    /// Scan input bytes for OSC 133 semantic prompt sequences
-    ///
-    /// OSC 133 format: `\x1b]133;X\x07` or `\x1b]133;X\x1b\\`
-    /// Where X is: A (prompt start), B (command start), C (output start), D (output end)
-    /// For D, may include exit code: `\x1b]133;D;exitcode\x07`
-    fn scan_osc133(&mut self, bytes: &[u8]) {
-        // OSC starts with \x1b] (ESC ])
+    /// Feed `bytes` to the parser, handling OSC 133 markers in stream order.
+    fn process_with_markers(&mut self, bytes: &[u8]) {
+        let mut fed = 0;
         let mut i = 0;
         while i < bytes.len() {
-            // Look for ESC ]
-            if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b']' {
-                // Check for "133;" pattern
-                if i + 6 < bytes.len()
-                    && bytes[i + 2] == b'1'
-                    && bytes[i + 3] == b'3'
-                    && bytes[i + 4] == b'3'
-                    && bytes[i + 5] == b';'
-                {
-                    let cmd = bytes[i + 6];
-
-                    // For D command, try to parse exit code (format: D;exitcode)
-                    let exit_code = if cmd == b'D' && i + 8 < bytes.len() && bytes[i + 7] == b';' {
-                        // Find terminator and parse exit code
-                        let mut end = i + 8;
-                        while end < bytes.len()
-                            && bytes[end] != 0x07
-                            && bytes[end] != 0x1b
-                            && bytes[end].is_ascii_digit()
-                        {
-                            end += 1;
-                        }
-                        if end > i + 8 {
-                            std::str::from_utf8(&bytes[i + 8..end])
-                                .ok()
-                                .and_then(|s| s.parse::<i32>().ok())
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-
-                    // Check for valid terminator anywhere after command
-                    // Scan forward to find BEL or ST
-                    let mut term_pos = i + 7;
-                    let mut has_terminator = false;
-                    while term_pos < bytes.len() && term_pos < i + 20 {
-                        // limit search
-                        if bytes[term_pos] == 0x07 {
-                            has_terminator = true;
-                            break;
-                        }
-                        if bytes[term_pos] == 0x1b
-                            && term_pos + 1 < bytes.len()
-                            && bytes[term_pos + 1] == b'\\'
-                        {
-                            has_terminator = true;
-                            break;
-                        }
-                        term_pos += 1;
-                    }
-
-                    if has_terminator {
-                        self.handle_osc133(cmd, exit_code);
-                    }
+            match scan_osc133_at(bytes, i) {
+                Osc133Scan::None => i += 1,
+                Osc133Scan::Marker { cmd, exit_code, end } => {
+                    // Parse everything before the marker so the cursor is where
+                    // the shell expects when the marker is recorded.
+                    self.parser.advance(&mut self.term, &bytes[fed..i]);
+                    self.handle_osc133(cmd, exit_code);
+                    fed = i;
+                    i = end;
+                }
+                Osc133Scan::Incomplete => {
+                    // Possible marker cut off by the read boundary: feed what we
+                    // have before it and hold the rest for the next chunk.
+                    self.parser.advance(&mut self.term, &bytes[fed..i]);
+                    self.osc_carry.extend_from_slice(&bytes[i..]);
+                    return;
                 }
             }
-            i += 1;
         }
+        self.parser.advance(&mut self.term, &bytes[fed..]);
+    }
+
+    /// Drop zone entries that have scrolled far out of the retained history.
+    fn prune_zones(&mut self) {
+        const KEEP_HISTORY_LINES: i64 = 2000;
+        let floor = self.term.grid().history_size() as i64 - KEEP_HISTORY_LINES;
+        if floor > 0
+            && self
+                .line_zones
+                .first_key_value()
+                .is_some_and(|(k, _)| *k < floor)
+        {
+            self.line_zones = self.line_zones.split_off(&floor);
+        }
+    }
+
+    /// Absolute index of a screen line: stable across scrolling until the
+    /// scrollback buffer is full.
+    fn absolute_line(&self, screen_line: i32) -> i64 {
+        self.term.grid().history_size() as i64 + screen_line as i64
     }
 
     /// Handle an OSC 133 command
     fn handle_osc133(&mut self, cmd: u8, exit_code: Option<i32>) {
         // Get current cursor line from terminal
-        let cursor = self.term.renderable_content().cursor;
-        let line = cursor.point.line.0;
+        let screen_line = self.term.grid().cursor.point.line.0;
+        let line = self.absolute_line(screen_line);
 
         match cmd {
             b'A' => {
@@ -311,7 +319,7 @@ impl Terminal {
     /// Returns Unknown if no OSC 133 marker has been seen for this line.
     pub fn get_line_zone(&self, line: i32) -> SemanticZone {
         self.line_zones
-            .get(&line)
+            .get(&self.absolute_line(line))
             .copied()
             .unwrap_or(SemanticZone::Unknown)
     }
@@ -419,6 +427,35 @@ impl Terminal {
                 }
             }
         }
+    }
+
+    /// Take and reset the damage accumulated since the previous call.
+    ///
+    /// This is the one invalidation source for the text layer: alacritty
+    /// tracks cursor movement, selection, attribute-only changes, scrolling
+    /// and resizes, so nothing else needs to hash the grid. Lines are
+    /// viewport-relative (already adjusted for `display_offset`).
+    pub fn take_damage(&mut self) -> TextInvalidation {
+        let result = match self.term.damage() {
+            TermDamage::Full => TextInvalidation::Full,
+            TermDamage::Partial(iter) => {
+                let lines: Vec<usize> = iter.map(|bounds| bounds.line).collect();
+                if lines.is_empty() {
+                    TextInvalidation::None
+                } else {
+                    TextInvalidation::Lines(lines)
+                }
+            }
+        };
+        self.term.reset_damage();
+        result
+    }
+
+    /// Mark the whole grid as needing a redraw (e.g. after a theme change).
+    pub fn mark_full_damage(&mut self) {
+        // Resizing to the current size is the public way to fully damage a Term.
+        let size = TermSize::new(self.term.columns(), self.term.screen_lines());
+        self.term.resize(size);
     }
 
     /// Start a new selection at the given point
@@ -529,13 +566,89 @@ impl Terminal {
     }
 }
 
+/// Result of probing for an OSC 133 sequence at one offset.
+enum Osc133Scan {
+    /// No sequence starts here
+    None,
+    /// A complete sequence: command byte, optional exit code, and end offset (exclusive)
+    Marker {
+        cmd: u8,
+        exit_code: Option<i32>,
+        end: usize,
+    },
+    /// The chunk ends inside what may be an OSC 133 sequence
+    Incomplete,
+}
+
+/// Longest OSC 133 sequence we recognise (`ESC ] 133 ; D ; <exit code> ESC \`).
+const OSC133_MAX_LEN: usize = 24;
+
+/// Probe `bytes[i..]` for `ESC ] 133 ; X [; digits] (BEL | ESC \)`.
+fn scan_osc133_at(bytes: &[u8], i: usize) -> Osc133Scan {
+    const PREFIX: &[u8] = b"\x1b]133;";
+    let rest = &bytes[i..];
+    if rest.is_empty() || rest[0] != 0x1b {
+        return Osc133Scan::None;
+    }
+    // Does the available data still agree with the prefix?
+    let cmp = rest.len().min(PREFIX.len());
+    if rest[..cmp] != PREFIX[..cmp] {
+        return Osc133Scan::None;
+    }
+    if rest.len() <= PREFIX.len() {
+        return Osc133Scan::Incomplete;
+    }
+    let cmd = rest[PREFIX.len()];
+    let mut pos = PREFIX.len() + 1;
+    let mut exit_code = None;
+    if cmd == b'D' && rest.get(pos) == Some(&b';') {
+        let digits_start = pos + 1;
+        let mut end = digits_start;
+        while end < rest.len() && rest[end].is_ascii_digit() {
+            end += 1;
+        }
+        if end > digits_start {
+            exit_code = std::str::from_utf8(&rest[digits_start..end])
+                .ok()
+                .and_then(|s| s.parse::<i32>().ok());
+        }
+        pos = end;
+    }
+    // Terminator: BEL or ESC \ (ST). Anything else is not a marker we handle.
+    match rest.get(pos) {
+        Some(0x07) => Osc133Scan::Marker {
+            cmd,
+            exit_code,
+            end: i + pos + 1,
+        },
+        Some(0x1b) => match rest.get(pos + 1) {
+            Some(b'\\') => Osc133Scan::Marker {
+                cmd,
+                exit_code,
+                end: i + pos + 2,
+            },
+            Some(_) => Osc133Scan::None,
+            None => Osc133Scan::Incomplete,
+        },
+        Some(_) => Osc133Scan::None,
+        None if pos < OSC133_MAX_LEN => Osc133Scan::Incomplete,
+        None => Osc133Scan::None,
+    }
+}
+
 /// A terminal connected to a PTY backend running a shell.
 ///
 /// Generic over the PTY backend to enable testing with mock PTY implementations.
 pub struct ShellTerminalGeneric<P: PtyBackend> {
     terminal: Terminal,
     pty: P,
+    /// Cached working directory (querying it costs a syscall, or a fork on
+    /// platforms without libproc); refreshed at most every `CWD_CACHE_TTL`.
+    cwd_cache: RefCell<Option<(Instant, Option<PathBuf>)>>,
 }
+
+/// How long a cached working directory stays valid.
+const CWD_CACHE_TTL: Duration = Duration::from_secs(1);
 
 /// Backward-compatible alias for the concrete PTY implementation
 pub type ShellTerminal = ShellTerminalGeneric<Pty>;
@@ -546,7 +659,7 @@ impl ShellTerminal {
         let terminal = Terminal::new(size);
         let pty = Pty::spawn(None, size.columns as u16, size.lines as u16)?;
 
-        Ok(Self { terminal, pty })
+        Ok(Self::from_parts(terminal, pty))
     }
 
     /// Create a new shell terminal with a specific working directory
@@ -554,7 +667,7 @@ impl ShellTerminal {
         let terminal = Terminal::new(size);
         let pty = Pty::spawn_with_cwd(None, size.columns as u16, size.lines as u16, Some(cwd))?;
 
-        Ok(Self { terminal, pty })
+        Ok(Self::from_parts(terminal, pty))
     }
 
     /// Create a new shell terminal with a specific shell
@@ -562,7 +675,7 @@ impl ShellTerminal {
         let terminal = Terminal::new(size);
         let pty = Pty::spawn(Some(shell), size.columns as u16, size.lines as u16)?;
 
-        Ok(Self { terminal, pty })
+        Ok(Self::from_parts(terminal, pty))
     }
 
     /// Create a new shell terminal with full spawn options
@@ -572,7 +685,7 @@ impl ShellTerminal {
         let terminal = Terminal::new(size);
         let pty = Pty::spawn_with_options(size.columns as u16, size.lines as u16, options)?;
 
-        Ok(Self { terminal, pty })
+        Ok(Self::from_parts(terminal, pty))
     }
 
     /// Get access to the PTY
@@ -585,48 +698,65 @@ impl<P: PtyBackend> ShellTerminalGeneric<P> {
     /// Create a shell terminal with a custom PTY backend
     pub fn with_backend(size: Size, pty: P) -> Self {
         let terminal = Terminal::new(size);
-        Self { terminal, pty }
+        Self::from_parts(terminal, pty)
     }
 
-    /// Get the current working directory of the shell process
-    pub fn working_directory(&self) -> Option<std::path::PathBuf> {
-        self.pty.working_directory()
+    fn from_parts(terminal: Terminal, pty: P) -> Self {
+        Self {
+            terminal,
+            pty,
+            cwd_cache: RefCell::new(None),
+        }
+    }
+
+    /// Get the current working directory of the shell process (cached for
+    /// `CWD_CACHE_TTL`; call `invalidate_cwd` after a command completes to
+    /// refresh sooner).
+    pub fn working_directory(&self) -> Option<PathBuf> {
+        let now = Instant::now();
+        if let Some((at, cwd)) = self.cwd_cache.borrow().as_ref()
+            && now.duration_since(*at) < CWD_CACHE_TTL
+        {
+            return cwd.clone();
+        }
+        let cwd = self.pty.working_directory();
+        *self.cwd_cache.borrow_mut() = Some((now, cwd.clone()));
+        cwd
+    }
+
+    /// Forget the cached working directory.
+    pub fn invalidate_cwd(&self) {
+        *self.cwd_cache.borrow_mut() = None;
     }
 
     /// Process any available PTY output through the terminal
     /// Returns true if any output was processed
     pub fn process_pty_output(&mut self) -> bool {
         let output = self.pty.read_available();
-        if !output.is_empty() {
-            // Log escape sequences for debugging
-            if output.len() < 2000 {
-                use std::fmt::Write;
-                let mut escaped = String::with_capacity(output.len() * 2);
-                for &b in &output {
-                    if b == 0x1b {
-                        escaped.push_str("ESC");
-                    } else if b == 0x07 {
-                        escaped.push_str("BEL");
-                    } else if b < 32 {
-                        let _ = write!(escaped, "^{}", (b + 64) as char);
-                    } else if b < 127 {
-                        escaped.push(b as char);
-                    } else {
-                        let _ = write!(escaped, "\\x{:02x}", b);
-                    }
-                }
-                log::debug!("PTY output ({} bytes): {}", output.len(), escaped);
-                // Check for black color sequences
-                let output_str = String::from_utf8_lossy(&output);
-                if output_str.contains("[30m") || output_str.contains("[30;") {
-                    log::warn!("PTY output contains BLACK foreground sequence!");
+        if output.is_empty() {
+            return false;
+        }
+        // Escape-sequence trace for debugging; only built when it will be logged.
+        if log::log_enabled!(log::Level::Debug) && output.len() < 2000 {
+            use std::fmt::Write;
+            let mut escaped = String::with_capacity(output.len() * 2);
+            for &b in &output {
+                if b == 0x1b {
+                    escaped.push_str("ESC");
+                } else if b == 0x07 {
+                    escaped.push_str("BEL");
+                } else if b < 32 {
+                    let _ = write!(escaped, "^{}", (b + 64) as char);
+                } else if b < 127 {
+                    escaped.push(b as char);
+                } else {
+                    let _ = write!(escaped, "\\x{:02x}", b);
                 }
             }
-            self.terminal.process_input(&output);
-            true
-        } else {
-            false
+            log::debug!("PTY output ({} bytes): {}", output.len(), escaped);
         }
+        self.terminal.process_input(&output);
+        true
     }
 
     /// Send keyboard input to the PTY
@@ -828,6 +958,51 @@ mod tests {
 
         // Terminal should now have content
         // (We're not checking specific content as it depends on shell)
+    }
+
+    #[test]
+    fn take_damage_resets() {
+        let mut term = Terminal::new(Size::new(80, 24));
+        assert_eq!(term.take_damage(), TextInvalidation::Full);
+        // Nothing happened since: no damage (cursor is re-damaged by alacritty
+        // on every call, so at most its line is reported).
+        match term.take_damage() {
+            TextInvalidation::None | TextInvalidation::Lines(_) => {}
+            TextInvalidation::Full => panic!("damage was not reset"),
+        }
+        term.process_input(b"hello");
+        match term.take_damage() {
+            TextInvalidation::Lines(lines) => assert!(lines.contains(&0)),
+            other => panic!("expected partial damage, got {:?}", other),
+        }
+        term.process_input(b"\r\n".repeat(30).as_slice());
+        assert_eq!(term.take_damage(), TextInvalidation::Full);
+    }
+
+    #[test]
+    fn osc133_marker_split_across_reads_and_after_newline() {
+        let mut term = Terminal::new(Size::new(80, 24));
+        // Marker arrives after a newline in the same chunk: recorded on line 1
+        term.process_input(b"prompt\r\n\x1b]133;A\x07");
+        assert_eq!(term.get_line_zone(1), SemanticZone::Prompt);
+        assert_eq!(term.get_line_zone(0), SemanticZone::Unknown);
+        // Marker split across two reads
+        term.process_input(b"\r\n\x1b]13");
+        term.process_input(b"3;B\x07");
+        assert_eq!(term.get_line_zone(2), SemanticZone::Input);
+        assert_eq!(term.current_zone(), SemanticZone::Input);
+    }
+
+    #[test]
+    fn osc133_zones_follow_scrolled_text() {
+        let mut term = Terminal::new(Size::new(80, 4));
+        term.process_input(b"\x1b]133;A\x07$ ");
+        assert_eq!(term.get_line_zone(0), SemanticZone::Prompt);
+        // Scroll the screen by two lines: the marked text is now on line -2
+        // of the grid (history) and line 0 holds different text.
+        term.process_input(b"\r\n\r\n\r\n\r\n\r\n");
+        assert_eq!(term.get_line_zone(0), SemanticZone::Unknown);
+        assert_eq!(term.get_line_zone(-2), SemanticZone::Prompt);
     }
 
     #[test]

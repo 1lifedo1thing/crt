@@ -3,13 +3,21 @@
 //! Loads fonts from ~/.config/crt/fonts/ first, then falls back to system fonts.
 
 use crate::config::{Config, FontConfig};
-use crt_renderer::FontVariants;
+use crt_renderer::{FontData, FontVariants};
 use fontdb::{Database, Family, Query, Style, Weight};
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 /// Global font database (loaded once)
 static FONT_DB: OnceLock<Database> = OnceLock::new();
+
+/// Font variants already loaded, keyed by the configured family list.
+///
+/// Every window (and every DPI change) asks for the same fonts; the bytes
+/// are shared through `Arc` instead of being read from disk and copied
+/// again.
+static VARIANT_CACHE: OnceLock<Mutex<HashMap<Vec<String>, FontVariants>>> = OnceLock::new();
 
 /// Get the fonts directory path (~/.config/crt/fonts)
 fn fonts_dir() -> Option<PathBuf> {
@@ -40,7 +48,7 @@ fn font_db() -> &'static Database {
 }
 
 /// Load font data by family name and style
-fn load_font(family: &str, weight: Weight, style: Style) -> Option<Vec<u8>> {
+fn load_font(family: &str, weight: Weight, style: Style) -> Option<FontData> {
     let db = font_db();
 
     let query = Query {
@@ -54,15 +62,16 @@ fn load_font(family: &str, weight: Weight, style: Style) -> Option<Vec<u8>> {
     let face = db.face(face_id)?;
 
     // fontdb gives us the font source - we need to read the data
-    match &face.source {
-        fontdb::Source::File(path) => std::fs::read(path).ok(),
-        fontdb::Source::Binary(data) => Some(data.as_ref().as_ref().to_vec()),
-        fontdb::Source::SharedFile(_path, data) => Some(data.as_ref().as_ref().to_vec()),
-    }
+    let bytes: Vec<u8> = match &face.source {
+        fontdb::Source::File(path) => std::fs::read(path).ok()?,
+        fontdb::Source::Binary(data) => data.as_ref().as_ref().to_vec(),
+        fontdb::Source::SharedFile(_path, data) => data.as_ref().as_ref().to_vec(),
+    };
+    Some(FontData::from(bytes))
 }
 
 /// Try to load a font from a list of family names (first match wins)
-fn load_font_from_families(families: &[String], weight: Weight, style: Style) -> Option<Vec<u8>> {
+fn load_font_from_families(families: &[String], weight: Weight, style: Style) -> Option<FontData> {
     for family in families {
         if let Some(data) = load_font(family, weight, style) {
             log::info!("Loaded font: {} ({:?}, {:?})", family, weight, style);
@@ -80,6 +89,20 @@ fn load_font_from_families(families: &[String], weight: Weight, style: Style) ->
 ///
 /// Falls back to MesloLGS NF from config dir, then any available monospace font.
 pub fn load_font_variants(config: &FontConfig) -> FontVariants {
+    let cache = VARIANT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(cache) = cache.lock()
+        && let Some(variants) = cache.get(&config.family)
+    {
+        return variants.clone();
+    }
+    let variants = load_font_variants_uncached(config);
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(config.family.clone(), variants.clone());
+    }
+    variants
+}
+
+fn load_font_variants_uncached(config: &FontConfig) -> FontVariants {
     // Try to load regular font from config families
     let regular = load_font_from_families(&config.family, Weight::NORMAL, Style::Normal)
         .or_else(|| {

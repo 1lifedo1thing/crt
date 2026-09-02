@@ -4,12 +4,16 @@
 
 use crt_theme::Theme;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Registry of available themes, loaded from the themes directory
+///
+/// Themes are handed out as `Arc<Theme>` so windows and render pipelines
+/// share one copy instead of deep-cloning a multi-kilobyte struct.
 pub struct ThemeRegistry {
     /// Cached parsed themes by name (without .css extension)
-    themes: HashMap<String, Theme>,
+    themes: HashMap<String, Arc<Theme>>,
     /// Path to the themes directory
     themes_dir: PathBuf,
     /// Default theme name from config
@@ -53,7 +57,7 @@ impl ThemeRegistry {
                 match self.load_theme_from_path(&path) {
                     Ok(theme) => {
                         log::info!("Loaded theme: {}", name);
-                        self.themes.insert(name, theme);
+                        self.themes.insert(name, Arc::new(theme));
                     }
                     Err(e) => {
                         log::warn!("Failed to load theme {:?}: {}", path, e);
@@ -83,25 +87,52 @@ impl ThemeRegistry {
     }
 
     /// Get a theme by name
-    pub fn get_theme(&self, name: &str) -> Option<&Theme> {
+    pub fn get_theme(&self, name: &str) -> Option<&Arc<Theme>> {
         self.themes.get(name)
     }
 
-    /// Get the default theme (from config or fallback)
-    pub fn get_default_theme(&self) -> (&str, Theme) {
+    /// Get the default theme (from config, else the alphabetically first
+    /// available theme so the fallback is stable across launches).
+    pub fn get_default_theme(&self) -> (String, Arc<Theme>) {
         if let Some(theme) = self.themes.get(&self.default_theme) {
-            (&self.default_theme, theme.clone())
-        } else if let Some((name, theme)) = self.themes.iter().next() {
+            (self.default_theme.clone(), theme.clone())
+        } else if let Some(name) = self.list_themes().first() {
             log::warn!(
                 "Default theme '{}' not found, using '{}'",
                 self.default_theme,
                 name
             );
-            (name.as_str(), theme.clone())
+            (name.to_string(), self.themes[*name].clone())
         } else {
             log::warn!("No themes found, using built-in default");
-            ("default", Theme::default())
+            ("default".to_string(), Arc::new(Theme::default()))
         }
+    }
+
+    /// Reload (or remove) the single theme file at `path`.
+    ///
+    /// Returns the theme name if the file belongs to this registry.
+    pub fn reload_path(&mut self, path: &Path) -> Option<String> {
+        if path.extension().is_none_or(|e| e != "css") {
+            return None;
+        }
+        let name = path.file_stem()?.to_str()?.to_string();
+        if !path.exists() {
+            if self.themes.remove(&name).is_some() {
+                log::info!("Theme removed: {}", name);
+            }
+            return Some(name);
+        }
+        match self.load_theme_from_path(path) {
+            Ok(theme) => {
+                log::info!("Reloaded theme: {}", name);
+                self.themes.insert(name.clone(), Arc::new(theme));
+            }
+            Err(e) => {
+                log::warn!("Failed to reload theme {:?}: {}", path, e);
+            }
+        }
+        Some(name)
     }
 
     /// Get the default theme name
@@ -189,11 +220,27 @@ mod tests {
 
     #[test]
     fn get_default_theme_falls_back_when_missing() {
-        let dir = setup_themes_dir(&[("other", MINIMAL_CSS)]);
+        let dir = setup_themes_dir(&[("zeta", MINIMAL_CSS), ("other", MINIMAL_CSS)]);
         let registry = ThemeRegistry::new(dir.path().to_path_buf(), "missing".to_string());
         let (name, _theme) = registry.get_default_theme();
-        // Falls back to whatever theme is available
+        // Falls back to the alphabetically first theme, deterministically
         assert_eq!(name, "other");
+    }
+
+    #[test]
+    fn reload_path_updates_single_theme() {
+        let dir = setup_themes_dir(&[("a", MINIMAL_CSS), ("b", MINIMAL_CSS)]);
+        let mut registry = ThemeRegistry::new(dir.path().to_path_buf(), "a".to_string());
+        let before_b = registry.get_theme("b").cloned().unwrap();
+        let path = dir.path().join("a.css");
+        fs::write(&path, MINIMAL_CSS).unwrap();
+        assert_eq!(registry.reload_path(&path).as_deref(), Some("a"));
+        // b is untouched (same Arc), a was re-parsed
+        assert!(Arc::ptr_eq(&before_b, registry.get_theme("b").unwrap()));
+        assert!(registry.reload_path(&dir.path().join("notes.txt")).is_none());
+        fs::remove_file(&path).unwrap();
+        assert_eq!(registry.reload_path(&path).as_deref(), Some("a"));
+        assert!(registry.get_theme("a").is_none());
     }
 
     #[test]

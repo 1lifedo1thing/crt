@@ -140,36 +140,6 @@ impl SharedGpuState {
         self.vello_renderer.clone()
     }
 
-    /// Reset the Vello renderer to clean up accumulated texture atlas resources.
-    ///
-    /// Vello's internal atlas/texture caches grow over time and don't have a
-    /// built-in cleanup mechanism. Recreating the renderer periodically prevents
-    /// unbounded GPU memory growth.
-    pub fn reset_vello_renderer(&self) {
-        let mut guard = match self.vello_renderer.lock() {
-            Ok(g) => g,
-            Err(e) => {
-                log::warn!("Vello renderer lock poisoned, skipping reset: {}", e);
-                return;
-            }
-        };
-        if guard.is_some() {
-            log::info!("Resetting Vello renderer to free accumulated GPU resources");
-            // Drop the old renderer
-            *guard = None;
-            // Create a new one
-            *guard = Some(
-                vello::Renderer::new(
-                    &self.device,
-                    vello::RendererOptions {
-                        pipeline_cache: None,
-                        ..Default::default()
-                    },
-                )
-                .expect("Failed to recreate Vello renderer"),
-            );
-        }
-    }
 }
 
 /// Per-window GPU state (surface tied to specific window)

@@ -39,9 +39,14 @@ fn main() {
     // Initialize profiling (enabled via CRT_PROFILE=1)
     profiling::init();
 
-    let event_loop = EventLoop::new().unwrap();
-    event_loop.set_control_flow(ControlFlow::Poll);
-    event_loop.run_app(&mut app::App::new()).unwrap();
+    // The loop sleeps between events; PTY output and file changes wake it
+    // through a user event and animations schedule their own deadlines.
+    let event_loop = EventLoop::<app::WakeReason>::with_user_event()
+        .build()
+        .unwrap();
+    event_loop.set_control_flow(ControlFlow::Wait);
+    let proxy = event_loop.create_proxy();
+    event_loop.run_app(&mut app::App::new(proxy)).unwrap();
 
     // Flush profiling data on exit
     profiling::shutdown();
