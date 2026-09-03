@@ -699,7 +699,7 @@ mod tests {
         for seed in 0..100 {
             let val = MatrixEffect::rand(seed);
             assert!(
-                val >= 0.0 && val < 1.0,
+                (0.0..1.0).contains(&val),
                 "rand({}) = {} out of range",
                 seed,
                 val
@@ -773,7 +773,11 @@ mod tests {
         let speeds: Vec<f64> = m.columns.iter().map(|c| c.speed).collect();
         // All speeds should be in range [0.7, 1.3]
         for &s in &speeds {
-            assert!(s >= 0.7 && s <= 1.3, "Speed {} out of expected range", s);
+            assert!(
+                (0.7..=1.3).contains(&s),
+                "Speed {} out of expected range",
+                s
+            );
         }
         // Not all the same
         assert!(speeds.windows(2).any(|w| (w[0] - w[1]).abs() > 0.001));
@@ -1069,7 +1073,7 @@ mod tests {
             let path = MatrixEffect::draw_char(center, 10.0, 14.0, seed, &[]);
             // Should produce non-empty path elements
             assert!(
-                path.elements().len() > 0,
+                !path.elements().is_empty(),
                 "Seed {} produced empty path",
                 seed
             );
@@ -1081,7 +1085,7 @@ mod tests {
         let center = Point::new(50.0, 50.0);
         let charset = vec!['A', 'B', 'C'];
         let path = MatrixEffect::draw_char(center, 10.0, 14.0, 0, &charset);
-        assert!(path.elements().len() > 0);
+        assert!(!path.elements().is_empty());
     }
 
     #[test]

@@ -587,8 +587,9 @@ mod tests {
         let _rows = 2;
 
         // Frame 0: (0, 0)
-        let col0 = 0 % columns;
-        let row0 = 0 / columns;
+        let frame0 = 0;
+        let col0 = frame0 % columns;
+        let row0 = frame0 / columns;
         assert_eq!((col0 * frame_width, row0 * frame_height), (0, 0));
 
         // Frame 3: (192, 0) - last in first row

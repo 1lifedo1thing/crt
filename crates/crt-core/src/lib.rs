@@ -1171,7 +1171,7 @@ mod tests {
 
     /// Mock PTY backend for deterministic testing without real shell processes
     pub struct MockPty {
-        output_queue: std::collections::VecDeque<Vec<u8>>,
+        output_queue: std::cell::RefCell<std::collections::VecDeque<Vec<u8>>>,
         captured_input: std::cell::RefCell<Vec<u8>>,
         last_resize: std::cell::Cell<Option<(u16, u16)>>,
         shutdown_called: std::cell::Cell<bool>,
@@ -1181,7 +1181,7 @@ mod tests {
         /// Create a MockPty with pre-loaded output chunks
         pub fn with_output(chunks: Vec<Vec<u8>>) -> Self {
             Self {
-                output_queue: chunks.into(),
+                output_queue: std::cell::RefCell::new(chunks.into()),
                 captured_input: std::cell::RefCell::new(Vec::new()),
                 last_resize: std::cell::Cell::new(None),
                 shutdown_called: std::cell::Cell::new(false),
@@ -1200,14 +1200,11 @@ mod tests {
         }
 
         fn try_read(&self) -> Option<Vec<u8>> {
-            // MockPty uses interior mutability pattern for read — but VecDeque needs &mut
-            // Since this is test-only, we use unsafe to match the non-mutable trait signature
-            None // try_read not needed for basic mock
+            self.output_queue.borrow_mut().pop_front()
         }
 
         fn read_available(&self) -> Vec<u8> {
-            // Return empty for basic mock — output is fed directly via terminal in tests
-            Vec::new()
+            self.output_queue.borrow_mut().drain(..).flatten().collect()
         }
 
         fn resize(&self, cols: u16, rows: u16) {

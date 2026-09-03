@@ -512,9 +512,11 @@ mod tests {
 
     #[test]
     fn test_star_generation() {
-        let mut starfield = StarfieldEffect::default();
-        starfield.density = 50;
-        starfield.layer_count = 2;
+        let mut starfield = StarfieldEffect {
+            density: 50,
+            layer_count: 2,
+            ..Default::default()
+        };
         starfield.generate_stars();
 
         assert_eq!(starfield.stars.len(), 100); // 50 * 2 layers

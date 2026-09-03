@@ -226,8 +226,8 @@ mod tests {
     #[test]
     fn effect_config_get_f32() {
         let mut config = EffectConfig::new();
-        config.insert("val", "3.14");
-        assert!((config.get_f32("val").unwrap() - 3.14).abs() < 0.001);
+        config.insert("val", "2.5");
+        assert!((config.get_f32("val").unwrap() - 2.5).abs() < 0.001);
     }
 
     #[test]

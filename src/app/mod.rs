@@ -248,10 +248,10 @@ impl App {
 
         // Prevent macOS from grouping this with terminal windows
         #[cfg(target_os = "macos")]
-        {
+        let attrs = {
             use winit::platform::macos::WindowAttributesExtMacOS;
-            attrs = attrs.with_tabbing_identifier("crt-drag-overlay");
-        }
+            attrs.with_tabbing_identifier("crt-drag-overlay")
+        };
 
         match event_loop.create_window(attrs) {
             Ok(window) => {

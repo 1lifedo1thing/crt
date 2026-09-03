@@ -70,10 +70,10 @@ impl App {
             .with_inner_size(winit::dpi::LogicalSize::new(width, height));
 
         #[cfg(target_os = "macos")]
-        {
+        let window_attrs = {
             let unique_id = format!("crt-window-{}", self.windows.len());
-            window_attrs = window_attrs.with_tabbing_identifier(&unique_id);
-        }
+            window_attrs.with_tabbing_identifier(&unique_id)
+        };
 
         let window = Arc::new(
             event_loop

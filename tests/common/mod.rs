@@ -523,12 +523,12 @@ mod tests {
 
     #[test]
     fn test_memory_stats() {
-        let _stats = MemoryStats::current();
+        let stats = MemoryStats::current();
         // On macOS, we should get some memory info
         #[cfg(target_os = "macos")]
-        {
-            assert!(stats.rss.is_some(), "Should get RSS on macOS");
-        }
+        assert!(stats.rss.is_some(), "Should get RSS on macOS");
+        #[cfg(not(target_os = "macos"))]
+        let _ = stats;
     }
 
     #[test]
