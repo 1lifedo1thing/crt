@@ -2,10 +2,15 @@
 //!
 //! Renders glyphs as instanced quads, sampling from a glyph atlas.
 //! Each glyph is one instance with position, UV coords, and color.
-//! All text renders in a single draw call.
+//! All text of one pass renders in a single draw call.
+//!
+//! `render()` uploads to a renderer-owned buffer only when the instance list
+//! changed; `render_transient()` bump-allocates from a [`FrameArena`] so one
+//! renderer can serve several passes in a frame (see `frame_arena.rs`).
 
 use std::sync::Arc;
 
+use crate::frame_arena::{FrameArena, OwnedInstanceBuffer};
 use crate::glyph_cache::PositionedGlyph;
 use crate::shared_pipelines::SharedGridPipeline;
 use bytemuck::{Pod, Zeroable};
@@ -49,10 +54,6 @@ struct Globals {
 
 /// Grid renderer using instanced quads
 ///
-/// The renderer does not own its instance buffer - this allows for buffer pooling
-/// across window lifecycles. Use `create_instance_buffer()` to create a buffer,
-/// or provide one from a buffer pool.
-///
 /// Pipeline objects (pipeline, bind group layout, sampler) can be shared across
 /// windows via `new_with_shared()` to avoid duplicating Metal shader caches.
 pub struct GridRenderer {
@@ -61,35 +62,19 @@ pub struct GridRenderer {
     /// Metal shader compilation (~5-15 MB per pipeline on macOS).
     shared: Arc<SharedGridPipeline>,
     globals_buffer: wgpu::Buffer,
-    instance_capacity: usize,
     bind_group: Option<wgpu::BindGroup>,
     /// Pending instances to render
     instances: Vec<GlyphInstance>,
+    /// Instances changed since the last owned upload
+    dirty: bool,
+    owned: OwnedInstanceBuffer,
+    /// Pixel bounds of pending instances: (min_x, min_y, max_x, max_y)
+    bounds: Option<[f32; 4]>,
     /// Cached screen size to avoid redundant uniform updates
     cached_screen_size: (f32, f32),
 }
 
 impl GridRenderer {
-    /// Maximum number of glyph instances per render call
-    pub const MAX_INSTANCES: usize = 32 * 1024;
-
-    /// Size of instance buffer in bytes (32K instances * 48 bytes = 1.5 MB)
-    pub const INSTANCE_BUFFER_SIZE: u64 =
-        (Self::MAX_INSTANCES * std::mem::size_of::<GlyphInstance>()) as u64;
-
-    /// Create an instance buffer for use with this renderer
-    ///
-    /// Call this to create a buffer if not using a buffer pool.
-    /// The buffer can be reused across renderer instances.
-    pub fn create_instance_buffer(device: &wgpu::Device) -> wgpu::Buffer {
-        device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Grid Instance Buffer"),
-            size: Self::INSTANCE_BUFFER_SIZE,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        })
-    }
-
     /// Create a grid renderer using shared pipeline objects.
     ///
     /// This avoids duplicating the compiled Metal pipeline and shader caches
@@ -100,9 +85,11 @@ impl GridRenderer {
         Self {
             shared: shared.clone(),
             globals_buffer,
-            instance_capacity: Self::MAX_INSTANCES,
             bind_group: None,
-            instances: Vec::with_capacity(Self::MAX_INSTANCES),
+            instances: Vec::new(),
+            dirty: false,
+            owned: OwnedInstanceBuffer::new("Grid Instance Buffer"),
+            bounds: None,
             cached_screen_size: (0.0, 0.0),
         }
     }
@@ -113,16 +100,7 @@ impl GridRenderer {
     /// duplicating GPU pipeline state.
     pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
         let shared = Arc::new(SharedGridPipeline::new(device, target_format));
-        let globals_buffer = Self::create_globals_buffer(device);
-
-        Self {
-            shared,
-            globals_buffer,
-            instance_capacity: Self::MAX_INSTANCES,
-            bind_group: None,
-            instances: Vec::with_capacity(Self::MAX_INSTANCES),
-            cached_screen_size: (0.0, 0.0),
-        }
+        Self::new_with_shared(device, &shared)
     }
 
     fn create_globals_buffer(device: &wgpu::Device) -> wgpu::Buffer {
@@ -165,17 +143,43 @@ impl GridRenderer {
 
     /// Clear pending instances
     pub fn clear(&mut self) {
+        if !self.instances.is_empty() {
+            self.dirty = true;
+        }
         self.instances.clear();
+        self.bounds = None;
+    }
+
+    fn extend_bounds(&mut self, g: &PositionedGlyph) {
+        let b = self.bounds.get_or_insert([g.x, g.y, g.x, g.y]);
+        b[0] = b[0].min(g.x);
+        b[1] = b[1].min(g.y);
+        b[2] = b[2].max(g.x + g.width);
+        b[3] = b[3].max(g.y + g.height);
     }
 
     /// Add positioned glyphs from layout
     pub fn push_glyphs(&mut self, glyphs: &[PositionedGlyph], color: [f32; 4]) {
-        for glyph in glyphs {
-            if self.instances.len() < self.instance_capacity {
-                self.instances
-                    .push(GlyphInstance::from_positioned(glyph, color));
-            }
+        for g in glyphs {
+            self.extend_bounds(g);
+            self.instances
+                .push(GlyphInstance::from_positioned(g, color));
         }
+        self.dirty |= !glyphs.is_empty();
+    }
+
+    /// Add a single positioned glyph
+    pub fn push_glyph(&mut self, glyph: &PositionedGlyph, color: [f32; 4]) {
+        self.extend_bounds(glyph);
+        self.instances
+            .push(GlyphInstance::from_positioned(glyph, color));
+        self.dirty = true;
+    }
+
+    /// Pixel bounds of the pending glyphs as (min_x, min_y, max_x, max_y),
+    /// or `None` when there are no glyphs.
+    pub fn bounds(&self) -> Option<[f32; 4]> {
+        self.bounds
     }
 
     /// Update screen size uniform (only writes if size changed)
@@ -193,34 +197,58 @@ impl GridRenderer {
         queue.write_buffer(&self.globals_buffer, 0, bytemuck::cast_slice(&[globals]));
     }
 
-    /// Upload instances and render
-    ///
-    /// The instance buffer must be created with `create_instance_buffer()` or
-    /// be at least `INSTANCE_BUFFER_SIZE` bytes with VERTEX | COPY_DST usage.
-    pub fn render<'a>(
-        &'a self,
+    fn bind(&self, render_pass: &mut wgpu::RenderPass<'_>) -> bool {
+        let Some(bind_group) = &self.bind_group else {
+            return false;
+        };
+        render_pass.set_pipeline(&self.shared.pipeline);
+        render_pass.set_bind_group(0, bind_group, &[]);
+        true
+    }
+
+    /// Render from the renderer-owned buffer, uploading only when the
+    /// instance list changed since the last upload.
+    pub fn render(
+        &mut self,
+        device: &wgpu::Device,
         queue: &wgpu::Queue,
-        render_pass: &mut wgpu::RenderPass<'a>,
-        instance_buffer: &'a wgpu::Buffer,
+        render_pass: &mut wgpu::RenderPass<'_>,
     ) {
         if self.instances.is_empty() {
             return;
         }
-
-        let bind_group = match &self.bind_group {
-            Some(bg) => bg,
-            None => return,
+        if self.dirty {
+            self.owned.upload(device, queue, &self.instances);
+            self.dirty = false;
+        }
+        let Some(buffer) = self.owned.buffer() else {
+            return;
         };
-
-        // Upload instance data
-        queue.write_buffer(instance_buffer, 0, bytemuck::cast_slice(&self.instances));
-
-        render_pass.set_pipeline(&self.shared.pipeline);
-        render_pass.set_bind_group(0, bind_group, &[]);
-        render_pass.set_vertex_buffer(0, instance_buffer.slice(..));
-
+        if !self.bind(render_pass) {
+            return;
+        }
+        render_pass.set_vertex_buffer(0, buffer.slice(..));
         // Draw 4 vertices per instance (triangle strip quad)
         render_pass.draw(0..4, 0..self.instances.len() as u32);
+    }
+
+    /// Render from a per-frame arena. Safe to call several times per frame
+    /// from different passes with different instance lists.
+    pub fn render_transient(
+        &self,
+        queue: &wgpu::Queue,
+        render_pass: &mut wgpu::RenderPass<'_>,
+        arena: &mut FrameArena,
+    ) {
+        if self.bind_group.is_none() {
+            return;
+        }
+        let Some(slice) = arena.push(queue, &self.instances) else {
+            return;
+        };
+        self.bind(render_pass);
+        render_pass.set_vertex_buffer(0, arena.slice(slice));
+        render_pass.draw(0..4, 0..slice.count);
     }
 
     pub fn instance_count(&self) -> usize {
@@ -231,7 +259,6 @@ impl GridRenderer {
 impl Drop for GridRenderer {
     fn drop(&mut self) {
         // Destroy globals buffer to release GPU memory immediately
-        // Note: instance buffer is external (for pooling) and not owned by renderer
         self.globals_buffer.destroy();
     }
 }

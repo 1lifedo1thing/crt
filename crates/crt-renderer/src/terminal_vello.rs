@@ -119,6 +119,16 @@ impl TerminalVelloRenderer {
         }
     }
 
+    /// Whether blinking is enabled
+    pub fn blink_enabled(&self) -> bool {
+        self.blink_enabled
+    }
+
+    /// When the blink state next toggles (for frame scheduling)
+    pub fn next_blink_toggle(&self) -> Instant {
+        self.last_blink_toggle + self.blink_interval
+    }
+
     /// Reset blink state (cursor becomes visible, timer resets)
     /// Call this when cursor moves or user types
     pub fn reset_blink(&mut self) {

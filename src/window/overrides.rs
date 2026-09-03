@@ -184,7 +184,11 @@ impl OverrideState {
     // Ref getters — return Option<&T> for non-Copy patch types
     override_ref_getter!(get_sprite_patch, sprite_patch, crt_theme::SpritePatch);
     override_ref_getter!(get_sprite_overlay, sprite_overlay, crt_theme::SpriteOverlay);
-    override_ref_getter!(get_starfield_patch, starfield_patch, crt_theme::StarfieldPatch);
+    override_ref_getter!(
+        get_starfield_patch,
+        starfield_patch,
+        crt_theme::StarfieldPatch
+    );
     override_ref_getter!(get_particle_patch, particle_patch, crt_theme::ParticlePatch);
     override_ref_getter!(get_grid_patch, grid_patch, crt_theme::GridPatch);
     override_ref_getter!(get_rain_patch, rain_patch, crt_theme::RainPatch);

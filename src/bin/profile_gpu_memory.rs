@@ -16,9 +16,7 @@
 use std::io::Write;
 use std::time::Instant;
 
-use crt_renderer::{
-    CrtPipeline, GlyphCache, GlyphStyle, GridRenderer, RectRenderer,
-};
+use crt_renderer::{CrtPipeline, GlyphCache, GlyphStyle, GridRenderer, RectRenderer};
 
 fn main() {
     env_logger::init();
@@ -88,7 +86,7 @@ fn main() {
     );
 
     // Staging buffer (for readback)
-    let padded_row = ((width * 4 + 255) / 256) * 256;
+    let padded_row = (width * 4).div_ceil(256) * 256;
     let staging_bytes = (padded_row as u64) * (height as u64);
     let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("Staging Buffer"),
@@ -104,8 +102,8 @@ fn main() {
 
     // ── Load font and create glyph cache ─────────────────────────────
     let font_data = load_system_font();
-    let mut glyph_cache = GlyphCache::new(&device, &font_data, 14.0)
-        .expect("Failed to create glyph cache");
+    let mut glyph_cache =
+        GlyphCache::new(&device, &font_data, 14.0).expect("Failed to create glyph cache");
 
     let (glyph_count, utilization, atlas_w, atlas_h) = glyph_cache.atlas_stats();
     let atlas_bytes = (atlas_w as u64) * (atlas_h as u64); // R8 = 1 byte/pixel
@@ -124,22 +122,8 @@ fn main() {
     let mut rect_renderer = RectRenderer::new(&device, format);
     rect_renderer.update_screen_size(&queue, width as f32, height as f32);
 
-    // Instance buffers
-    let grid_instance_buffer = GridRenderer::create_instance_buffer(&device);
-    let grid_buf_bytes: u64 = 32 * 1024 * 48; // 1.5 MB
-    gpu_bytes += grid_buf_bytes;
-    println!(
-        "  Grid instance buffer (32K×48B):         {:>8.2} MB",
-        grid_buf_bytes as f64 / 1024.0 / 1024.0
-    );
-
-    let rect_instance_buffer = RectRenderer::create_instance_buffer(&device);
-    let rect_buf_bytes: u64 = 16 * 1024 * 32; // 512 KB
-    gpu_bytes += rect_buf_bytes;
-    println!(
-        "  Rect instance buffer (16K×32B):         {:>8.2} MB",
-        rect_buf_bytes as f64 / 1024.0 / 1024.0
-    );
+    // Instance buffers are owned by the renderers and sized to the content
+    // (see crt_renderer::frame_arena), so they are not counted up front.
 
     // CRT pipeline (optional post-processing)
     let crt_pipeline = CrtPipeline::new(&device, format);
@@ -156,8 +140,7 @@ fn main() {
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-            | wgpu::TextureUsages::TEXTURE_BINDING,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
     let _crt_view = crt_texture.create_view(&Default::default());
@@ -295,10 +278,9 @@ fn main() {
         // Submit GPU work
         glyph_cache.flush(&queue);
 
-        let mut encoder =
-            device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Frame Encoder"),
-            });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Frame Encoder"),
+        });
 
         // Clear pass
         {
@@ -341,7 +323,7 @@ fn main() {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            rect_renderer.render(&queue, &mut pass, &rect_instance_buffer);
+            rect_renderer.render(&device, &queue, &mut pass);
         }
 
         // Grid (text) pass
@@ -361,7 +343,7 @@ fn main() {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            grid_renderer.render(&queue, &mut pass, &grid_instance_buffer);
+            grid_renderer.render(&device, &queue, &mut pass);
         }
 
         queue.submit(std::iter::once(encoder.finish()));
@@ -396,10 +378,8 @@ fn main() {
     let final_gpu_bytes = tex_bytes          // render target
         + staging_bytes                       // staging
         + final_atlas_bytes                   // glyph atlas
-        + grid_buf_bytes                      // grid instance
-        + rect_buf_bytes                      // rect instance
         + tex_bytes                           // CRT intermediate
-        + uniform_bytes;                      // uniforms
+        + uniform_bytes; // uniforms
 
     println!("  Resource                                  Size");
     println!("  ──────────────────────────────────────  ────────");
@@ -420,14 +400,7 @@ fn main() {
         final_atlas_bytes as f64 / 1024.0 / 1024.0,
         utilization * 100.0,
     );
-    println!(
-        "  Grid instance buffer                    {:>6.2} MB",
-        grid_buf_bytes as f64 / 1024.0 / 1024.0,
-    );
-    println!(
-        "  Rect instance buffer                    {:>6.2} MB",
-        rect_buf_bytes as f64 / 1024.0 / 1024.0,
-    );
+    println!("  Instance buffers                        sized to content (not tracked)");
     println!(
         "  Uniform buffers                         {:>6.2} MB",
         uniform_bytes as f64 / 1024.0 / 1024.0,
@@ -496,19 +469,17 @@ fn load_system_font() -> Vec<u8> {
             style: Style::Normal,
             ..Default::default()
         };
-        if let Some(face_id) = db.query(&query) {
-            if let Some(face) = db.face(face_id) {
-                let data = match &face.source {
-                    fontdb::Source::File(path) => std::fs::read(path).ok(),
-                    fontdb::Source::Binary(data) => Some(data.as_ref().as_ref().to_vec()),
-                    fontdb::Source::SharedFile(_path, data) => {
-                        Some(data.as_ref().as_ref().to_vec())
-                    }
-                };
-                if let Some(font_data) = data {
-                    println!("Font: {family}");
-                    return font_data;
-                }
+        if let Some(face_id) = db.query(&query)
+            && let Some(face) = db.face(face_id)
+        {
+            let data = match &face.source {
+                fontdb::Source::File(path) => std::fs::read(path).ok(),
+                fontdb::Source::Binary(data) => Some(data.as_ref().as_ref().to_vec()),
+                fontdb::Source::SharedFile(_path, data) => Some(data.as_ref().as_ref().to_vec()),
+            };
+            if let Some(font_data) = data {
+                println!("Font: {family}");
+                return font_data;
             }
         }
     }

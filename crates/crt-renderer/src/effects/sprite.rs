@@ -396,8 +396,8 @@ impl BackdropEffect for SpriteEffect {
         "sprite"
     }
 
-    fn update(&mut self, _dt: f32, time: f32) {
-        self.time = time as f64;
+    fn update(&mut self, _dt: f64, time: f64) {
+        self.time = time;
 
         // Calculate current frame from time and fps
         if let Some(sheet) = &self.sprite_sheet {
@@ -545,6 +545,18 @@ impl BackdropEffect for SpriteEffect {
     fn is_enabled(&self) -> bool {
         self.enabled && self.sprite_sheet.is_some()
     }
+
+    fn is_animated(&self) -> bool {
+        if !self.is_enabled() {
+            return false;
+        }
+        let multi_frame = self
+            .sprite_sheet
+            .as_ref()
+            .is_some_and(|s| s.frame_count > 1 && self.fps > 0.0);
+        let moving = self.motion_type != SpriteMotion::None && self.motion_speed > 0.0;
+        multi_frame || moving
+    }
 }
 
 #[cfg(test)]
@@ -555,6 +567,7 @@ mod tests {
     fn test_default_sprite_disabled() {
         let sprite = SpriteEffect::default();
         assert!(!sprite.is_enabled());
+        assert!(!sprite.is_animated());
     }
 
     #[test]
@@ -574,8 +587,9 @@ mod tests {
         let _rows = 2;
 
         // Frame 0: (0, 0)
-        let col0 = 0 % columns;
-        let row0 = 0 / columns;
+        let frame0 = 0;
+        let col0 = frame0 % columns;
+        let row0 = frame0 / columns;
         assert_eq!((col0 * frame_width, row0 * frame_height), (0, 0));
 
         // Frame 3: (192, 0) - last in first row

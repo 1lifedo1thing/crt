@@ -1,9 +1,14 @@
 //! Context menu rendering
 //!
 //! Renders the right-click context menu with nested theme submenu.
+//!
+//! All row positions come from `ContextMenu::item_rects()` /
+//! `submenu_item_rects()` — the same functions hit testing uses — so what is
+//! drawn is exactly what a click selects.
 
 use crate::gpu::SharedGpuState;
 use crate::window::{ContextMenuItem, WindowState};
+use crt_renderer::{GlyphCache, GridRenderer, PositionedGlyph};
 
 /// Render context menu overlay
 pub fn render(
@@ -13,56 +18,83 @@ pub fn render(
     frame_view: &wgpu::TextureView,
 ) {
     let scale = state.scale_factor;
-    let items = state.ui.context_menu.items();
-    let item_count = items.len();
-    let separator_height = 12.0 * scale;
-
-    // Menu dimensions
-    let padding_x = 12.0 * scale;
-    let padding_y = 6.0 * scale;
-    let item_height = 24.0 * scale;
-    let menu_width = 160.0 * scale; // Main menu is narrower now
-
-    // Calculate total height accounting for separators
-    let mut menu_height = padding_y * 2.0;
-    for item in &items {
-        if item.is_separator() {
-            menu_height += separator_height;
-        } else {
-            menu_height += item_height;
-        }
-    }
-
-    // Get menu position and adjust if near screen edges
     let screen_width = state.gpu.config.width as f32;
     let screen_height = state.gpu.config.height as f32;
 
-    let mut menu_x = state.ui.context_menu.x;
-    let mut menu_y = state.ui.context_menu.y;
+    // ---- Layout (mutates menu position/size; hit testing reads the same) ----
+    {
+        let menu = &mut state.ui.context_menu;
+        menu.set_scale(scale);
+        if menu.items().is_empty() {
+            menu.rebuild_items();
+        }
+        let m = menu.metrics();
+        let (menu_width, menu_height) = menu.menu_size();
 
-    // Keep menu within screen bounds
-    if menu_x + menu_width > screen_width {
-        menu_x = screen_width - menu_width - 4.0;
-    }
-    if menu_x < 4.0 {
-        menu_x = 4.0;
+        // Keep menu within screen bounds
+        let mut menu_x = menu.x;
+        let mut menu_y = menu.y;
+        if menu_x + menu_width > screen_width {
+            menu_x = screen_width - menu_width - 4.0;
+        }
+        if menu_x < 4.0 {
+            menu_x = 4.0;
+        }
+        if menu_height > screen_height - 8.0 {
+            menu_y = 4.0;
+        } else if menu_y + menu_height > screen_height - 4.0 {
+            menu_y = screen_height - menu_height - 4.0;
+        }
+        if menu_y < 4.0 {
+            menu_y = 4.0;
+        }
+        menu.x = menu_x;
+        menu.y = menu_y;
+        menu.width = menu_width;
+        menu.height = menu_height;
+        menu.item_height = m.item_height;
+
+        // Submenu: to the right of the main menu, aligned with the Themes row.
+        let (submenu_width, submenu_height) = menu.submenu_size();
+        let themes_row_y = menu
+            .themes_item_index()
+            .and_then(|idx| menu.item_rects().nth(idx))
+            .map(|r| r.y)
+            .unwrap_or(menu_y);
+        let mut submenu_x = menu_x + menu_width - m.border;
+        let mut submenu_y = themes_row_y - m.padding_y;
+        if submenu_x + submenu_width > screen_width - 4.0 {
+            // Show submenu on the left side instead
+            submenu_x = menu_x - submenu_width + m.border;
+        }
+        if submenu_x < 4.0 {
+            submenu_x = 4.0;
+        }
+        if submenu_y + submenu_height > screen_height - 4.0 {
+            submenu_y = screen_height - submenu_height - 4.0;
+        }
+        if submenu_y < 4.0 {
+            submenu_y = 4.0;
+        }
+        menu.submenu_x = submenu_x;
+        menu.submenu_y = submenu_y;
+        menu.submenu_width = submenu_width;
+        menu.submenu_height = submenu_height;
     }
 
-    if menu_height > screen_height - 8.0 {
-        menu_y = 4.0;
-    } else if menu_y + menu_height > screen_height - 4.0 {
-        menu_y = screen_height - menu_height - 4.0;
-    }
-    if menu_y < 4.0 {
-        menu_y = 4.0;
-    }
-
-    // Update context menu dimensions for hit testing
-    state.ui.context_menu.x = menu_x;
-    state.ui.context_menu.y = menu_y;
-    state.ui.context_menu.width = menu_width;
-    state.ui.context_menu.height = menu_height;
-    state.ui.context_menu.item_height = item_height;
+    let menu = &state.ui.context_menu;
+    let m = menu.metrics();
+    let items = menu.items();
+    let theme_items = menu.theme_items();
+    let show_submenu = menu.submenu_visible && !theme_items.is_empty();
+    let (menu_x, menu_y, menu_width, menu_height) = (menu.x, menu.y, menu.width, menu.height);
+    let (submenu_x, submenu_y, submenu_width, submenu_height) = (
+        menu.submenu_x,
+        menu.submenu_y,
+        menu.submenu_width,
+        menu.submenu_height,
+    );
+    let border_thickness = m.border;
 
     // Colors from theme
     let ui_style = &state.gpu.effect_pipeline.theme().ui;
@@ -73,23 +105,15 @@ pub fn render(
     let text_color = ui_style.context_menu.text_color.to_array();
     let shortcut_color = ui_style.context_menu.shortcut_color.to_array();
 
-    // Render background using rect_renderer
-    state.gpu.rect_renderer.clear();
-    state
-        .gpu
-        .rect_renderer
-        .update_screen_size(&shared.queue, screen_width, screen_height);
+    // ---- Shapes ----
+    let rects = &mut state.gpu.rect_renderer;
+    rects.clear();
+    rects.update_screen_size(&shared.queue, screen_width, screen_height);
 
-    // Menu background
-    state
-        .gpu
-        .rect_renderer
-        .push_rect(menu_x, menu_y, menu_width, menu_height, bg_color);
-
-    // Border (simple rectangles around the edges)
-    let border_thickness = 1.0 * scale;
+    // Menu background + border
+    rects.push_rect(menu_x, menu_y, menu_width, menu_height, bg_color);
     push_menu_border(
-        &mut state.gpu.rect_renderer,
+        rects,
         menu_x,
         menu_y,
         menu_width,
@@ -98,72 +122,16 @@ pub fn render(
         border_color,
     );
 
-    // Pre-compute item positions (accounting for variable heights)
-    let mut item_y_positions = Vec::with_capacity(item_count);
-    let mut current_y = menu_y + padding_y;
-    for item in &items {
-        item_y_positions.push(current_y);
-        if item.is_separator() {
-            current_y += separator_height;
-        } else {
-            current_y += item_height;
-        }
-    }
-
-    // Check if we should show submenu (hover on Themes item)
-    let themes_idx = state.ui.context_menu.themes_item_index();
-    let show_submenu = themes_idx.map_or(false, |idx| {
-        state.ui.context_menu.hovered_item == Some(idx)
-            || state.ui.context_menu.focused_item == Some(idx)
-            || state.ui.context_menu.submenu_visible
-    });
-
-    // Calculate submenu position and dimensions
-    let theme_items = state.ui.context_menu.theme_items();
-    let submenu_item_count = theme_items.len();
-    let submenu_width = 200.0 * scale; // Wider for theme names
-    let submenu_height = padding_y * 2.0 + (submenu_item_count as f32 * item_height);
-
-    // Position submenu to the right of main menu, aligned with Themes item
-    let mut submenu_x = menu_x + menu_width - border_thickness;
-    let mut submenu_y = if let Some(idx) = themes_idx {
-        item_y_positions.get(idx).copied().unwrap_or(menu_y)
-    } else {
-        menu_y
-    };
-
-    // Adjust if submenu would go off screen
-    if submenu_x + submenu_width > screen_width - 4.0 {
-        // Show submenu on the left side instead
-        submenu_x = menu_x - submenu_width + border_thickness;
-    }
-    if submenu_x < 4.0 {
-        submenu_x = 4.0;
-    }
-    if submenu_y + submenu_height > screen_height - 4.0 {
-        submenu_y = screen_height - submenu_height - 4.0;
-    }
-    if submenu_y < 4.0 {
-        submenu_y = 4.0;
-    }
-
-    // Update submenu state
-    if show_submenu && !theme_items.is_empty() {
-        state.ui.context_menu.submenu_visible = true;
-        state.ui.context_menu.submenu_x = submenu_x;
-        state.ui.context_menu.submenu_y = submenu_y;
-        state.ui.context_menu.submenu_width = submenu_width;
-        state.ui.context_menu.submenu_height = submenu_height;
-
-        // Render submenu background
-        state
-            .gpu
-            .rect_renderer
-            .push_rect(submenu_x, submenu_y, submenu_width, submenu_height, bg_color);
-
-        // Submenu border
+    if show_submenu {
+        rects.push_rect(
+            submenu_x,
+            submenu_y,
+            submenu_width,
+            submenu_height,
+            bg_color,
+        );
         push_menu_border(
-            &mut state.gpu.rect_renderer,
+            rects,
             submenu_x,
             submenu_y,
             submenu_width,
@@ -172,88 +140,37 @@ pub fn render(
             border_color,
         );
 
-        // Submenu hover highlight
-        if let Some(hover_idx) = state.ui.context_menu.submenu_hovered_item {
-            if hover_idx < submenu_item_count {
-                let hover_y = submenu_y + padding_y + (hover_idx as f32 * item_height);
-                state.gpu.rect_renderer.push_rect(
-                    submenu_x + border_thickness,
-                    hover_y,
-                    submenu_width - (border_thickness * 2.0),
-                    item_height,
-                    hover_color,
-                );
+        // Submenu hover highlight / focus ring
+        for rect in menu.submenu_item_rects() {
+            if menu.submenu_hovered_item == Some(rect.index) {
+                push_row_highlight(rects, rect.bounds(), border_thickness, hover_color);
+            }
+            if menu.submenu_focused_item == Some(rect.index) {
+                push_focus_ring(rects, rect.bounds(), border_thickness, scale, focus_color);
             }
         }
     }
 
-    // Hover highlight for main menu
-    if let Some(hover_idx) = state.ui.context_menu.hovered_item
-        && hover_idx < item_count
-        && items[hover_idx].is_selectable()
-    {
-        let hover_y = item_y_positions[hover_idx];
-        state.gpu.rect_renderer.push_rect(
-            menu_x + border_thickness,
-            hover_y,
-            menu_width - (border_thickness * 2.0),
-            item_height,
-            hover_color,
-        );
-    }
-
-    // Focus indicator (keyboard focus) - rendered as a border/ring
-    if let Some(focus_idx) = state.ui.context_menu.focused_item
-        && focus_idx < item_count
-        && items[focus_idx].is_selectable()
-    {
-        let focus_y = item_y_positions[focus_idx];
-        let focus_border = 2.0 * scale;
-        let inset = border_thickness + 2.0 * scale;
-
-        // Draw focus ring as 4 rectangles
-        state.gpu.rect_renderer.push_rect(
-            menu_x + inset,
-            focus_y,
-            menu_width - (inset * 2.0),
-            focus_border,
-            focus_color,
-        );
-        state.gpu.rect_renderer.push_rect(
-            menu_x + inset,
-            focus_y + item_height - focus_border,
-            menu_width - (inset * 2.0),
-            focus_border,
-            focus_color,
-        );
-        state.gpu.rect_renderer.push_rect(
-            menu_x + inset,
-            focus_y,
-            focus_border,
-            item_height,
-            focus_color,
-        );
-        state.gpu.rect_renderer.push_rect(
-            menu_x + menu_width - inset - focus_border,
-            focus_y,
-            focus_border,
-            item_height,
-            focus_color,
-        );
-    }
-
-    // Render separators as horizontal lines
-    for (idx, item) in items.iter().enumerate() {
-        if item.is_separator() {
-            let sep_y = item_y_positions[idx] + separator_height / 2.0;
-            let sep_inset = padding_x / 2.0;
-            state.gpu.rect_renderer.push_rect(
-                menu_x + sep_inset,
+    for rect in menu.item_rects() {
+        if rect.is_separator {
+            // Separator: hairline centred in its row
+            let sep_y = rect.y + rect.height / 2.0;
+            let sep_inset = m.padding_x / 2.0;
+            rects.push_rect(
+                rect.x + sep_inset,
                 sep_y,
-                menu_width - (sep_inset * 2.0),
+                rect.width - sep_inset * 2.0,
                 1.0 * scale,
                 border_color,
             );
+            continue;
+        }
+        if menu.hovered_item == Some(rect.index) {
+            push_row_highlight(rects, rect.bounds(), border_thickness, hover_color);
+        }
+        // Keyboard focus ring (only on the main menu while focus is there)
+        if menu.focused_item == Some(rect.index) && !menu.is_submenu_focused() {
+            push_focus_ring(rects, rect.bounds(), border_thickness, scale, focus_color);
         }
     }
 
@@ -278,112 +195,84 @@ pub fn render(
         state
             .gpu
             .rect_renderer
-            .render(&shared.queue, &mut pass, &state.gpu.rect_instance_buffer);
+            .render_transient(&shared.queue, &mut pass, &mut state.gpu.arena);
     }
 
-    // Render menu text
-    state.gpu.tab_title_renderer.clear();
+    // ---- Text ----
+    let glyphs = &mut state.gpu.tab_glyph_cache;
+    let text = &mut state.gpu.tab_title_renderer;
+    text.clear();
 
-    let font_height = 12.0 * scale;
-    let text_offset_y = (item_height - font_height) / 2.0;
+    let cell_width = glyphs.cell_width();
+    let text_offset_y = (m.item_height - glyphs.line_height()) / 2.0;
+    let mut glyph_buffer: Vec<PositionedGlyph> = Vec::with_capacity(32);
 
-    // Render main menu items
-    for (idx, item) in items.iter().enumerate() {
+    // Main menu items: label left-aligned, shortcut/arrow right-aligned
+    for rect in menu.item_rects() {
+        let item = &items[rect.index];
         if item.is_separator() {
             continue;
         }
+        let item_y = rect.y + text_offset_y;
+        push_text(
+            glyphs,
+            text,
+            &mut glyph_buffer,
+            item.label(),
+            rect.x + m.padding_x,
+            item_y,
+            text_color,
+        );
 
-        let item_y = item_y_positions[idx] + text_offset_y;
-        let label = item.label();
-        let label_start_x = menu_x + padding_x;
-
-        // Render label
-        let mut glyphs = Vec::new();
-        let mut char_x = label_start_x;
-        for c in label.chars() {
-            if let Some(glyph) = state.gpu.tab_glyph_cache.position_char(c, char_x, item_y) {
-                glyphs.push(glyph);
-            }
-            char_x += state.gpu.tab_glyph_cache.cell_width();
-        }
-        state
-            .gpu
-            .tab_title_renderer
-            .push_glyphs(&glyphs, text_color);
-
-        // Render shortcut/arrow (right-aligned)
         let shortcut = item.shortcut();
         if !shortcut.is_empty() {
-            let shortcut_width =
-                shortcut.chars().count() as f32 * state.gpu.tab_glyph_cache.cell_width();
-            let shortcut_x = menu_x + menu_width - padding_x - shortcut_width;
-
-            let mut shortcut_glyphs = Vec::new();
-            let mut char_x = shortcut_x;
-            for c in shortcut.chars() {
-                if let Some(glyph) = state.gpu.tab_glyph_cache.position_char(c, char_x, item_y) {
-                    shortcut_glyphs.push(glyph);
-                }
-                char_x += state.gpu.tab_glyph_cache.cell_width();
-            }
-            state
-                .gpu
-                .tab_title_renderer
-                .push_glyphs(&shortcut_glyphs, shortcut_color);
+            let shortcut_width = shortcut.chars().count() as f32 * cell_width;
+            let shortcut_x = rect.x + rect.width - m.padding_x - shortcut_width;
+            push_text(
+                glyphs,
+                text,
+                &mut glyph_buffer,
+                shortcut,
+                shortcut_x,
+                item_y,
+                shortcut_color,
+            );
         }
     }
 
-    // Render submenu items
-    if show_submenu && !theme_items.is_empty() {
-        for (idx, item) in theme_items.iter().enumerate() {
-            let item_y = submenu_y + padding_y + (idx as f32 * item_height) + text_offset_y;
-
-            // Check if this theme is current (for checkmark)
-            let (label, show_checkmark) = match item {
-                ContextMenuItem::Theme(name) => {
-                    let is_current = state.ui.context_menu.is_current_theme(name);
-                    (item.label(), is_current)
-                }
-                _ => (item.label(), false),
-            };
-
-            // Render checkmark for current theme
-            let label_start_x = if show_checkmark {
-                let checkmark = "\u{2713}";
-                let mut char_x = submenu_x + padding_x;
-                for c in checkmark.chars() {
-                    if let Some(glyph) = state.gpu.tab_glyph_cache.position_char(c, char_x, item_y)
-                    {
-                        state
-                            .gpu
-                            .tab_title_renderer
-                            .push_glyphs(&[glyph], text_color);
-                    }
-                    char_x += state.gpu.tab_glyph_cache.cell_width();
-                }
-                submenu_x + padding_x + (2.0 * state.gpu.tab_glyph_cache.cell_width())
-            } else {
-                // Indent to align with checkmarked items
-                submenu_x + padding_x + (2.0 * state.gpu.tab_glyph_cache.cell_width())
-            };
-
-            // Render label
-            let mut glyphs = Vec::new();
-            let mut char_x = label_start_x;
-            for c in label.chars() {
-                if let Some(glyph) = state.gpu.tab_glyph_cache.position_char(c, char_x, item_y) {
-                    glyphs.push(glyph);
-                }
-                char_x += state.gpu.tab_glyph_cache.cell_width();
+    // Submenu items: optional checkmark, then the theme name (indented so
+    // checked and unchecked names align)
+    if show_submenu {
+        let label_indent = m.padding_x + 2.0 * cell_width;
+        for rect in menu.submenu_item_rects() {
+            let item = &theme_items[rect.index];
+            let item_y = rect.y + text_offset_y;
+            if let ContextMenuItem::Theme(name) = item
+                && menu.is_current_theme(name)
+            {
+                push_text(
+                    glyphs,
+                    text,
+                    &mut glyph_buffer,
+                    "\u{2713}",
+                    rect.x + m.padding_x,
+                    item_y,
+                    text_color,
+                );
             }
-            state
-                .gpu
-                .tab_title_renderer
-                .push_glyphs(&glyphs, text_color);
+            push_text(
+                glyphs,
+                text,
+                &mut glyph_buffer,
+                item.label(),
+                rect.x + label_indent,
+                item_y,
+                text_color,
+            );
         }
     }
 
-    state.gpu.tab_glyph_cache.flush(&shared.queue);
+    glyphs.flush(&shared.queue);
 
     // Render text pass
     {
@@ -403,12 +292,77 @@ pub fn render(
             occlusion_query_set: None,
         });
 
-        state.gpu.tab_title_renderer.render(
+        state.gpu.tab_title_renderer.render_transient(
             &shared.queue,
             &mut pass,
-            &state.gpu.overlay_text_instance_buffer,
+            &mut state.gpu.arena,
         );
     }
+}
+
+/// Position `text` one cell per char starting at (`x`, `y`) and push it.
+fn push_text(
+    glyphs: &mut GlyphCache,
+    renderer: &mut GridRenderer,
+    buffer: &mut Vec<PositionedGlyph>,
+    text: &str,
+    x: f32,
+    y: f32,
+    color: [f32; 4],
+) {
+    buffer.clear();
+    let cell_width = glyphs.cell_width();
+    let mut char_x = x;
+    for c in text.chars() {
+        if let Some(glyph) = glyphs.position_char(c, char_x, y) {
+            buffer.push(glyph);
+        }
+        char_x += cell_width;
+    }
+    renderer.push_glyphs(buffer, color);
+}
+
+/// A row rectangle as `(x, y, width, height)`.
+type Row = (f32, f32, f32, f32);
+
+/// Hover highlight filling a row, inset by the border.
+fn push_row_highlight(
+    renderer: &mut crt_renderer::RectRenderer,
+    (x, y, width, height): Row,
+    border: f32,
+    color: [f32; 4],
+) {
+    renderer.push_rect(x + border, y, width - border * 2.0, height, color);
+}
+
+/// Keyboard focus ring drawn as four bars just inside a row.
+fn push_focus_ring(
+    renderer: &mut crt_renderer::RectRenderer,
+    (x, y, width, height): Row,
+    border: f32,
+    scale: f32,
+    color: [f32; 4],
+) {
+    let focus_border = 2.0 * scale;
+    let inset = border + 2.0 * scale;
+    let ring_x = x + inset;
+    let ring_w = width - inset * 2.0;
+    renderer.push_rect(ring_x, y, ring_w, focus_border, color);
+    renderer.push_rect(
+        ring_x,
+        y + height - focus_border,
+        ring_w,
+        focus_border,
+        color,
+    );
+    renderer.push_rect(ring_x, y, focus_border, height, color);
+    renderer.push_rect(
+        x + width - inset - focus_border,
+        y,
+        focus_border,
+        height,
+        color,
+    );
 }
 
 /// Helper to push menu border rectangles

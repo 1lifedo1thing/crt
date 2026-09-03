@@ -1,10 +1,19 @@
 //! Rect renderer for solid color rectangles using instanced quads
 //!
-//! Renders colored rectangles for cell backgrounds.
-//! All rectangles render in a single draw call.
+//! Renders colored rectangles for cell backgrounds, the tab bar and overlays.
+//! All rectangles of one pass render in a single draw call.
+//!
+//! Two upload paths exist:
+//! - `render()` uses a buffer owned by this renderer and only re-uploads when
+//!   the instance list changed. Use it for content that persists across
+//!   frames (cell backgrounds).
+//! - `render_transient()` bump-allocates from a [`FrameArena`], so several
+//!   passes in one frame can share one renderer without overwriting each
+//!   other's data. Use it for overlays and per-pass UI.
 
 use std::sync::Arc;
 
+use crate::frame_arena::{FrameArena, OwnedInstanceBuffer};
 use crate::shared_pipelines::SharedRectPipeline;
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
@@ -30,56 +39,33 @@ struct Globals {
 }
 
 /// Rect renderer using instanced quads
-///
-/// The renderer does not own its instance buffer - this allows for buffer pooling
-/// across window lifecycles. Use `create_instance_buffer()` to create a buffer,
-/// or provide one from a buffer pool.
-///
-/// Pipeline objects can be shared across windows via `new_with_shared()` to
-/// avoid duplicating Metal shader caches.
 pub struct RectRenderer {
     /// Shared pipeline objects (pipeline, bind group layout).
     shared: Arc<SharedRectPipeline>,
     globals_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
-    instance_capacity: usize,
     /// Pending instances to render
     instances: Vec<RectInstance>,
+    /// Instances changed since the last owned upload
+    dirty: bool,
+    owned: OwnedInstanceBuffer,
     /// Cached screen size to avoid redundant uniform updates
     cached_screen_size: (f32, f32),
 }
 
 impl RectRenderer {
-    /// Maximum number of rect instances per render call
-    pub const MAX_INSTANCES: usize = 16 * 1024;
-
-    /// Size of instance buffer in bytes (16K instances * 32 bytes = 512 KB)
-    pub const INSTANCE_BUFFER_SIZE: u64 =
-        (Self::MAX_INSTANCES * std::mem::size_of::<RectInstance>()) as u64;
-
-    /// Create an instance buffer for use with this renderer
-    ///
-    /// Call this to create a buffer if not using a buffer pool.
-    /// The buffer can be reused across renderer instances.
-    pub fn create_instance_buffer(device: &wgpu::Device) -> wgpu::Buffer {
-        device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Rect Instance Buffer"),
-            size: Self::INSTANCE_BUFFER_SIZE,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        })
-    }
-
     /// Create a rect renderer using shared pipeline objects.
     pub fn new_with_shared(device: &wgpu::Device, shared: &Arc<SharedRectPipeline>) -> Self {
-        let (globals_buffer, bind_group) = Self::create_per_window_resources(device, &shared.bind_group_layout);
+        let (globals_buffer, bind_group) =
+            Self::create_per_window_resources(device, &shared.bind_group_layout);
 
         Self {
             shared: shared.clone(),
             globals_buffer,
             bind_group,
-            instance_capacity: Self::MAX_INSTANCES,
-            instances: Vec::with_capacity(Self::MAX_INSTANCES),
+            instances: Vec::new(),
+            dirty: false,
+            owned: OwnedInstanceBuffer::new("Rect Instance Buffer"),
             cached_screen_size: (0.0, 0.0),
         }
     }
@@ -87,16 +73,7 @@ impl RectRenderer {
     /// Create a rect renderer with its own pipeline objects.
     pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
         let shared = Arc::new(SharedRectPipeline::new(device, target_format));
-        let (globals_buffer, bind_group) = Self::create_per_window_resources(device, &shared.bind_group_layout);
-
-        Self {
-            shared,
-            globals_buffer,
-            bind_group,
-            instance_capacity: Self::MAX_INSTANCES,
-            instances: Vec::with_capacity(Self::MAX_INSTANCES),
-            cached_screen_size: (0.0, 0.0),
-        }
+        Self::new_with_shared(device, &shared)
     }
 
     fn create_per_window_resources(
@@ -128,18 +105,20 @@ impl RectRenderer {
 
     /// Clear pending instances
     pub fn clear(&mut self) {
+        if !self.instances.is_empty() {
+            self.dirty = true;
+        }
         self.instances.clear();
     }
 
     /// Add a rectangle
     pub fn push_rect(&mut self, x: f32, y: f32, width: f32, height: f32, color: [f32; 4]) {
-        if self.instances.len() < self.instance_capacity {
-            self.instances.push(RectInstance {
-                pos: [x, y],
-                size: [width, height],
-                color,
-            });
-        }
+        self.instances.push(RectInstance {
+            pos: [x, y],
+            size: [width, height],
+            color,
+        });
+        self.dirty = true;
     }
 
     /// Get the number of pending instances
@@ -162,36 +141,55 @@ impl RectRenderer {
         queue.write_buffer(&self.globals_buffer, 0, bytemuck::cast_slice(&[globals]));
     }
 
-    /// Upload instances and render
-    ///
-    /// The instance buffer must be created with `create_instance_buffer()` or
-    /// be at least `INSTANCE_BUFFER_SIZE` bytes with VERTEX | COPY_DST usage.
-    pub fn render<'a>(
-        &'a self,
+    fn bind(&self, render_pass: &mut wgpu::RenderPass<'_>) {
+        render_pass.set_pipeline(&self.shared.pipeline);
+        render_pass.set_bind_group(0, &self.bind_group, &[]);
+    }
+
+    /// Render from the renderer-owned buffer, uploading only when the
+    /// instance list changed since the last upload.
+    pub fn render(
+        &mut self,
+        device: &wgpu::Device,
         queue: &wgpu::Queue,
-        render_pass: &mut wgpu::RenderPass<'a>,
-        instance_buffer: &'a wgpu::Buffer,
+        render_pass: &mut wgpu::RenderPass<'_>,
     ) {
         if self.instances.is_empty() {
             return;
         }
-
-        // Upload instance data
-        queue.write_buffer(instance_buffer, 0, bytemuck::cast_slice(&self.instances));
-
-        render_pass.set_pipeline(&self.shared.pipeline);
-        render_pass.set_bind_group(0, &self.bind_group, &[]);
-        render_pass.set_vertex_buffer(0, instance_buffer.slice(..));
-
+        if self.dirty {
+            self.owned.upload(device, queue, &self.instances);
+            self.dirty = false;
+        }
+        let Some(buffer) = self.owned.buffer() else {
+            return;
+        };
+        self.bind(render_pass);
+        render_pass.set_vertex_buffer(0, buffer.slice(..));
         // Draw 4 vertices per instance (triangle strip quad)
         render_pass.draw(0..4, 0..self.instances.len() as u32);
+    }
+
+    /// Render from a per-frame arena. Safe to call several times per frame
+    /// from different passes with different instance lists.
+    pub fn render_transient(
+        &self,
+        queue: &wgpu::Queue,
+        render_pass: &mut wgpu::RenderPass<'_>,
+        arena: &mut FrameArena,
+    ) {
+        let Some(slice) = arena.push(queue, &self.instances) else {
+            return;
+        };
+        self.bind(render_pass);
+        render_pass.set_vertex_buffer(0, arena.slice(slice));
+        render_pass.draw(0..4, 0..slice.count);
     }
 }
 
 impl Drop for RectRenderer {
     fn drop(&mut self) {
         // Destroy globals buffer to release GPU memory immediately
-        // Note: instance buffer is external (for pooling) and not owned by renderer
         self.globals_buffer.destroy();
     }
 }

@@ -1,27 +1,33 @@
 //! ApplicationHandler implementation for winit event loop.
 //!
-//! Handles window events, keyboard/mouse input, and frame timing.
+//! Handles window events, keyboard/mouse input, and frame scheduling.
+//!
+//! The loop sleeps (`ControlFlow::Wait`) unless something needs a frame. PTY
+//! reader threads and the config watcher wake it through a user event; each
+//! window reports when its next frame is due (`next_frame_deadline`) and the
+//! loop waits until the earliest one.
 
 use std::time::Instant;
 
-use crate::input::{
-    drag::{self, TabDragState},
-    handle_cursor_moved, handle_keyboard_input, handle_mouse_input, handle_mouse_wheel,
-    handle_resize, handle_tab_click, KeyboardAction,
-};
 use super::initialization::{DetachPayload, MergePayload};
+use super::{App, WakeReason};
+use crate::input::{
+    KeyboardAction,
+    drag::{self, TabDragState},
+    handle_cursor_moved_with_modifiers, handle_ime, handle_keyboard_event, handle_mouse_input,
+    handle_mouse_wheel_with_modifiers, handle_resize, handle_tab_click, set_modifiers,
+};
 use crate::render::render_frame;
 use crate::window;
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, WindowEvent},
-    event_loop::ActiveEventLoop,
+    event_loop::{ActiveEventLoop, ControlFlow},
     window::WindowId,
 };
 
-use super::initialization::handle_scale_factor_change;
-use super::App;
 use super::FONT_SCALE_STEP;
+use super::initialization::handle_scale_factor_change;
 
 #[cfg(target_os = "macos")]
 use crate::menu::{build_menu_bar, menu_id_to_action, set_windows_menu};
@@ -29,7 +35,7 @@ use crate::menu::{build_menu_bar, menu_id_to_action, set_windows_menu};
 #[cfg(target_os = "macos")]
 use muda::MenuEvent;
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<WakeReason> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.windows.is_empty() {
             self.create_window(event_loop);
@@ -47,6 +53,13 @@ impl ApplicationHandler for App {
                 self.menu_ids = Some(ids);
             }
         }
+    }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: WakeReason) {
+        // The waker coalesces sends; acknowledge so the next output can wake
+        // us again. The actual work (draining PTYs, polling the watcher,
+        // scheduling frames) happens in `about_to_wait`, which runs next.
+        self.waker.acknowledge(event);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
@@ -79,9 +92,10 @@ impl ApplicationHandler for App {
 
         match event {
             WindowEvent::CloseRequested => {
-                self.windows.remove(&id);
-                if self.focused_window == Some(id) {
-                    self.focused_window = self.windows.keys().next().copied();
+                self.cancel_drag_for_window(id);
+                self.close_window(id);
+                if self.windows.is_empty() {
+                    event_loop.exit();
                 }
             }
 
@@ -100,6 +114,7 @@ impl ApplicationHandler for App {
                         log::debug!("Focus gained - applied theme override");
                     }
                     // Redraw immediately when gaining focus to resume effects
+                    state.render.dirty = true;
                     state.window.request_redraw();
                 } else {
                     // Apply on_blur override if theme defines it
@@ -110,32 +125,46 @@ impl ApplicationHandler for App {
                             .add(window::OverrideEventType::FocusLost, override_props.clone());
                         log::debug!("Focus lost - applied theme override");
                     }
+                    // A drag cannot continue once the source window loses focus
+                    self.cancel_drag_for_window(id);
                 }
             }
 
             WindowEvent::Occluded(occluded) => {
                 if let Some(state) = self.windows.get_mut(&id) {
+                    let was_occluded = state.render.occluded;
                     state.render.occluded = occluded;
                     log::debug!("Window {:?} occluded: {}", id, occluded);
+                    if was_occluded && !occluded {
+                        // Content may have changed while hidden; render fresh
+                        state.render.dirty = true;
+                        state.window.request_redraw();
+                    }
                 }
             }
 
             WindowEvent::ModifiersChanged(m) => {
                 self.modifiers = m;
+                set_modifiers(&self.modifiers);
+            }
+
+            WindowEvent::Ime(ime) => {
+                handle_ime(state, &ime);
             }
 
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 // Cancel active drag on Escape
-                if event.logical_key == winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape) {
-                    if self.drag_state.take().is_some() {
-                        log::debug!("Tab drag cancelled via Escape");
-                        self.drag_overlay = None; // Close overlay
-                        if let Some(state) = self.windows.get_mut(&id) {
-                            state.window.set_cursor(winit::window::CursorIcon::Default);
-                            state.window.request_redraw();
-                        }
-                        return;
+                if event.logical_key
+                    == winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape)
+                    && self.drag_state.take().is_some()
+                {
+                    log::debug!("Tab drag cancelled via Escape");
+                    self.drag_overlay = None; // Close overlay
+                    if let Some(state) = self.windows.get_mut(&id) {
+                        state.window.set_cursor(winit::window::CursorIcon::Default);
+                        state.window.request_redraw();
                     }
+                    return;
                 }
 
                 let Some(state) = self.windows.get_mut(&id) else {
@@ -143,13 +172,8 @@ impl ApplicationHandler for App {
                 };
 
                 // Delegate to keyboard handler
-                let action = handle_keyboard_input(
-                    state,
-                    &event.logical_key,
-                    event.text.as_ref().map(|s| s.as_str()),
-                    &self.modifiers,
-                    &self.config.keybindings,
-                );
+                let action =
+                    handle_keyboard_event(state, &event, &self.modifiers, &self.config.keybindings);
 
                 // Handle actions that require App-level access
                 match action {
@@ -157,9 +181,10 @@ impl ApplicationHandler for App {
                         event_loop.exit();
                     }
                     KeyboardAction::CloseWindow => {
-                        self.windows.remove(&id);
-                        if self.focused_window == Some(id) {
-                            self.focused_window = self.windows.keys().next().copied();
+                        self.cancel_drag_for_window(id);
+                        self.close_window(id);
+                        if self.windows.is_empty() {
+                            event_loop.exit();
                         }
                     }
                     KeyboardAction::NewWindow => {
@@ -227,10 +252,8 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => {
                 // Update drag state if a drag is in progress
                 if let Some(ref mut drag_state) = self.drag_state {
-                    drag_state.current_pos = winit::dpi::PhysicalPosition::new(
-                        position.x,
-                        position.y,
-                    );
+                    drag_state.current_pos =
+                        winit::dpi::PhysicalPosition::new(position.x, position.y);
                     if !drag_state.drag_active && drag_state.exceeds_threshold() {
                         drag_state.drag_active = true;
                         log::debug!("Tab drag activated for tab {}", drag_state.tab_id);
@@ -240,23 +263,19 @@ impl ApplicationHandler for App {
                     // Resolve drop target across all windows
                     if drag_state.drag_active {
                         if let Some(ref window_rects) = drag_window_rects {
-                            let dragged_idx = state
-                                .gpu
-                                .tab_bar
-                                .tab_index(drag_state.tab_id)
-                                .unwrap_or(0);
+                            let dragged_idx =
+                                state.gpu.tab_bar.tab_index(drag_state.tab_id).unwrap_or(0);
                             let source_id = drag_state.source_window_id;
 
                             // Convert cursor to screen coordinates
-                            let cursor_screen =
-                                if let Ok(win_pos) = state.window.inner_position() {
-                                    winit::dpi::PhysicalPosition::new(
-                                        position.x + win_pos.x as f64,
-                                        position.y + win_pos.y as f64,
-                                    )
-                                } else {
-                                    drag_state.current_pos
-                                };
+                            let cursor_screen = if let Ok(win_pos) = state.window.inner_position() {
+                                winit::dpi::PhysicalPosition::new(
+                                    position.x + win_pos.x as f64,
+                                    position.y + win_pos.y as f64,
+                                )
+                            } else {
+                                drag_state.current_pos
+                            };
 
                             let source_tab_count = state.gpu.tab_bar.tab_count();
                             drag_state.drop_target = drag::resolve_drop_target(
@@ -268,20 +287,25 @@ impl ApplicationHandler for App {
                             );
                         }
                         // Move the overlay window to follow cursor
-                        if let Some(ref overlay) = self.drag_overlay {
-                            if let Ok(win_pos) = state.window.inner_position() {
-                                let screen_x = position.x as i32 + win_pos.x - 75;
-                                let screen_y = position.y as i32 + win_pos.y + 15;
-                                overlay.set_outer_position(
-                                    winit::dpi::PhysicalPosition::new(screen_x, screen_y),
-                                );
-                            }
+                        if let Some(ref overlay) = self.drag_overlay
+                            && let Ok(win_pos) = state.window.inner_position()
+                        {
+                            let screen_x = position.x as i32 + win_pos.x - 75;
+                            let screen_y = position.y as i32 + win_pos.y + 15;
+                            overlay.set_outer_position(winit::dpi::PhysicalPosition::new(
+                                screen_x, screen_y,
+                            ));
                         }
 
                         state.window.request_redraw();
                     }
                 }
-                handle_cursor_moved(state, position.x as f32, position.y as f32);
+                handle_cursor_moved_with_modifiers(
+                    state,
+                    position.x as f32,
+                    position.y as f32,
+                    self.modifiers.state(),
+                );
             }
 
             WindowEvent::MouseInput {
@@ -294,6 +318,11 @@ impl ApplicationHandler for App {
                 // Handle drag initiation/completion at App level
                 let mut handled_by_drag = false;
                 if button == MouseButton::Left && button_state == ElementState::Pressed {
+                    // A press while a stale drag exists (release was lost) resets it
+                    if self.drag_state.take().is_some() {
+                        self.drag_overlay = None;
+                        state.window.set_cursor(winit::window::CursorIcon::Default);
+                    }
                     let (x, y) = state.interaction.cursor_position;
                     if let Some(tab_id) = drag::should_start_drag(
                         &state.gpu.tab_bar,
@@ -309,127 +338,19 @@ impl ApplicationHandler for App {
                         ));
                         handled_by_drag = true;
                     }
-                } else if button == MouseButton::Left && button_state == ElementState::Released {
-                    if let Some(drag) = self.drag_state.take() {
-                        // Clean up overlay and cursor
-                        self.drag_overlay = None;
-                        state.window.set_cursor(winit::window::CursorIcon::Default);
+                } else if button == MouseButton::Left
+                    && button_state == ElementState::Released
+                    && let Some(drag) = self.drag_state.take()
+                {
+                    // Clean up overlay and cursor
+                    self.drag_overlay = None;
+                    state.window.set_cursor(winit::window::CursorIcon::Default);
 
-                        if drag.drag_active {
-                            match drag.drop_target {
-                                drag::DragDropTarget::Reorder { insert_index } => {
-                                    if let Some(from_idx) =
-                                        state.gpu.tab_bar.tab_index(drag.tab_id)
-                                    {
-                                        if from_idx != insert_index {
-                                            state.gpu.tab_bar.move_tab(from_idx, insert_index);
-                                            state.render.dirty = true;
-                                            state.window.request_redraw();
-                                            log::debug!(
-                                                "Tab {} reordered: {} -> {}",
-                                                drag.tab_id,
-                                                from_idx,
-                                                insert_index
-                                            );
-                                        }
-                                    }
-                                }
-                                drag::DragDropTarget::Detach => {
-                                    // Extract tab+shell from source window
-                                    if let Some(tab) =
-                                        state.gpu.tab_bar.remove_tab(drag.tab_id)
-                                    {
-                                        if let Some(shell) =
-                                            state.shells.remove(&drag.tab_id)
-                                        {
-                                            let content_hash = state
-                                                .content_hashes
-                                                .remove(&drag.tab_id)
-                                                .unwrap_or(0);
-                                            state.render.dirty = true;
-                                            state.window.request_redraw();
-
-                                            // Convert cursor to screen position for window placement
-                                            let screen_pos = state
-                                                .window
-                                                .inner_position()
-                                                .ok()
-                                                .map(|wp| {
-                                                    winit::dpi::PhysicalPosition::new(
-                                                        wp.x + drag.current_pos.x as i32,
-                                                        wp.y + drag.current_pos.y as i32,
-                                                    )
-                                                });
-
-                                            self.pending_detach = Some(DetachPayload {
-                                                tab,
-                                                shell,
-                                                content_hash,
-                                                screen_position: screen_pos,
-                                            });
-                                            // Close source window if it's now empty
-                                            if state.gpu.tab_bar.tab_count() == 0 {
-                                                self.pending_close_empty =
-                                                    Some(drag.source_window_id);
-                                            }
-                                            log::debug!(
-                                                "Tab {} detached from window {:?}",
-                                                drag.tab_id,
-                                                drag.source_window_id
-                                            );
-                                        }
-                                    }
-                                }
-                                drag::DragDropTarget::Merge {
-                                    target_window_id,
-                                    insert_index,
-                                } => {
-                                    // Extract tab+shell from source window
-                                    if let Some(tab) =
-                                        state.gpu.tab_bar.remove_tab(drag.tab_id)
-                                    {
-                                        if let Some(shell) =
-                                            state.shells.remove(&drag.tab_id)
-                                        {
-                                            let content_hash = state
-                                                .content_hashes
-                                                .remove(&drag.tab_id)
-                                                .unwrap_or(0);
-                                            state.render.dirty = true;
-                                            state.window.request_redraw();
-
-                                            // Close source window if it's now empty
-                                            if state.gpu.tab_bar.tab_count() == 0 {
-                                                self.pending_close_empty =
-                                                    Some(drag.source_window_id);
-                                            }
-                                            self.pending_merge = Some(MergePayload {
-                                                tab,
-                                                shell,
-                                                content_hash,
-                                                target_window_id,
-                                                insert_index,
-                                            });
-                                            log::debug!(
-                                                "Tab {} merging into window {:?} at index {}",
-                                                drag.tab_id,
-                                                target_window_id,
-                                                insert_index
-                                            );
-                                        }
-                                    }
-                                }
-                                drag::DragDropTarget::Pending => {
-                                    // Should not happen for active drags
-                                }
-                            }
-                        } else {
-                            // Threshold not exceeded — treat as normal click
-                            let (x, y) = state.interaction.cursor_position;
-                            handle_tab_click(state, x, y, Instant::now());
-                        }
-                        handled_by_drag = true;
-                    }
+                    // The drop must be applied to the window the drag started
+                    // in, which is not necessarily the one that received the
+                    // release event.
+                    self.finish_drag(drag, id);
+                    return;
                 }
 
                 if !handled_by_drag {
@@ -437,7 +358,10 @@ impl ApplicationHandler for App {
                     let (cursor_x, cursor_y) = state.interaction.cursor_position;
                     let new_tab_clicked = button == MouseButton::Left
                         && button_state == ElementState::Pressed
-                        && state.gpu.tab_bar.hit_test_new_tab_button(cursor_x, cursor_y);
+                        && state
+                            .gpu
+                            .tab_bar
+                            .hit_test_new_tab_button(cursor_x, cursor_y);
 
                     if new_tab_clicked {
                         self.open_new_tab();
@@ -451,8 +375,7 @@ impl ApplicationHandler for App {
                         );
                         // Check for pending theme change from context menu
                         if let Some(theme_name) = state.ui.pending_theme.take() {
-                            if let Some(theme) =
-                                self.theme_registry.get_theme(&theme_name).cloned()
+                            if let Some(theme) = self.theme_registry.get_theme(&theme_name).cloned()
                             {
                                 super::apply_theme_to_window(
                                     state,
@@ -471,7 +394,7 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
-                handle_mouse_wheel(state, delta);
+                handle_mouse_wheel_with_modifiers(state, delta, self.modifiers.state());
             }
 
             WindowEvent::RedrawRequested => {
@@ -489,12 +412,6 @@ impl ApplicationHandler for App {
                     };
                     let insertion_index = match &ds.drop_target {
                         drag::DragDropTarget::Reorder { insert_index } => Some(*insert_index),
-                        drag::DragDropTarget::Merge { insert_index, .. }
-                            if ds.source_window_id != id =>
-                        {
-                            // Show caret on target window, not source
-                            None
-                        }
                         _ => None,
                     };
                     let ghost_position = if ds.source_window_id == id {
@@ -502,10 +419,6 @@ impl ApplicationHandler for App {
                     } else {
                         None
                     };
-                    log::debug!(
-                        "Drag feedback: mode={:?}, insertion={:?}, ghost={:?}",
-                        mode, insertion_index, ghost_position
-                    );
                     Some(DragFeedback {
                         dragged_tab_id: ds.tab_id,
                         insertion_index,
@@ -521,23 +434,28 @@ impl ApplicationHandler for App {
 
             _ => {}
         }
-
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         // Create drag overlay if drag just activated
-        if let Some(ref ds) = self.drag_state {
-            if ds.drag_active && self.drag_overlay.is_none() {
-                // Get tab title from source window
-                let title = self
-                    .windows
-                    .get(&ds.source_window_id)
-                    .and_then(|w| w.gpu.tab_bar.get_tab_title(ds.tab_id).map(|s| s.to_string()))
-                    .unwrap_or_else(|| "Tab".to_string());
-                let x = ds.current_pos.x as i32;
-                let y = ds.current_pos.y as i32;
-                self.create_drag_overlay(event_loop, &title, x, y);
-            }
+        if let Some(ref ds) = self.drag_state
+            && ds.drag_active
+            && self.drag_overlay.is_none()
+        {
+            // Get tab title from source window
+            let title = self
+                .windows
+                .get(&ds.source_window_id)
+                .and_then(|w| {
+                    w.gpu
+                        .tab_bar
+                        .get_tab_title(ds.tab_id)
+                        .map(|s| s.to_string())
+                })
+                .unwrap_or_else(|| "Tab".to_string());
+            let x = ds.current_pos.x as i32;
+            let y = ds.current_pos.y as i32;
+            self.create_drag_overlay(event_loop, &title, x, y);
         }
 
         // Close empty windows from tab extraction (must happen before creating new ones)
@@ -551,21 +469,7 @@ impl ApplicationHandler for App {
             self.create_window_for_detach(event_loop, payload);
         }
         if let Some(payload) = self.pending_merge.take() {
-            if let Some(target) = self.windows.get_mut(&payload.target_window_id) {
-                let tab_id = payload.tab.id;
-                target.gpu.tab_bar.insert_existing_tab(payload.tab, payload.insert_index);
-                let mut shell = payload.shell;
-                shell.resize(crt_core::Size::new(target.cols, target.rows));
-                target.shells.insert(tab_id, shell);
-                target.content_hashes.insert(tab_id, payload.content_hash);
-                target.gpu.tab_bar.select_tab(tab_id);
-                target.render.dirty = true;
-                target.content_hashes.insert(tab_id, 0); // Force re-render
-                target.window.request_redraw();
-                target.window.focus_window();
-                self.focused_window = Some(payload.target_window_id);
-                log::info!("Tab {} merged into window {:?}", tab_id, payload.target_window_id);
-            }
+            self.merge_tab(payload);
         }
 
         #[cfg(target_os = "macos")]
@@ -576,7 +480,7 @@ impl ApplicationHandler for App {
             self.handle_menu_action(action, event_loop);
         }
 
-        // Check for config/theme file changes - collect events first to avoid borrow issues
+        // Config/theme file changes (debounced on the trailing edge by the watcher)
         let events: Vec<_> = self
             .config_watcher
             .as_mut()
@@ -586,7 +490,7 @@ impl ApplicationHandler for App {
         for event in events {
             match event {
                 crate::watcher::ConfigEvent::ConfigChanged => self.reload_config(),
-                crate::watcher::ConfigEvent::ThemeChanged => self.reload_theme(),
+                crate::watcher::ConfigEvent::ThemeChanged(path) => self.reload_theme_file(&path),
             }
         }
 
@@ -595,53 +499,193 @@ impl ApplicationHandler for App {
             self.create_window(event_loop);
         }
 
-        // FRAME THROTTLING - Critical fix for Metal/wgpu memory leak (November 2024)
-        //
-        // WHY: wgpu/Metal on macOS has a bug where IOAccelerator drawable allocations grow
-        // unboundedly when frames are rendered at high rates. With ControlFlow::Poll and
-        // continuous request_redraw(), we were seeing 1500+ GPU allocations per second,
-        // causing memory to balloon from ~130MB to 4-9GB within minutes.
-        //
-        // WHAT: Limits redraws to ~60fps by only calling request_redraw() when at least
-        // 16.6ms has elapsed since the last frame. This keeps IOAccelerator regions
-        // at ~500 instead of 40,000+ and memory stable at ~150-220MB.
-        //
-        // RE-EVALUATE WHEN:
-        // - wgpu updates to 24.x+ (check if Metal backend fixes drawable allocation)
-        // - Testing on non-macOS platforms (this may not be needed on Windows/Linux)
-        // - If we need variable refresh rate support (would need smarter throttling)
-        // - If Apple fixes the IOAccelerator memory management in a future macOS version
-        //
-        // Related: https://github.com/gfx-rs/wgpu/issues/3292 (Metal memory growth issues)
-        const TARGET_FRAME_TIME: std::time::Duration =
-            std::time::Duration::from_micros(16666); // ~60fps
-        let elapsed = self.last_frame_time.elapsed();
+        // Every window's PTYs are drained here (not per frame) so background
+        // tabs keep up with their shells and never buffer output unbounded.
+        self.drain_ptys();
 
-        // Focused window: 60fps for smooth effects
-        if elapsed >= TARGET_FRAME_TIME {
-            self.last_frame_time = Instant::now();
-
-            if let Some(focused_id) = self.focused_window
-                && let Some(state) = self.windows.get(&focused_id)
-                && !state.render.occluded
-            {
-                state.window.request_redraw();
-            }
+        // If everything is closed, stop rather than sleep forever.
+        if self.windows.is_empty() {
+            event_loop.exit();
+            return;
         }
 
-        // Unfocused windows: 10fps for PTY output updates (saves GPU work)
-        const UNFOCUSED_FRAME_TIME: std::time::Duration =
-            std::time::Duration::from_millis(100);
-        let unfocused_elapsed = self.last_unfocused_frame_time.elapsed();
-
-        if unfocused_elapsed >= UNFOCUSED_FRAME_TIME {
-            self.last_unfocused_frame_time = Instant::now();
-
-            for (id, state) in self.windows.iter() {
-                // Skip focused window (handled above) and occluded windows
-                if Some(*id) != self.focused_window && !state.render.occluded {
-                    state.window.request_redraw();
+        // FRAME SCHEDULING
+        //
+        // Redraws are capped at ~60 fps for the focused window and 10 fps for
+        // the others (this cap is what keeps Metal's drawable allocations
+        // bounded on macOS; see the review notes in docs/explanation). Unlike
+        // a polling loop, the wait below actually sleeps: PTY output and
+        // watcher events wake us through a user event, and animations wake us
+        // at their next deadline.
+        let now = Instant::now();
+        let mut next_wake: Option<Instant> = None;
+        let focused = self.focused_window;
+        for (id, state) in self.windows.iter_mut() {
+            let is_focused = focused == Some(*id);
+            match state.next_frame_deadline(now, is_focused) {
+                Some(deadline) if deadline <= now => state.window.request_redraw(),
+                Some(deadline) => {
+                    next_wake = Some(next_wake.map_or(deadline, |t| t.min(deadline)));
                 }
+                None => {}
+            }
+        }
+        if let Some(watcher) = self.config_watcher.as_mut()
+            && let Some(due) = watcher.next_due()
+        {
+            next_wake = Some(next_wake.map_or(due, |t| t.min(due)));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // Menu events arrive on a channel with no wake-up; poll them at a
+            // low rate while idle.
+            let menu_poll = now + std::time::Duration::from_millis(250);
+            next_wake = Some(next_wake.map_or(menu_poll, |t| t.min(menu_poll)));
+        }
+
+        event_loop.set_control_flow(match next_wake {
+            Some(t) => ControlFlow::WaitUntil(t),
+            None => ControlFlow::Wait,
+        });
+    }
+}
+
+impl App {
+    /// Apply a completed tab drag. `release_window` is the window that got
+    /// the mouse release; the drag's source window is looked up explicitly.
+    fn finish_drag(&mut self, drag: TabDragState, release_window: WindowId) {
+        let source_id = drag.source_window_id;
+        let Some(state) = self.windows.get_mut(&source_id) else {
+            return;
+        };
+
+        if !drag.drag_active {
+            // Threshold not exceeded — treat as a normal click on the window
+            // that received the release.
+            if let Some(state) = self.windows.get_mut(&release_window) {
+                let (x, y) = state.interaction.cursor_position;
+                handle_tab_click(state, x, y, Instant::now());
+            }
+            return;
+        }
+
+        match drag.drop_target {
+            drag::DragDropTarget::Reorder { insert_index } => {
+                if let Some(from_idx) = state.gpu.tab_bar.tab_index(drag.tab_id)
+                    && from_idx != insert_index
+                {
+                    state.gpu.tab_bar.move_tab(from_idx, insert_index);
+                    state.render.dirty = true;
+                    state.window.request_redraw();
+                    log::debug!(
+                        "Tab {} reordered: {} -> {}",
+                        drag.tab_id,
+                        from_idx,
+                        insert_index
+                    );
+                }
+            }
+            drag::DragDropTarget::Detach => {
+                // Extract tab+shell from source window
+                if let Some(tab) = state.gpu.tab_bar.remove_tab(drag.tab_id)
+                    && let Some(shell) = state.shells.remove(&drag.tab_id)
+                {
+                    state.text_rebuild.remove(&drag.tab_id);
+                    state.render.dirty = true;
+                    state.window.request_redraw();
+
+                    // Convert cursor to screen position for window placement
+                    let screen_pos = state.window.inner_position().ok().map(|wp| {
+                        winit::dpi::PhysicalPosition::new(
+                            wp.x + drag.current_pos.x as i32,
+                            wp.y + drag.current_pos.y as i32,
+                        )
+                    });
+
+                    self.pending_detach = Some(DetachPayload {
+                        tab,
+                        shell,
+                        screen_position: screen_pos,
+                    });
+                    // Close source window if it's now empty
+                    if state.gpu.tab_bar.tab_count() == 0 {
+                        self.pending_close_empty = Some(source_id);
+                    }
+                    log::debug!("Tab {} detached from window {:?}", drag.tab_id, source_id);
+                }
+            }
+            drag::DragDropTarget::Merge {
+                target_window_id,
+                insert_index,
+            } => {
+                // Extract tab+shell from source window
+                if let Some(tab) = state.gpu.tab_bar.remove_tab(drag.tab_id)
+                    && let Some(shell) = state.shells.remove(&drag.tab_id)
+                {
+                    state.text_rebuild.remove(&drag.tab_id);
+                    state.render.dirty = true;
+                    state.window.request_redraw();
+
+                    // Close source window if it's now empty
+                    if state.gpu.tab_bar.tab_count() == 0 {
+                        self.pending_close_empty = Some(source_id);
+                    }
+                    self.pending_merge = Some(MergePayload {
+                        tab,
+                        shell,
+                        target_window_id,
+                        insert_index,
+                    });
+                    log::debug!(
+                        "Tab {} merging into window {:?} at index {}",
+                        drag.tab_id,
+                        target_window_id,
+                        insert_index
+                    );
+                }
+            }
+            drag::DragDropTarget::Pending => {
+                // Should not happen for active drags
+            }
+        }
+    }
+
+    /// Insert a tab extracted from another window (deferred merge).
+    fn merge_tab(&mut self, payload: MergePayload) {
+        if let Some(target) = self.windows.get_mut(&payload.target_window_id) {
+            let tab_id = payload.tab.id;
+            target
+                .gpu
+                .tab_bar
+                .insert_existing_tab(payload.tab, payload.insert_index);
+            let mut shell = payload.shell;
+            shell.resize(crt_core::Size::new(target.cols, target.rows));
+            target.shells.insert(tab_id, shell);
+            target.gpu.tab_bar.select_tab(tab_id);
+            target.render.dirty = true;
+            target.text_rebuild.insert(tab_id);
+            target.window.request_redraw();
+            target.window.focus_window();
+            self.focused_window = Some(payload.target_window_id);
+            log::info!(
+                "Tab {} merged into window {:?}",
+                tab_id,
+                payload.target_window_id
+            );
+        }
+    }
+
+    /// Drop any drag that started in `window_id` (focus lost, window closed).
+    fn cancel_drag_for_window(&mut self, window_id: WindowId) {
+        if self
+            .drag_state
+            .as_ref()
+            .is_some_and(|d| d.source_window_id == window_id)
+        {
+            self.drag_state = None;
+            self.drag_overlay = None;
+            if let Some(state) = self.windows.get_mut(&window_id) {
+                state.window.set_cursor(winit::window::CursorIcon::Default);
             }
         }
     }

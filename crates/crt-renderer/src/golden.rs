@@ -111,7 +111,11 @@ pub fn compare_images(actual: &RgbaImage, golden: &RgbaImage, tolerance: f64) ->
             let db = ap[2].abs_diff(gp[2]);
             let da = ap[3].abs_diff(gp[3]);
 
-            if dr > PIXEL_THRESHOLD || dg > PIXEL_THRESHOLD || db > PIXEL_THRESHOLD || da > PIXEL_THRESHOLD {
+            if dr > PIXEL_THRESHOLD
+                || dg > PIXEL_THRESHOLD
+                || db > PIXEL_THRESHOLD
+                || da > PIXEL_THRESHOLD
+            {
                 diff_pixels += 1;
                 // Highlight differing pixel in red.
                 diff_img.put_pixel(x, y, Rgba([255, 0, 0, 255]));
@@ -134,9 +138,7 @@ pub fn compare_images(actual: &RgbaImage, golden: &RgbaImage, tolerance: f64) ->
     let diff_image = if diff_pixels > 0 {
         let mut png_bytes = Vec::new();
         let mut cursor = std::io::Cursor::new(&mut png_bytes);
-        diff_img
-            .write_to(&mut cursor, image::ImageFormat::Png)
-            .ok();
+        diff_img.write_to(&mut cursor, image::ImageFormat::Png).ok();
         Some(png_bytes)
     } else {
         None
@@ -299,7 +301,10 @@ mod tests {
         let blue_img = image::load_from_memory(&blue_png).unwrap().to_rgba8();
 
         let result = compare_images(&red_img, &blue_img, 0.5);
-        assert!(!result.matched, "completely different images should not match");
+        assert!(
+            !result.matched,
+            "completely different images should not match"
+        );
         assert_eq!(result.diff_pixels, 64); // 8x8 = 64
         assert_eq!(result.diff_percentage, 100.0);
     }
@@ -312,7 +317,10 @@ mod tests {
 
         let result = compare_images(&img_a, &img_b, 0.0);
         assert!(!result.matched);
-        assert!(result.diff_image.is_some(), "diff image should be generated");
+        assert!(
+            result.diff_image.is_some(),
+            "diff image should be generated"
+        );
 
         // Decode the diff image and verify the differing pixel is red
         let diff = image::load_from_memory(result.diff_image.as_ref().unwrap())
@@ -339,7 +347,10 @@ mod tests {
         let img_b = RgbaImage::from_fn(4, 4, |_, _| Rgba([101, 101, 101, 255]));
 
         let result = compare_images(&img_a, &img_b, 0.0);
-        assert!(result.matched, "sub-threshold differences should be ignored");
+        assert!(
+            result.matched,
+            "sub-threshold differences should be ignored"
+        );
         assert_eq!(result.diff_pixels, 0);
     }
 

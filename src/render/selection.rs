@@ -18,6 +18,8 @@ pub fn render_selection_rects(
     let (offset_x, offset_y) = state.gpu.tab_bar.content_offset();
     let padding = 10.0 * state.scale_factor;
     let screen_lines = state.rows as i32;
+    // Last column index of the grid; full-line rows extend to here.
+    let last_col = state.cols.saturating_sub(1);
 
     // Selection highlight color (semi-transparent blue)
     let selection_color = [0.3, 0.4, 0.6, 0.5];
@@ -44,8 +46,8 @@ pub fn render_selection_rects(
 
     if selection.is_block {
         // Block selection: rectangle from start to end
-        let min_col = start_col.min(end_col);
-        let max_col = start_col.max(end_col);
+        let min_col = start_col.min(end_col).min(last_col);
+        let max_col = start_col.max(end_col).min(last_col);
 
         for viewport_line in visible_start..=visible_end {
             let y = offset_y + padding + (viewport_line as f32 * line_height);
@@ -70,17 +72,21 @@ pub fn render_selection_rects(
                 (start_col.min(end_col), start_col.max(end_col))
             } else if grid_line == start_grid_line {
                 // First line: from start column to end of line
-                (start_col, 999)
+                (start_col, last_col)
             } else if grid_line == end_grid_line {
                 // Last line: from start of line to end column
                 (0, end_col)
             } else {
                 // Middle line: full line
-                (0, 999)
+                (0, last_col)
             };
 
+            // Clamp into the grid so a stale selection never overshoots.
+            let line_start_col = line_start_col.min(last_col);
+            let line_end_col = line_end_col.min(last_col).max(line_start_col);
+
             let x = offset_x + padding + (line_start_col as f32 * cell_width);
-            let num_cells = (line_end_col - line_start_col + 1).min(500);
+            let num_cells = line_end_col - line_start_col + 1;
             let width = num_cells as f32 * cell_width;
             state
                 .gpu

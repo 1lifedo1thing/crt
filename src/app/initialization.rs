@@ -2,18 +2,18 @@
 //!
 //! Contains the heavy `create_window()` function and scale factor handling.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::config::Config;
 use crate::font;
 use crate::gpu::{SharedGpuState, WindowGpuState};
 use crate::window::{self, WindowState};
-use crt_core::{ShellTerminal, Size, SpawnOptions};
+use crt_core::{ShellTerminal, Size};
 use crt_renderer::{
-    BackgroundImagePipeline, BackgroundImageState, CrtPipeline, EffectsRenderer, GlyphCache,
-    GridEffect, GridRenderer, MatrixEffect, ParticleEffect, RainEffect, RectRenderer, ShapeEffect,
-    SpriteEffect, StarfieldEffect, Tab, TabBar,
+    BackgroundImagePipeline, BackgroundImageState, CrtPipeline, EffectsRenderer, FrameArena,
+    GlyphCache, GridEffect, GridRenderer, MatrixEffect, ParticleEffect, RainEffect, RectRenderer,
+    ShapeEffect, SpriteEffect, StarfieldEffect, Tab, TabBar,
 };
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowId};
@@ -22,7 +22,6 @@ use winit::window::{Window, WindowId};
 pub(crate) struct DetachPayload {
     pub tab: Tab,
     pub shell: ShellTerminal,
-    pub content_hash: u64,
     pub screen_position: Option<winit::dpi::PhysicalPosition<i32>>,
 }
 
@@ -30,13 +29,12 @@ pub(crate) struct DetachPayload {
 pub(crate) struct MergePayload {
     pub tab: Tab,
     pub shell: ShellTerminal,
-    pub content_hash: u64,
     pub target_window_id: WindowId,
     pub insert_index: usize,
 }
 
-use super::effects::configure_effects_from_theme;
 use super::App;
+use super::effects::configure_effects_from_theme;
 
 #[cfg(target_os = "macos")]
 use winit::platform::macos::WindowAttributesExtMacOS;
@@ -67,15 +65,15 @@ impl App {
         );
 
         // Build window
-        let mut window_attrs = Window::default_attributes()
+        let window_attrs = Window::default_attributes()
             .with_title(&self.config.window.title)
             .with_inner_size(winit::dpi::LogicalSize::new(width, height));
 
         #[cfg(target_os = "macos")]
-        {
+        let window_attrs = {
             let unique_id = format!("crt-window-{}", self.windows.len());
-            window_attrs = window_attrs.with_tabbing_identifier(&unique_id);
-        }
+            window_attrs.with_tabbing_identifier(&unique_id)
+        };
 
         let window = Arc::new(
             event_loop
@@ -85,6 +83,9 @@ impl App {
         let window_id = window.id();
         let size = window.inner_size();
         let scale_factor = window.scale_factor() as f32;
+        // Accept composed input (CJK IMEs, macOS emoji picker); commits arrive
+        // as WindowEvent::Ime.
+        window.set_ime_allowed(true);
 
         // Create GPU resources
         let surface = shared.instance.create_surface(window.clone()).unwrap();
@@ -126,7 +127,8 @@ impl App {
         grid_renderer.update_screen_size(&shared.queue, size.width as f32, size.height as f32);
 
         // Separate renderer for output text (rendered flat, no glow)
-        let mut output_grid_renderer = GridRenderer::new_with_shared(&shared.device, &pipelines.grid);
+        let mut output_grid_renderer =
+            GridRenderer::new_with_shared(&shared.device, &pipelines.grid);
         output_grid_renderer.set_glyph_cache(&shared.device, &glyph_cache);
         output_grid_renderer.update_screen_size(
             &shared.queue,
@@ -144,8 +146,7 @@ impl App {
 
         let mut tab_title_renderer = GridRenderer::new_with_shared(&shared.device, &pipelines.grid);
         tab_title_renderer.set_glyph_cache(&shared.device, &tab_glyph_cache);
-        tab_title_renderer
-            .update_screen_size(&shared.queue, size.width as f32, size.height as f32);
+        tab_title_renderer.update_screen_size(&shared.queue, size.width as f32, size.height as f32);
 
         // Effect pipeline for background rendering - get theme from registry
         let (theme_name, theme) = self.theme_registry.get_default_theme();
@@ -173,6 +174,7 @@ impl App {
         // Tab bar (always at top, initial tab gets a globally unique ID)
         let mut tab_bar = TabBar::with_initial_id(&shared.device, format, initial_tab_id);
         tab_bar.set_scale_factor(scale_factor);
+        tab_bar.set_font_metrics(tab_glyph_cache.cell_width(), tab_glyph_cache.line_height());
         tab_bar.set_theme(theme.tabs);
         tab_bar.resize(size.width as f32, size.height as f32);
 
@@ -208,41 +210,24 @@ impl App {
         // to avoid buffer conflicts with tab bar rendering
         let overlay_rect_renderer = RectRenderer::new_with_shared(&shared.device, &pipelines.rect);
 
-        // Checkout instance buffers from pool (reused across window lifecycles)
-        use crate::gpu::BufferClass;
-        let grid_instance_buffer = shared
-            .buffer_pool
-            .checkout(BufferClass::GridInstance)
-            .expect("Buffer pool checkout failed");
-        let output_grid_instance_buffer = shared
-            .buffer_pool
-            .checkout(BufferClass::GridInstance)
-            .expect("Buffer pool checkout failed");
-        let tab_title_instance_buffer = shared
-            .buffer_pool
-            .checkout(BufferClass::GridInstance)
-            .expect("Buffer pool checkout failed");
-        let overlay_text_instance_buffer = shared
-            .buffer_pool
-            .checkout(BufferClass::GridInstance)
-            .expect("Buffer pool checkout failed");
-        let rect_instance_buffer = shared
-            .buffer_pool
-            .checkout(BufferClass::RectInstance)
-            .expect("Buffer pool checkout failed");
-        let overlay_rect_instance_buffer = shared
-            .buffer_pool
-            .checkout(BufferClass::RectInstance)
-            .expect("Buffer pool checkout failed");
+        // Rect renderer for cell backgrounds (owned buffer, uploaded on change)
+        let cell_bg_renderer = RectRenderer::new_with_shared(&shared.device, &pipelines.rect);
+
+        // Per-frame arena for transient vertex data (grows on demand)
+        let arena = FrameArena::new(&shared.device, 1024 * 1024, "Window Frame Arena");
 
         // Background image pipeline (always created, state only if theme has background image)
-        let background_image_pipeline = BackgroundImagePipeline::new_with_shared(&shared.device, &pipelines.background_image);
+        let background_image_pipeline =
+            BackgroundImagePipeline::new_with_shared(&shared.device, &pipelines.background_image);
         let (background_image_state, background_image_bind_group) =
             if let Some(ref bg_image) = theme.background_image {
                 match BackgroundImageState::new(&shared.device, &shared.queue, bg_image) {
                     Ok(state) => {
-                        let bind_group = background_image_pipeline
-                            .create_bind_group(&shared.device, &state.texture.view);
+                        let bind_group = background_image_pipeline.create_bind_group(
+                            &shared.device,
+                            &state.texture.view,
+                            state.texture.sampler(),
+                        );
                         log::info!("Loaded background image: {:?}", bg_image.path);
                         (Some(state), Some(bind_group))
                     }
@@ -294,18 +279,15 @@ impl App {
             output_grid_renderer,
             tab_glyph_cache,
             tab_title_renderer,
-            grid_instance_buffer,
-            output_grid_instance_buffer,
-            tab_title_instance_buffer,
-            overlay_text_instance_buffer,
+            tab_titles_version: None,
+            arena,
             effect_pipeline,
             effects_renderer,
             tab_bar,
             terminal_vello,
+            cell_bg_renderer,
             rect_renderer,
             overlay_rect_renderer,
-            rect_instance_buffer,
-            overlay_rect_instance_buffer,
             background_image_pipeline,
             background_image_state,
             background_image_bind_group,
@@ -319,7 +301,7 @@ impl App {
 
         // Create initial shell with semantic prompts if enabled
         let mut shells = HashMap::new();
-        let mut content_hashes = HashMap::new();
+        let mut text_rebuild = HashSet::new();
 
         // Inherit CWD from focused window if available, otherwise use config default
         let cwd = self
@@ -328,12 +310,7 @@ impl App {
             .and_then(|state| state.active_shell_cwd())
             .or_else(|| self.config.shell.working_directory.clone());
 
-        let spawn_options = SpawnOptions {
-            shell: self.config.shell.program.clone(),
-            cwd,
-            semantic_prompts: self.config.shell.semantic_prompts,
-            shell_assets_dir: Config::shell_assets_dir(),
-        };
+        let spawn_options = self.spawn_options(cwd);
         if let Ok(shell) = ShellTerminal::with_options(Size::new(cols, rows), spawn_options) {
             log::info!(
                 "Shell spawned for initial tab {} (semantic_prompts={})",
@@ -341,39 +318,35 @@ impl App {
                 self.config.shell.semantic_prompts
             );
             shells.insert(initial_tab_id, shell);
-            content_hashes.insert(initial_tab_id, 0);
+            text_rebuild.insert(initial_tab_id);
         }
 
         let window_state = WindowState {
             window,
             gpu,
             shells,
-            content_hashes,
+            text_rebuild,
             cols,
             rows,
             scale_factor,
             font_scale: 1.0,
-            render: window::RenderState {
-                dirty: true,
-                frame_count: 0,
-                occluded: false,
-                focused: true,
-                cached: Default::default(),
-                paste_pending: false,
-            },
+            render: window::RenderState::default(),
             interaction: Default::default(),
             ui: window::UiState {
                 search: Default::default(),
                 bell: window::BellState::from_config(&self.config.bell),
-                context_menu: window::ContextMenu {
-                    themes: self
-                        .theme_registry
-                        .list_themes()
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect(),
-                    current_theme: theme_name.to_string(),
-                    ..Default::default()
+                context_menu: {
+                    let mut menu = window::ContextMenu::default();
+                    menu.set_themes(
+                        self.theme_registry
+                            .list_themes()
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect(),
+                    );
+                    menu.current_theme = theme_name.to_string();
+                    menu.set_scale(scale_factor);
+                    menu
                 },
                 zoom_indicator: Default::default(),
                 copy_indicator: Default::default(),
@@ -384,7 +357,7 @@ impl App {
             },
             custom_title: None,
             theme: theme.clone(),
-            theme_name: theme_name.to_string(),
+            theme_name: theme_name.clone(),
         };
 
         self.windows.insert(window_id, window_state);
@@ -415,7 +388,7 @@ impl App {
             if let Some(initial_tab_id) = state.gpu.tab_bar.active_tab_id() {
                 state.gpu.tab_bar.remove_tab(initial_tab_id);
                 state.shells.remove(&initial_tab_id);
-                state.content_hashes.remove(&initial_tab_id);
+                state.text_rebuild.remove(&initial_tab_id);
             }
 
             // Insert the detached tab+shell
@@ -427,18 +400,16 @@ impl App {
             let mut shell = payload.shell;
             shell.resize(Size::new(state.cols, state.rows));
             state.shells.insert(tab_id, shell);
-            state.content_hashes.insert(tab_id, payload.content_hash);
 
             // Position window at cursor if provided
             if let Some(pos) = payload.screen_position {
-                state.window.set_outer_position(winit::dpi::PhysicalPosition::new(
-                    pos.x, pos.y,
-                ));
+                state
+                    .window
+                    .set_outer_position(winit::dpi::PhysicalPosition::new(pos.x, pos.y));
             }
 
             state.render.dirty = true;
-            // Invalidate content hash so the terminal rerenders
-            state.content_hashes.insert(tab_id, 0);
+            state.text_rebuild.insert(tab_id);
         }
 
         log::info!("Created detached window {:?}", window_id);
@@ -504,8 +475,12 @@ pub(crate) fn handle_scale_factor_change(
 
     state.gpu.tab_glyph_cache = tab_glyph_cache;
 
-    // Update tab bar scale factor
+    // Update tab bar scale factor and text metrics
     state.gpu.tab_bar.set_scale_factor(new_scale);
+    state.gpu.tab_bar.set_font_metrics(
+        state.gpu.tab_glyph_cache.cell_width(),
+        state.gpu.tab_glyph_cache.line_height(),
+    );
 
     // Recalculate terminal dimensions with new cell sizes
     let size = state.window.inner_size();
@@ -532,9 +507,7 @@ pub(crate) fn handle_scale_factor_change(
 
     // Mark as dirty and invalidate content hashes
     state.render.dirty = true;
-    for hash in state.content_hashes.values_mut() {
-        *hash = 0;
-    }
+    state.request_text_rebuild_all();
     state.window.request_redraw();
 
     log::info!(

@@ -4,6 +4,7 @@
 //! Uses fixed-width grid positioning for terminal rendering.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use swash::{
     FontRef,
     scale::{Render, ScaleContext, Source, StrikeWith},
@@ -160,37 +161,43 @@ pub struct PositionedGlyph {
     pub uv_max: [f32; 2],
 }
 
+/// Shared, immutable font file bytes.
+///
+/// Font files are megabytes each; sharing them lets every glyph cache in
+/// every window (terminal text and tab titles) reference one copy.
+pub type FontData = Arc<[u8]>;
+
 /// Font variant data
 #[derive(Clone)]
 pub struct FontVariants {
-    pub regular: Vec<u8>,
-    pub bold: Option<Vec<u8>>,
-    pub italic: Option<Vec<u8>>,
-    pub bold_italic: Option<Vec<u8>>,
+    pub regular: FontData,
+    pub bold: Option<FontData>,
+    pub italic: Option<FontData>,
+    pub bold_italic: Option<FontData>,
 }
 
 impl FontVariants {
-    pub fn new(regular: Vec<u8>) -> Self {
+    pub fn new(regular: impl Into<FontData>) -> Self {
         Self {
-            regular,
+            regular: regular.into(),
             bold: None,
             italic: None,
             bold_italic: None,
         }
     }
 
-    pub fn with_bold(mut self, data: Vec<u8>) -> Self {
-        self.bold = Some(data);
+    pub fn with_bold(mut self, data: impl Into<FontData>) -> Self {
+        self.bold = Some(data.into());
         self
     }
 
-    pub fn with_italic(mut self, data: Vec<u8>) -> Self {
-        self.italic = Some(data);
+    pub fn with_italic(mut self, data: impl Into<FontData>) -> Self {
+        self.italic = Some(data.into());
         self
     }
 
-    pub fn with_bold_italic(mut self, data: Vec<u8>) -> Self {
-        self.bold_italic = Some(data);
+    pub fn with_bold_italic(mut self, data: impl Into<FontData>) -> Self {
+        self.bold_italic = Some(data.into());
         self
     }
 
@@ -259,7 +266,7 @@ impl GlyphCache {
         font_data: &[u8],
         font_size: f32,
     ) -> Result<Self, &'static str> {
-        let fonts = FontVariants::new(font_data.to_vec());
+        let fonts = FontVariants::new(font_data);
         Self::new_internal(device, fonts, font_size, 1.5) // Default line height
     }
 
@@ -310,42 +317,12 @@ impl GlyphCache {
         let vertical_padding = cell_height - glyph_height;
         let baseline_offset = ascent + (vertical_padding * 0.5);
 
-        // Get cell width using 'M' as reference
-        // For monospace fonts, we need proper horizontal spacing
-        let mut scale_context = ScaleContext::new();
-        let cached_cell_width = {
-            let mut scaler = scale_context
-                .builder(font)
-                .size(font_size)
-                .hint(true)
-                .build();
-
-            let glyph_id = font.charmap().map('M');
-            if glyph_id != 0 {
-                // Render to get dimensions
-                // Prioritize scalable sources over fixed-size bitmaps
-                if let Some(image) = Render::new(&[
-                    Source::ColorOutline(0),
-                    Source::Outline,
-                    Source::ColorBitmap(StrikeWith::BestFit),
-                ])
-                .format(Format::Alpha)
-                .render(&mut scaler, glyph_id)
-                {
-                    // For monospace terminals, cell width should match glyph advance
-                    // - left bearing (offset from cell origin)
-                    // - glyph width (no extra padding to avoid gaps in ligatures)
-                    let visual_width = image.placement.width as f32;
-                    let left_bearing = image.placement.left as f32;
-
-                    left_bearing + visual_width
-                } else {
-                    font_size * 0.6
-                }
-            } else {
-                font_size * 0.6
-            }
-        };
+        // Cell width is the font's advance for a reference glyph ('M'), the
+        // same metric `set_font_size` uses, so layout is identical before and
+        // after zooming. (The ink extent of 'M' is narrower than the advance
+        // and would make adjacent glyphs touch.)
+        let scale_context = ScaleContext::new();
+        let cached_cell_width = Self::advance_cell_width(&font, scale, font_size);
 
         Ok(Self {
             fonts,
@@ -364,6 +341,22 @@ impl GlyphCache {
             staging_data: Vec::new(),
             pending_uploads: Vec::new(),
         })
+    }
+
+    /// Advance width of the reference glyph at `font_size`, with a fallback
+    /// for fonts that report no advance.
+    fn advance_cell_width(font: &FontRef<'_>, scale: f32, font_size: f32) -> f32 {
+        let glyph_id = font.charmap().map('M');
+        let advance = if glyph_id != 0 {
+            font.glyph_metrics(&[]).advance_width(glyph_id) * scale
+        } else {
+            0.0
+        };
+        if advance > 0.0 {
+            advance
+        } else {
+            font_size * 0.6
+        }
     }
 
     /// Get or create a cached glyph (regular style)
@@ -636,18 +629,7 @@ impl GlyphCache {
             let vertical_padding = self.cached_line_height - glyph_height;
             self.baseline_offset = ascent + (vertical_padding * 0.5);
 
-            // Get cell width from glyph advance
-            let glyph_id = font.charmap().map('M');
-            let advance = font.glyph_metrics(&[]).advance_width(glyph_id);
-            self.cached_cell_width = if advance > 0.0 {
-                advance * scale
-            } else {
-                new_font_size * 0.6
-            };
-            // Fallback if zero
-            if self.cached_cell_width <= 0.0 {
-                self.cached_cell_width = new_font_size * 0.6;
-            }
+            self.cached_cell_width = Self::advance_cell_width(&font, scale, new_font_size);
         }
 
         // Clear cached glyphs

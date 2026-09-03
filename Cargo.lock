@@ -945,6 +945,7 @@ dependencies = [
  "pollster",
  "swash",
  "thiserror 2.0.17",
+ "unicode-width",
  "vello",
  "wgpu",
 ]
@@ -956,6 +957,7 @@ dependencies = [
  "bytemuck",
  "criterion",
  "lightningcss",
+ "log",
  "thiserror 2.0.17",
 ]
 

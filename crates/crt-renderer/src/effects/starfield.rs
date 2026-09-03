@@ -182,31 +182,40 @@ impl StarfieldEffect {
         (x as f64) / (u64::MAX as f64)
     }
 
+    /// Number of random values consumed per star (non-overlapping ranges)
+    const RNG_STRIDE: usize = 5;
+
     /// Generate stars for all layers
+    ///
+    /// Stars are generated grouped by layer (back layer first) so that
+    /// `render` can draw back-to-front with a single pass over the vector.
     fn generate_stars(&mut self) {
         self.stars.clear();
 
         let total_stars = self.density * self.layer_count;
         self.stars.reserve(total_stars);
 
-        for i in 0..total_stars {
-            let layer = i % self.layer_count;
+        for layer in 0..self.layer_count {
+            for j in 0..self.density {
+                let i = layer * self.density + j;
+                let base = i * Self::RNG_STRIDE;
 
-            // Generate pseudo-random values using index-based seeding
-            let x = self.random(i * 5);
-            let y = self.random(i * 5 + 1);
-            let size = self.random(i * 5 + 2);
-            let brightness = 0.5 + self.random(i * 5 + 3) * 0.5; // 0.5-1.0
-            let twinkle_phase = self.random(i * 5 + 4) * std::f64::consts::TAU;
+                // Generate pseudo-random values using index-based seeding
+                let x = self.random(base);
+                let y = self.random(base + 1);
+                let size = self.random(base + 2);
+                let brightness = 0.5 + self.random(base + 3) * 0.5; // 0.5-1.0
+                let twinkle_phase = self.random(base + 4) * std::f64::consts::TAU;
 
-            self.stars.push(Star {
-                x,
-                y,
-                size,
-                brightness,
-                layer,
-                twinkle_phase,
-            });
+                self.stars.push(Star {
+                    x,
+                    y,
+                    size,
+                    brightness,
+                    layer,
+                    twinkle_phase,
+                });
+            }
         }
 
         self.needs_regeneration = false;
@@ -299,8 +308,8 @@ impl BackdropEffect for StarfieldEffect {
         "starfield"
     }
 
-    fn update(&mut self, _dt: f32, time: f32) {
-        self.time = time as f64;
+    fn update(&mut self, _dt: f64, time: f64) {
+        self.time = time;
 
         // Regenerate stars if needed
         if self.needs_regeneration {
@@ -316,36 +325,35 @@ impl BackdropEffect for StarfieldEffect {
         let width = bounds.width();
         let height = bounds.height();
 
-        // Render stars from back layer to front (back layers = dimmer/smaller)
-        for layer in 0..self.layer_count {
-            for star in self.stars.iter().filter(|s| s.layer == layer) {
-                // Get animated position
-                let (x, y) = self.star_position(star, width, height);
+        // Stars are stored grouped by layer, back layer first, so a single
+        // pass draws back-to-front (back layers = dimmer/smaller).
+        for star in &self.stars {
+            // Get animated position
+            let (x, y) = self.star_position(star, width, height);
 
-                // Calculate star size based on layer (closer = larger) and random factor
-                let layer_factor = 0.4 + (star.layer as f64 / self.layer_count as f64) * 0.6;
-                let base_size = self.min_size + star.size * (self.max_size - self.min_size);
-                let size = base_size * layer_factor;
+            // Calculate star size based on layer (closer = larger) and random factor
+            let layer_factor = 0.4 + (star.layer as f64 / self.layer_count as f64) * 0.6;
+            let base_size = self.min_size + star.size * (self.max_size - self.min_size);
+            let size = base_size * layer_factor;
 
-                // Calculate brightness - back layers are dimmer
-                let layer_brightness = 0.3 + (star.layer as f64 / self.layer_count as f64) * 0.7;
-                let mut brightness = star.brightness * layer_brightness;
+            // Calculate brightness - back layers are dimmer
+            let layer_brightness = 0.3 + (star.layer as f64 / self.layer_count as f64) * 0.7;
+            let mut brightness = star.brightness * layer_brightness;
 
-                // Optional twinkling
-                if self.twinkle {
-                    let twinkle = (self.time * self.twinkle_speed + star.twinkle_phase).sin();
-                    brightness *= 0.6 + twinkle * 0.4; // Vary between 0.2 and 1.0
-                }
-
-                // Apply brightness to alpha
-                let alpha = (self.color.a as f64 * brightness) as u8;
-                if alpha < 5 {
-                    continue; // Skip nearly invisible stars
-                }
-                let color = self.color.with_alpha(alpha);
-
-                self.draw_star(scene, x, y, size, color);
+            // Optional twinkling
+            if self.twinkle {
+                let twinkle = (self.time * self.twinkle_speed + star.twinkle_phase).sin();
+                brightness *= 0.6 + twinkle * 0.4; // Vary between 0.2 and 1.0
             }
+
+            // Apply brightness to alpha
+            let alpha = (self.color.a as f64 * brightness) as u8;
+            if alpha < 5 {
+                continue; // Skip nearly invisible stars
+            }
+            let color = self.color.with_alpha(alpha);
+
+            self.draw_star(scene, x, y, size, color);
         }
     }
 
@@ -354,16 +362,20 @@ impl BackdropEffect for StarfieldEffect {
             self.enabled = enabled;
         }
 
+        // Clamp before comparing so an out-of-range value does not
+        // regenerate on every configure/patch/restore.
         if let Some(density) = config.get_usize("density") {
+            let density = density.clamp(10, 1000);
             if density != self.density {
-                self.density = density.clamp(10, 1000);
+                self.density = density;
                 self.needs_regeneration = true;
             }
         }
 
         if let Some(layers) = config.get_usize("layers") {
+            let layers = layers.clamp(1, 5);
             if layers != self.layer_count {
-                self.layer_count = layers.clamp(1, 5);
+                self.layer_count = layers;
                 self.needs_regeneration = true;
             }
         }
@@ -412,6 +424,15 @@ impl BackdropEffect for StarfieldEffect {
 
     fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    fn is_animated(&self) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        let twinkling = self.twinkle && self.twinkle_speed > 0.0;
+        let moving = self.direction != StarDirection::Static && self.speed > 0.0;
+        twinkling || moving
     }
 }
 
@@ -491,9 +512,11 @@ mod tests {
 
     #[test]
     fn test_star_generation() {
-        let mut starfield = StarfieldEffect::default();
-        starfield.density = 50;
-        starfield.layer_count = 2;
+        let mut starfield = StarfieldEffect {
+            density: 50,
+            layer_count: 2,
+            ..Default::default()
+        };
         starfield.generate_stars();
 
         assert_eq!(starfield.stars.len(), 100); // 50 * 2 layers
@@ -510,5 +533,53 @@ mod tests {
         assert_eq!(StarDirection::from_str("LEFT"), Some(StarDirection::Left));
         assert_eq!(StarDirection::from_str("Right"), Some(StarDirection::Right));
         assert_eq!(StarDirection::from_str("invalid"), None);
+    }
+
+    #[test]
+    fn test_stars_are_grouped_by_layer_back_to_front() {
+        let mut starfield = StarfieldEffect {
+            density: 10,
+            layer_count: 3,
+            ..Default::default()
+        };
+        starfield.generate_stars();
+        let layers: Vec<usize> = starfield.stars.iter().map(|s| s.layer).collect();
+        assert!(
+            layers.windows(2).all(|w| w[0] <= w[1]),
+            "stars must be sorted by layer"
+        );
+        for layer in 0..3 {
+            assert_eq!(layers.iter().filter(|&&l| l == layer).count(), 10);
+        }
+    }
+
+    #[test]
+    fn test_is_animated() {
+        let mut sf = StarfieldEffect::default();
+        assert!(!sf.is_animated(), "disabled");
+        sf.enabled = true;
+        // Default: twinkle on, static direction -> animated via twinkle
+        assert!(sf.is_animated());
+        sf.twinkle = false;
+        assert!(!sf.is_animated(), "static direction and no twinkle");
+        sf.direction = StarDirection::Down;
+        assert!(sf.is_animated());
+        sf.speed = 0.0;
+        assert!(!sf.is_animated(), "moving direction with zero speed");
+    }
+
+    #[test]
+    fn test_out_of_range_density_does_not_regenerate_repeatedly() {
+        let mut sf = StarfieldEffect::default();
+        let mut config = EffectConfig::new();
+        config.insert("density", "99999");
+        config.insert("layers", "42");
+        sf.configure(&config);
+        assert_eq!(sf.density, 1000);
+        assert_eq!(sf.layer_count, 5);
+        sf.update(0.0, 0.0);
+        assert!(!sf.needs_regeneration);
+        sf.configure(&config);
+        assert!(!sf.needs_regeneration);
     }
 }

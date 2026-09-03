@@ -26,48 +26,22 @@ fn project_root() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// Load a monospace font for testing. Tries common system fonts.
+/// The bundled font, so golden images do not depend on the machine's fonts.
+static TEST_FONT: &[u8] = include_bytes!("../assets/fonts/MesloLGS-NF-Regular.ttf");
+
+/// Load the font used for visual tests.
 fn load_test_font() -> Vec<u8> {
-    use fontdb::{Database, Family, Query, Style, Weight};
+    TEST_FONT.to_vec()
+}
 
-    let mut db = Database::new();
-    db.load_system_fonts();
-
-    let families = [
-        "MesloLGS NF",
-        "Menlo",
-        "Monaco",
-        "Consolas",
-        "DejaVu Sans Mono",
-        "Liberation Mono",
-        "Courier New",
-    ];
-
-    for family in &families {
-        let query = Query {
-            families: &[Family::Name(family)],
-            weight: Weight::NORMAL,
-            style: Style::Normal,
-            ..Default::default()
-        };
-        if let Some(face_id) = db.query(&query) {
-            if let Some(face) = db.face(face_id) {
-                let data = match &face.source {
-                    fontdb::Source::File(path) => std::fs::read(path).ok(),
-                    fontdb::Source::Binary(data) => Some(data.as_ref().as_ref().to_vec()),
-                    fontdb::Source::SharedFile(_path, data) => {
-                        Some(data.as_ref().as_ref().to_vec())
-                    }
-                };
-                if let Some(font_data) = data {
-                    eprintln!("Visual tests using font: {family}");
-                    return font_data;
-                }
-            }
-        }
+/// Called when no GPU adapter is available. Tests skip quietly by default;
+/// with `CRT_REQUIRE_GPU=1` (CI runners that are expected to have one) a
+/// missing adapter is a failure rather than a silent pass.
+fn skip_no_gpu() {
+    if std::env::var_os("CRT_REQUIRE_GPU").is_some() {
+        panic!("CRT_REQUIRE_GPU is set but no GPU adapter is available");
     }
-
-    panic!("No suitable monospace font found for visual tests");
+    eprintln!("Skipping: no GPU adapter");
 }
 
 /// Test rendering context: headless renderer + glyph cache + renderers.
@@ -76,8 +50,6 @@ struct VisualTestContext {
     glyph_cache: GlyphCache,
     grid_renderer: GridRenderer,
     rect_renderer: RectRenderer,
-    grid_instance_buffer: wgpu::Buffer,
-    rect_instance_buffer: wgpu::Buffer,
 }
 
 impl VisualTestContext {
@@ -90,8 +62,8 @@ impl VisualTestContext {
         let format = headless.format();
         let font_data = load_test_font();
 
-        let mut glyph_cache = GlyphCache::new(device, &font_data, 14.0)
-            .expect("Failed to create glyph cache");
+        let mut glyph_cache =
+            GlyphCache::new(device, &font_data, 14.0).expect("Failed to create glyph cache");
         glyph_cache.precache_ascii();
         glyph_cache.flush(headless.queue());
 
@@ -102,16 +74,11 @@ impl VisualTestContext {
         let mut rect_renderer = RectRenderer::new(device, format);
         rect_renderer.update_screen_size(headless.queue(), width as f32, height as f32);
 
-        let grid_instance_buffer = GridRenderer::create_instance_buffer(device);
-        let rect_instance_buffer = RectRenderer::create_instance_buffer(device);
-
         Some(Self {
             headless,
             glyph_cache,
             grid_renderer,
             rect_renderer,
-            grid_instance_buffer,
-            rect_instance_buffer,
         })
     }
 
@@ -163,12 +130,12 @@ impl VisualTestContext {
     fn render_and_capture(&mut self) -> Vec<u8> {
         self.glyph_cache.flush(self.headless.queue());
 
-        let mut encoder = self
-            .headless
-            .device()
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Visual Test Encoder"),
-            });
+        let mut encoder =
+            self.headless
+                .device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Visual Test Encoder"),
+                });
 
         // Pass 1: Clear to dark background
         {
@@ -212,11 +179,8 @@ impl VisualTestContext {
                 occlusion_query_set: None,
             });
 
-            self.rect_renderer.render(
-                self.headless.queue(),
-                &mut pass,
-                &self.rect_instance_buffer,
-            );
+            self.rect_renderer
+                .render(self.headless.device(), self.headless.queue(), &mut pass);
         }
 
         // Pass 3: Render text glyphs
@@ -237,14 +201,13 @@ impl VisualTestContext {
                 occlusion_query_set: None,
             });
 
-            self.grid_renderer.render(
-                self.headless.queue(),
-                &mut pass,
-                &self.grid_instance_buffer,
-            );
+            self.grid_renderer
+                .render(self.headless.device(), self.headless.queue(), &mut pass);
         }
 
-        self.headless.queue().submit(std::iter::once(encoder.finish()));
+        self.headless
+            .queue()
+            .submit(std::iter::once(encoder.finish()));
         self.headless.capture_png().expect("PNG capture failed")
     }
 
@@ -276,7 +239,7 @@ fn visual_text_basic_ascii() {
     let mut ctx = match VisualTestContext::new(320, 200) {
         Some(c) => c,
         None => {
-            eprintln!("Skipping: no GPU adapter");
+            skip_no_gpu();
             return;
         }
     };
@@ -297,34 +260,16 @@ fn visual_text_styles() {
     let mut ctx = match VisualTestContext::new(320, 200) {
         Some(c) => c,
         None => {
-            eprintln!("Skipping: no GPU adapter");
+            skip_no_gpu();
             return;
         }
     };
 
     let white = [1.0, 1.0, 1.0, 1.0];
     ctx.draw_text("Regular text", 0, 0, white);
-    ctx.draw_text_styled(
-        "Bold text",
-        0,
-        1,
-        white,
-        GlyphStyle::new(true, false),
-    );
-    ctx.draw_text_styled(
-        "Italic text",
-        0,
-        2,
-        white,
-        GlyphStyle::new(false, true),
-    );
-    ctx.draw_text_styled(
-        "Bold Italic",
-        0,
-        3,
-        white,
-        GlyphStyle::new(true, true),
-    );
+    ctx.draw_text_styled("Bold text", 0, 1, white, GlyphStyle::new(true, false));
+    ctx.draw_text_styled("Italic text", 0, 2, white, GlyphStyle::new(false, true));
+    ctx.draw_text_styled("Bold Italic", 0, 3, white, GlyphStyle::new(true, true));
 
     let png = ctx.render_and_capture();
     assert_golden(&png, "text_styles");
@@ -336,7 +281,7 @@ fn visual_text_ansi_colors() {
     let mut ctx = match VisualTestContext::new(320, 200) {
         Some(c) => c,
         None => {
-            eprintln!("Skipping: no GPU adapter");
+            skip_no_gpu();
             return;
         }
     };
@@ -367,7 +312,7 @@ fn visual_text_unicode() {
     let mut ctx = match VisualTestContext::new(400, 200) {
         Some(c) => c,
         None => {
-            eprintln!("Skipping: no GPU adapter");
+            skip_no_gpu();
             return;
         }
     };
@@ -401,7 +346,7 @@ fn visual_cursor_block() {
     let mut ctx = match VisualTestContext::new(320, 120) {
         Some(c) => c,
         None => {
-            eprintln!("Skipping: no GPU adapter");
+            skip_no_gpu();
             return;
         }
     };
@@ -426,7 +371,7 @@ fn visual_cursor_beam() {
     let mut ctx = match VisualTestContext::new(320, 120) {
         Some(c) => c,
         None => {
-            eprintln!("Skipping: no GPU adapter");
+            skip_no_gpu();
             return;
         }
     };
@@ -451,7 +396,7 @@ fn visual_cursor_underline() {
     let mut ctx = match VisualTestContext::new(320, 120) {
         Some(c) => c,
         None => {
-            eprintln!("Skipping: no GPU adapter");
+            skip_no_gpu();
             return;
         }
     };
@@ -480,7 +425,7 @@ fn visual_selection_single_line() {
     let mut ctx = match VisualTestContext::new(320, 120) {
         Some(c) => c,
         None => {
-            eprintln!("Skipping: no GPU adapter");
+            skip_no_gpu();
             return;
         }
     };
@@ -503,7 +448,7 @@ fn visual_selection_multi_line() {
     let mut ctx = match VisualTestContext::new(320, 160) {
         Some(c) => c,
         None => {
-            eprintln!("Skipping: no GPU adapter");
+            skip_no_gpu();
             return;
         }
     };
@@ -534,7 +479,7 @@ fn visual_tab_single() {
     let mut ctx = match VisualTestContext::new(400, 80) {
         Some(c) => c,
         None => {
-            eprintln!("Skipping: no GPU adapter");
+            skip_no_gpu();
             return;
         }
     };
@@ -567,7 +512,7 @@ fn visual_tab_multiple() {
     let mut ctx = match VisualTestContext::new(500, 80) {
         Some(c) => c,
         None => {
-            eprintln!("Skipping: no GPU adapter");
+            skip_no_gpu();
             return;
         }
     };
@@ -606,7 +551,7 @@ fn visual_tab_truncation() {
     let mut ctx = match VisualTestContext::new(320, 80) {
         Some(c) => c,
         None => {
-            eprintln!("Skipping: no GPU adapter");
+            skip_no_gpu();
             return;
         }
     };
@@ -655,8 +600,6 @@ fn render_with_crt_effect(width: u32, height: u32, crt_uniforms: CrtUniforms) ->
     grid_renderer.set_glyph_cache(device, &glyph_cache);
     grid_renderer.update_screen_size(queue, width as f32, height as f32);
 
-    let grid_instance_buffer = GridRenderer::create_instance_buffer(device);
-
     // Create intermediate texture for text content (CRT reads from this)
     let source_texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("CRT Source Texture"),
@@ -684,8 +627,14 @@ fn render_with_crt_effect(width: u32, height: u32, crt_uniforms: CrtUniforms) ->
         ("$ ls -la", green),
         ("total 42", white),
         ("drwxr-xr-x  5 user staff  160 Mar 11 19:00 .", white),
-        ("-rw-r--r--  1 user staff 1234 Mar 11 18:30 Cargo.toml", white),
-        ("-rw-r--r--  1 user staff 5678 Mar 11 18:30 README.md", white),
+        (
+            "-rw-r--r--  1 user staff 1234 Mar 11 18:30 Cargo.toml",
+            white,
+        ),
+        (
+            "-rw-r--r--  1 user staff 5678 Mar 11 18:30 README.md",
+            white,
+        ),
     ];
 
     for (row, (text, color)) in text_lines.iter().enumerate() {
@@ -745,7 +694,7 @@ fn render_with_crt_effect(width: u32, height: u32, crt_uniforms: CrtUniforms) ->
             timestamp_writes: None,
             occlusion_query_set: None,
         });
-        grid_renderer.render(queue, &mut pass, &grid_instance_buffer);
+        grid_renderer.render(device, queue, &mut pass);
     }
 
     // Pass 2: Apply CRT post-processing to headless render target
@@ -806,7 +755,7 @@ fn visual_crt_scanlines() {
     let png = match render_with_crt_effect(320, 240, uniforms) {
         Some(p) => p,
         None => {
-            eprintln!("Skipping: no GPU adapter");
+            skip_no_gpu();
             return;
         }
     };
@@ -832,7 +781,7 @@ fn visual_crt_curvature() {
     let png = match render_with_crt_effect(320, 240, uniforms) {
         Some(p) => p,
         None => {
-            eprintln!("Skipping: no GPU adapter");
+            skip_no_gpu();
             return;
         }
     };
@@ -858,7 +807,7 @@ fn visual_crt_vignette() {
     let png = match render_with_crt_effect(320, 240, uniforms) {
         Some(p) => p,
         None => {
-            eprintln!("Skipping: no GPU adapter");
+            skip_no_gpu();
             return;
         }
     };
@@ -884,7 +833,7 @@ fn visual_crt_glow() {
     let png = match render_with_crt_effect(320, 240, uniforms) {
         Some(p) => p,
         None => {
-            eprintln!("Skipping: no GPU adapter");
+            skip_no_gpu();
             return;
         }
     };
@@ -901,7 +850,7 @@ fn visual_theme_default() {
     let mut ctx = match VisualTestContext::new(320, 200) {
         Some(c) => c,
         None => {
-            eprintln!("Skipping: no GPU adapter");
+            skip_no_gpu();
             return;
         }
     };
@@ -932,7 +881,7 @@ fn visual_theme_custom_colors() {
     let mut ctx = match VisualTestContext::new(320, 200) {
         Some(c) => c,
         None => {
-            eprintln!("Skipping: no GPU adapter");
+            skip_no_gpu();
             return;
         }
     };
@@ -963,7 +912,7 @@ fn visual_theme_background_gradient() {
     {
         Ok(r) => r,
         Err(_) => {
-            eprintln!("Skipping: no GPU adapter");
+            skip_no_gpu();
             return;
         }
     };
@@ -973,7 +922,7 @@ fn visual_theme_background_gradient() {
     let format = headless.format();
 
     // Create and render the background pipeline (gradient + animated grid)
-    let bg_pipeline = BackgroundPipeline::new(device, format);
+    let mut bg_pipeline = BackgroundPipeline::new(device, format);
     bg_pipeline.update_uniforms(queue, 320.0, 240.0);
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {

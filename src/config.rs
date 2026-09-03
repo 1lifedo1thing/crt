@@ -502,11 +502,6 @@ impl Config {
         ConfigPaths::from_env_or_default().map(|paths| paths.shell_assets_dir())
     }
 
-    /// Path to the user's config file, if a config directory can be determined.
-    pub fn config_path() -> Option<PathBuf> {
-        ConfigPaths::from_env_or_default().map(|paths| paths.config_path())
-    }
-
     /// Ensure the config file exists, creating it (and its directory) with a
     /// commented starter template if missing. Returns the path so callers can
     /// open it in an editor.
@@ -1261,10 +1256,7 @@ action = "quit"
             "quit",
         ];
         for action in &actions {
-            let toml_str = format!(
-                "key = \"x\"\nmods = [\"super\"]\naction = \"{}\"",
-                action
-            );
+            let toml_str = format!("key = \"x\"\nmods = [\"super\"]\naction = \"{}\"", action);
             let result: Result<Keybinding, _> = toml::from_str(&toml_str);
             assert!(result.is_ok(), "Failed to parse action: {}", action);
         }

@@ -73,9 +73,7 @@ fn bench_all_lines_text(c: &mut Criterion) {
             BenchmarkId::new("extract", format!("{}x{}", lines, cols)),
             &(),
             |b, _| {
-                b.iter(|| {
-                    terminal.all_lines_text()
-                });
+                b.iter(|| terminal.all_lines_text());
             },
         );
     }

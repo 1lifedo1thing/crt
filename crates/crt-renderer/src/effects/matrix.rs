@@ -41,11 +41,22 @@ pub struct MatrixEffect {
     needs_regeneration: bool,
     /// Custom charset - each unique character maps to a unique shape
     charset: Vec<char>,
+    /// Pre-built glyph paths at the current char size, centred on the
+    /// origin. One per charset entry, or one per default geometric shape
+    /// when no charset is set. Drawn with a per-glyph translation.
+    glyph_paths: Vec<BezPath>,
 }
+
+/// Expected trail character churn, in changes per column per second.
+/// (Equivalent to the old 10% per frame at 60 fps.)
+const CHURN_RATE: f64 = 6.0;
+
+/// Number of default geometric glyph shapes when no charset is configured
+const DEFAULT_GLYPH_COUNT: usize = 8;
 
 impl MatrixEffect {
     pub fn new() -> Self {
-        Self {
+        let mut effect = Self {
             enabled: false,
             color: Color::from_rgba8(0, 255, 70, 255), // Classic matrix green
             columns: Vec::new(),
@@ -57,6 +68,64 @@ impl MatrixEffect {
             num_columns: 100,
             needs_regeneration: true,
             charset: Vec::new(), // Empty = use default shapes
+            glyph_paths: Vec::new(),
+        };
+        effect.rebuild_glyph_paths();
+        effect
+    }
+
+    /// Derive a 32-bit hash seed from elapsed time and a column index.
+    ///
+    /// Uses wrapping `u64` arithmetic so the seed keeps changing (and never
+    /// overflows in debug builds) no matter how long the effect runs; the
+    /// previous `(time * 1000.0) as u32 + idx` overflowed after ~49.7 days.
+    fn time_seed(time: f64, idx: u32) -> u32 {
+        let ticks = (time * 1000.0) as u64;
+        let mixed = ticks
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(idx as u64);
+        ((mixed >> 32) as u32) ^ (mixed as u32)
+    }
+
+    /// Index into `glyph_paths` for a character seed
+    fn glyph_index(&self, seed: u32) -> usize {
+        if self.charset.is_empty() {
+            (Self::hash(seed) as usize) % DEFAULT_GLYPH_COUNT
+        } else {
+            (Self::hash(seed) as usize) % self.charset.len()
+        }
+    }
+
+    /// Rebuild the cached glyph paths (call when char size or charset changes)
+    fn rebuild_glyph_paths(&mut self) {
+        let origin = Point::ORIGIN;
+        if self.charset.is_empty() {
+            // `draw_char` picks the default shape with `hash(seed) % 8`, so
+            // find one seed per shape to build each path once.
+            let mut paths: Vec<Option<BezPath>> = vec![None; DEFAULT_GLYPH_COUNT];
+            let mut remaining = DEFAULT_GLYPH_COUNT;
+            let mut seed = 0u32;
+            while remaining > 0 {
+                let shape = (Self::hash(seed) as usize) % DEFAULT_GLYPH_COUNT;
+                if paths[shape].is_none() {
+                    paths[shape] = Some(Self::draw_char(
+                        origin,
+                        self.char_width,
+                        self.char_height,
+                        seed,
+                        &[],
+                    ));
+                    remaining -= 1;
+                }
+                seed = seed.wrapping_add(1);
+            }
+            self.glyph_paths = paths.into_iter().map(|p| p.unwrap_or_default()).collect();
+        } else {
+            self.glyph_paths = self
+                .charset
+                .iter()
+                .map(|&ch| Self::draw_char(origin, self.char_width, self.char_height, 0, &[ch]))
+                .collect();
         }
     }
 
@@ -354,7 +423,7 @@ impl BackdropEffect for MatrixEffect {
         "matrix"
     }
 
-    fn update(&mut self, dt: f32, time: f32) {
+    fn update(&mut self, dt: f64, time: f64) {
         if !self.enabled {
             return;
         }
@@ -363,8 +432,11 @@ impl BackdropEffect for MatrixEffect {
             self.generate_columns();
         }
 
-        self.time = time as f64;
-        let dt = dt as f64;
+        self.time = time;
+
+        // Probability that a trail character changes during this frame,
+        // scaled by dt so the churn rate is independent of frame rate.
+        let churn_probability = (CHURN_RATE * dt).min(1.0);
 
         for column in &mut self.columns {
             let idx = (column.x * 1000.0) as u32;
@@ -374,8 +446,8 @@ impl BackdropEffect for MatrixEffect {
                 column.head_y += self.base_speed * column.speed * dt;
 
                 // Occasionally change a random character in the trail
-                let change_seed = (self.time * 1000.0) as u32 + idx;
-                if Self::rand(change_seed) < 0.1 && !column.char_seeds.is_empty() {
+                let change_seed = Self::time_seed(self.time, idx);
+                if Self::rand(change_seed) < churn_probability && !column.char_seeds.is_empty() {
                     let char_idx = Self::hash(change_seed.wrapping_add(500)) as usize
                         % column.char_seeds.len();
                     column.char_seeds[char_idx] = change_seed.wrapping_add(1000);
@@ -384,14 +456,15 @@ impl BackdropEffect for MatrixEffect {
                 // Check if column has gone off screen
                 if column.head_y > 1.0 + column.trail_length {
                     column.active = false;
-                    column.respawn_delay = Self::rand(idx + (self.time * 100.0) as u32) * 2.0;
+                    column.respawn_delay =
+                        Self::rand(Self::time_seed(self.time, idx.wrapping_add(7919))) * 2.0;
                 }
             } else {
                 // Count down respawn delay
                 column.respawn_delay -= dt;
                 if column.respawn_delay <= 0.0 {
                     // Respawn at top
-                    let seed = idx + (self.time * 1000.0) as u32;
+                    let seed = Self::time_seed(self.time, idx);
                     column.head_y = -Self::rand(seed) * 0.2;
                     column.trail_length = 0.15 + Self::rand(seed.wrapping_add(1000)) * 0.25;
                     column.speed = 0.7 + Self::rand(seed.wrapping_add(2000)) * 0.6;
@@ -461,19 +534,21 @@ impl BackdropEffect for MatrixEffect {
                     Color::new([r, g, b, alpha as f32 / 255.0])
                 };
 
-                // Draw the character shape
+                // Draw the pre-built character shape, translated into place
                 let center = Point::new(x_px, char_y_px + self.char_height / 2.0);
                 let char_seed = column.char_seeds[i];
-                let path = Self::draw_char(
-                    center,
-                    self.char_width,
-                    self.char_height,
-                    char_seed,
-                    &self.charset,
-                );
+                let Some(path) = self.glyph_paths.get(self.glyph_index(char_seed)) else {
+                    continue;
+                };
 
                 let stroke = Stroke::new(1.5);
-                scene.stroke(&stroke, Affine::IDENTITY, &Brush::Solid(color), None, &path);
+                scene.stroke(
+                    &stroke,
+                    Affine::translate(center.to_vec2()),
+                    &Brush::Solid(color),
+                    None,
+                    path,
+                );
             }
         }
     }
@@ -481,10 +556,9 @@ impl BackdropEffect for MatrixEffect {
     fn configure(&mut self, config: &EffectConfig) {
         // Note: EffectsRenderer strips the "matrix-" prefix before calling configure
         if let Some(enabled) = config.get_bool("enabled") {
+            // Enabling alone does not invalidate the columns; `update` still
+            // generates them the first time (needs_regeneration starts true).
             self.enabled = enabled;
-            if enabled {
-                self.needs_regeneration = true;
-            }
         }
 
         if let Some(color_str) = config.get("color") {
@@ -506,20 +580,37 @@ impl BackdropEffect for MatrixEffect {
             self.base_speed = (speed / 25.0).clamp(0.05, 1.0); // Convert to fraction of screen height/sec
         }
 
+        let mut glyphs_changed = false;
+
         if let Some(font_size) = config.get_f64("font-size") {
-            self.char_height = font_size.clamp(8.0, 32.0);
-            self.char_width = font_size * 0.7;
+            let font_size = font_size.clamp(8.0, 32.0);
+            let char_width = font_size * 0.7;
+            if font_size != self.char_height || char_width != self.char_width {
+                self.char_height = font_size;
+                self.char_width = char_width;
+                glyphs_changed = true;
+            }
         }
 
         if let Some(charset_str) = config.get("charset") {
             let chars: Vec<char> = charset_str.trim_matches('"').chars().collect();
-            if !chars.is_empty() {
+            if !chars.is_empty() && chars != self.charset {
                 self.charset = chars;
+                glyphs_changed = true;
             }
+        }
+
+        if glyphs_changed {
+            self.rebuild_glyph_paths();
         }
     }
 
     fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    fn is_animated(&self) -> bool {
+        // Columns always fall (base_speed is clamped >= 0.05)
         self.enabled
     }
 }
@@ -607,7 +698,12 @@ mod tests {
     fn rand_produces_zero_to_one() {
         for seed in 0..100 {
             let val = MatrixEffect::rand(seed);
-            assert!(val >= 0.0 && val < 1.0, "rand({}) = {} out of range", seed, val);
+            assert!(
+                (0.0..1.0).contains(&val),
+                "rand({}) = {} out of range",
+                seed,
+                val
+            );
         }
     }
 
@@ -651,7 +747,11 @@ mod tests {
         m.generate_columns();
         // All should start above or at the top (head_y <= 0)
         for col in &m.columns {
-            assert!(col.head_y <= 0.0, "Column starts at {} (should be <= 0)", col.head_y);
+            assert!(
+                col.head_y <= 0.0,
+                "Column starts at {} (should be <= 0)",
+                col.head_y
+            );
         }
     }
 
@@ -673,7 +773,11 @@ mod tests {
         let speeds: Vec<f64> = m.columns.iter().map(|c| c.speed).collect();
         // All speeds should be in range [0.7, 1.3]
         for &s in &speeds {
-            assert!(s >= 0.7 && s <= 1.3, "Speed {} out of expected range", s);
+            assert!(
+                (0.7..=1.3).contains(&s),
+                "Speed {} out of expected range",
+                s
+            );
         }
         // Not all the same
         assert!(speeds.windows(2).any(|w| (w[0] - w[1]).abs() > 0.001));
@@ -759,7 +863,94 @@ mod tests {
         config.insert("enabled", "true");
         m.configure(&config);
         assert!(m.is_enabled());
-        assert!(m.needs_regeneration); // enabling triggers regeneration
+        assert!(m.needs_regeneration); // fresh effect still needs first generation
+    }
+
+    #[test]
+    fn re_enabling_does_not_force_regeneration() {
+        let mut m = MatrixEffect::new();
+        m.enabled = true;
+        m.update(0.016, 0.016); // generates columns
+        assert!(!m.needs_regeneration);
+        let mut config = EffectConfig::new();
+        config.insert("enabled", "true");
+        m.configure(&config);
+        assert!(
+            !m.needs_regeneration,
+            "enabled=true alone must not regenerate"
+        );
+    }
+
+    #[test]
+    fn time_seed_uses_wrapping_arithmetic_for_long_uptimes() {
+        // ~100 days: the old `(time * 1000.0) as u32 + idx` overflowed here
+        let t = 100.0 * 24.0 * 3600.0;
+        let a = MatrixEffect::time_seed(t, u32::MAX);
+        let b = MatrixEffect::time_seed(t + 0.001, u32::MAX);
+        assert_ne!(a, b, "seed must keep changing every tick");
+        // Deterministic
+        assert_eq!(a, MatrixEffect::time_seed(t, u32::MAX));
+    }
+
+    #[test]
+    fn churn_is_frame_rate_independent() {
+        // Count trail changes over one simulated second at two frame rates
+        fn changes_over_one_second(fps: u32) -> usize {
+            let mut m = MatrixEffect::new();
+            m.enabled = true;
+            m.num_columns = 200;
+            m.base_speed = 0.0001; // keep columns on screen
+            m.generate_columns();
+            let before: Vec<Vec<u32>> = m.columns.iter().map(|c| c.char_seeds.clone()).collect();
+            let dt = 1.0 / fps as f64;
+            let mut t = 0.0;
+            let mut changes = 0;
+            for _ in 0..fps {
+                let snapshot: Vec<Vec<u32>> =
+                    m.columns.iter().map(|c| c.char_seeds.clone()).collect();
+                t += dt;
+                m.update(dt, t);
+                for (col, prev) in m.columns.iter().zip(&snapshot) {
+                    if col.char_seeds != *prev {
+                        changes += 1;
+                    }
+                }
+            }
+            let _ = before;
+            changes
+        }
+        let slow = changes_over_one_second(30) as f64;
+        let fast = changes_over_one_second(120) as f64;
+        // Expected ~CHURN_RATE * 200 for both; allow generous tolerance
+        let expected = CHURN_RATE * 200.0;
+        assert!(
+            (slow - expected).abs() < expected * 0.35,
+            "30fps: {} vs {}",
+            slow,
+            expected
+        );
+        assert!(
+            (fast - expected).abs() < expected * 0.35,
+            "120fps: {} vs {}",
+            fast,
+            expected
+        );
+    }
+
+    #[test]
+    fn glyph_paths_prebuilt_for_default_and_charset() {
+        let mut m = MatrixEffect::new();
+        assert_eq!(m.glyph_paths.len(), DEFAULT_GLYPH_COUNT);
+        for p in &m.glyph_paths {
+            assert!(!p.elements().is_empty());
+        }
+        let mut config = EffectConfig::new();
+        config.insert("charset", "ABC");
+        m.configure(&config);
+        assert_eq!(m.glyph_paths.len(), 3);
+        for seed in 0..50 {
+            assert!(m.glyph_index(seed) < 3);
+        }
     }
 
     #[test]
@@ -881,7 +1072,11 @@ mod tests {
         for seed in 0..8 {
             let path = MatrixEffect::draw_char(center, 10.0, 14.0, seed, &[]);
             // Should produce non-empty path elements
-            assert!(path.elements().len() > 0, "Seed {} produced empty path", seed);
+            assert!(
+                !path.elements().is_empty(),
+                "Seed {} produced empty path",
+                seed
+            );
         }
     }
 
@@ -890,7 +1085,7 @@ mod tests {
         let center = Point::new(50.0, 50.0);
         let charset = vec!['A', 'B', 'C'];
         let path = MatrixEffect::draw_char(center, 10.0, 14.0, 0, &charset);
-        assert!(path.elements().len() > 0);
+        assert!(!path.elements().is_empty());
     }
 
     #[test]

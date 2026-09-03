@@ -7,11 +7,14 @@
 //! - `determine_click_target` — decides what a mouse click hits
 //! - `compute_click_count` — multi-click detection (single/double/triple)
 //! - `normalize_scroll_delta` — converts pixel scroll delta to line count
+//! - `accumulate_scroll` — turns fractional (trackpad) deltas into whole lines
 
+use std::cell::Cell;
 use std::time::{Duration, Instant};
 
 use crt_core::Scroll;
 use winit::event::{ElementState, Modifiers, MouseButton, MouseScrollDelta};
+use winit::keyboard::ModifiersState;
 
 use crate::window::{ContextMenuItem, WindowState};
 
@@ -19,9 +22,9 @@ use super::{
     DetectedPath, DetectedUrl, MOUSE_BUTTON_LEFT, MOUSE_BUTTON_MIDDLE, MOUSE_BUTTON_RIGHT,
     find_path_at_position, find_path_index_at_position, find_url_at_position,
     find_url_index_at_position, get_clipboard_content, get_terminal_selection_text,
-    handle_tab_click, handle_terminal_mouse_button, handle_terminal_mouse_move,
-    handle_terminal_mouse_release, handle_terminal_scroll, open_file, open_url, paste_to_terminal,
-    set_clipboard_content,
+    handle_alternate_scroll, handle_tab_click, handle_terminal_mouse_button,
+    handle_terminal_mouse_move, handle_terminal_scroll, open_file, open_url, paste_to_terminal,
+    set_clipboard_content, set_modifiers,
 };
 
 // ── Pure decision functions (no side effects) ──────────────────────────────
@@ -67,7 +70,28 @@ pub fn screen_to_grid_position(x: f32, y: f32, layout: &GridLayout) -> Option<(u
     Some((col, line))
 }
 
+/// Convert screen pixel coordinates to the *nearest* terminal grid position.
+///
+/// Like [`screen_to_grid_position`] but never returns `None`: positions
+/// above/left of the content area clamp to column/row 0, and positions
+/// beyond it clamp to the last column/row. Used for button releases and
+/// drags, so applications never see a button stuck down because the pointer
+/// left the grid.
+pub fn screen_to_grid_position_clamped(x: f32, y: f32, layout: &GridLayout) -> (usize, usize) {
+    let rel_x = (x - layout.content_offset_x - layout.padding).max(0.0);
+    let rel_y = (y - layout.content_offset_y - layout.padding).max(0.0);
+
+    let col = (rel_x / layout.cell_width) as usize;
+    let line = (rel_y / layout.line_height) as usize;
+
+    (
+        col.min(layout.max_cols.saturating_sub(1)),
+        line.min(layout.max_rows.saturating_sub(1)),
+    )
+}
+
 /// What a mouse click targets
+#[allow(dead_code)] // pure decision model, exercised by tests
 #[derive(Debug, Clone, PartialEq)]
 pub enum MouseClickTarget {
     /// Cmd+click on a URL at grid position (col, line)
@@ -98,6 +122,7 @@ pub enum MouseClickTarget {
 ///
 /// This is the pure decision function for `handle_mouse_input`. The caller
 /// is responsible for executing the appropriate side effects based on the result.
+#[allow(dead_code)] // pure decision model, exercised by tests
 pub fn determine_click_target(
     button: MouseButton,
     button_state: ElementState,
@@ -208,37 +233,104 @@ pub fn compute_click_count(
     }
 }
 
-/// Normalize a pixel scroll delta to a line count.
+/// Normalize a pixel scroll delta to a (vertical) line count.
 ///
 /// For `LineDelta`, returns the Y component directly.
 /// For `PixelDelta`, divides by line height to convert pixels to lines.
+#[allow(dead_code)] // vertical-only convenience, exercised by tests
 pub fn normalize_scroll_delta(delta: &MouseScrollDelta, line_height: f32) -> f32 {
+    normalize_scroll_delta_xy(delta, line_height).1
+}
+
+/// Normalize a scroll delta to `(horizontal, vertical)` line counts.
+///
+/// Horizontal pixel deltas are divided by the same line height (there is no
+/// better unit for a wheel-left/right tick).
+pub fn normalize_scroll_delta_xy(delta: &MouseScrollDelta, line_height: f32) -> (f32, f32) {
     match delta {
-        MouseScrollDelta::LineDelta(_, y) => *y,
-        MouseScrollDelta::PixelDelta(pos) => (pos.y / line_height as f64) as f32,
+        MouseScrollDelta::LineDelta(x, y) => (*x, *y),
+        MouseScrollDelta::PixelDelta(pos) => (
+            (pos.x / line_height as f64) as f32,
+            (pos.y / line_height as f64) as f32,
+        ),
     }
+}
+
+/// Fold a fractional scroll delta into a running accumulator and return the
+/// whole lines it now amounts to.
+///
+/// Trackpads deliver many sub-line deltas per gesture; truncating each one to
+/// an integer would drop them all. The accumulator carries the remainder
+/// across events, and resets when the scroll direction flips so a reversal
+/// doesn't have to "pay back" the leftover first.
+///
+/// Returns `(new_accumulator, whole_lines)`.
+pub fn accumulate_scroll(accumulator: f32, delta: f32) -> (f32, i32) {
+    let accumulator =
+        if delta != 0.0 && accumulator != 0.0 && delta.signum() != accumulator.signum() {
+            0.0
+        } else {
+            accumulator
+        };
+    let total = accumulator + delta;
+    let lines = total.trunc();
+    (total - lines, lines as i32)
+}
+
+thread_local! {
+    /// Sub-line scroll remainders `(x, y)`. One focused window receives wheel
+    /// events at a time, so a single accumulator suffices; `InteractionState`
+    /// is owned by another module and can't grow a field here.
+    static SCROLL_ACCUMULATOR: Cell<(f32, f32)> = const { Cell::new((0.0, 0.0)) };
+}
+
+/// Accumulate a `(x, y)` delta and return the whole `(lines_x, lines_y)`.
+fn accumulate_scroll_xy(dx: f32, dy: f32) -> (i32, i32) {
+    SCROLL_ACCUMULATOR.with(|acc| {
+        let (ax, ay) = acc.get();
+        let (ax, lines_x) = accumulate_scroll(ax, dx);
+        let (ay, lines_y) = accumulate_scroll(ay, dy);
+        acc.set((ax, ay));
+        (lines_x, lines_y)
+    })
 }
 
 // ── Side-effectful handler functions ───────────────────────────────────────
 
-/// Handle cursor moved event
-///
-/// Updates cursor position, context menu hover, URL hover, and selection drag.
-pub fn handle_cursor_moved(state: &mut WindowState, x: f32, y: f32) {
+/// Handle cursor moved event with explicit modifier state (used for xterm
+/// modifier bits in motion reports and for Shift bypassing mouse reporting).
+pub fn handle_cursor_moved_with_modifiers(
+    state: &mut WindowState,
+    x: f32,
+    y: f32,
+    mods: ModifiersState,
+) {
     state.interaction.cursor_position = (x, y);
 
     // Update context menu hover state
     if state.ui.context_menu.visible {
-        let old_hover = state.ui.context_menu.hovered_item;
+        let menu = &state.ui.context_menu;
+        let old_hover = (
+            menu.hovered_item,
+            menu.submenu_hovered_item,
+            menu.submenu_visible,
+        );
         state.ui.context_menu.update_hover(x, y);
-        if old_hover != state.ui.context_menu.hovered_item {
+        let menu = &state.ui.context_menu;
+        if old_hover
+            != (
+                menu.hovered_item,
+                menu.submenu_hovered_item,
+                menu.submenu_visible,
+            )
+        {
             state.render.dirty = true;
             state.window.request_redraw();
         }
     }
 
     // Update selection if dragging
-    handle_terminal_mouse_move(state, x, y);
+    handle_terminal_mouse_move(state, x, y, mods);
 
     // Check for URL / file-path hover and update underline state
     let layout = grid_layout_from_state(state);
@@ -278,12 +370,14 @@ pub fn handle_mouse_input(
     open_file_command: Option<&str>,
 ) -> bool {
     let (x, y) = state.interaction.cursor_position;
+    set_modifiers(modifiers);
+    let mods = modifiers.state();
 
     // Check for Cmd+click (Super on macOS, Ctrl on Linux) to open URLs
     #[cfg(target_os = "macos")]
-    let cmd_pressed = modifiers.state().super_key();
+    let cmd_pressed = mods.super_key();
     #[cfg(not(target_os = "macos"))]
-    let cmd_pressed = modifiers.state().control_key();
+    let cmd_pressed = mods.control_key();
 
     if cmd_pressed && button == MouseButton::Left && button_state == ElementState::Pressed {
         let layout = grid_layout_from_state(state);
@@ -340,7 +434,10 @@ pub fn handle_mouse_input(
                 }
                 // Check main menu
                 if let Some(item) = state.ui.context_menu.item_at(x, y) {
-                    // Themes item doesn't do anything on click (submenu shows on hover)
+                    // Separators are inert; Themes opens its submenu on hover
+                    if item.is_separator() {
+                        return true;
+                    }
                     if !item.has_submenu() {
                         handle_context_menu_action(state, item);
                         state.ui.context_menu.hide();
@@ -384,17 +481,20 @@ pub fn handle_mouse_input(
     };
 
     if let Some(btn) = mouse_button {
+        let now = Instant::now();
         match button_state {
             ElementState::Pressed => {
                 // Try terminal (mouse reporting or selection) first, then tab bar
-                if !handle_terminal_mouse_button(state, x, y, Instant::now(), btn, true)
+                if !handle_terminal_mouse_button(state, x, y, now, btn, true, mods)
                     && btn == MOUSE_BUTTON_LEFT
                 {
-                    handle_tab_click(state, x, y, Instant::now());
+                    handle_tab_click(state, x, y, now);
                 }
             }
             ElementState::Released => {
-                handle_terminal_mouse_release(state, x, y);
+                // Button-aware release (SGR reports the real button), clamped
+                // to the grid if the pointer left the content area.
+                handle_terminal_mouse_button(state, x, y, now, btn, false, mods);
             }
         }
     }
@@ -402,15 +502,41 @@ pub fn handle_mouse_input(
     false
 }
 
-/// Handle mouse wheel event
-pub fn handle_mouse_wheel(state: &mut WindowState, delta: MouseScrollDelta) {
+/// Handle mouse wheel event with explicit modifier state.
+///
+/// Order of precedence:
+/// 1. Mouse reporting (unless Shift is held): wheel buttons 64/65 (vertical)
+///    and 66/67 (horizontal) with xterm modifier bits, one report per line.
+/// 2. Alternate scroll: in the alternate screen, vertical lines become
+///    Up/Down cursor keys.
+/// 3. Local scrollback.
+///
+/// Fractional (trackpad) deltas are accumulated across events so slow
+/// scrolling still moves.
+pub fn handle_mouse_wheel_with_modifiers(
+    state: &mut WindowState,
+    delta: MouseScrollDelta,
+    mods: ModifiersState,
+) {
     let (x, y) = state.interaction.cursor_position;
     let line_height = state.gpu.glyph_cache.line_height();
-    let delta_y = normalize_scroll_delta(&delta, line_height);
+    let (delta_x, delta_y) = normalize_scroll_delta_xy(&delta, line_height);
+    let (lines_x, lines_y) = accumulate_scroll_xy(delta_x, delta_y);
+    if lines_x == 0 && lines_y == 0 {
+        return;
+    }
 
-    // Check if mouse reporting should handle this
-    if handle_terminal_scroll(state, x, y, delta_y) {
-        // Mouse reporting handled the scroll
+    // Mouse reporting (Shift bypasses it so the user can always scroll back)
+    if handle_terminal_scroll(state, x, y, lines_x, lines_y, mods) {
+        return;
+    }
+
+    if lines_y == 0 {
+        return; // horizontal-only wheel has no local meaning
+    }
+
+    // Alternate screen: translate to cursor keys (DECSET 1007)
+    if !mods.shift_key() && handle_alternate_scroll(state, lines_y) {
         return;
     }
 
@@ -419,13 +545,10 @@ pub fn handle_mouse_wheel(state: &mut WindowState, delta: MouseScrollDelta) {
     if let Some(tab_id) = tab_id
         && let Some(shell) = state.shells.get_mut(&tab_id)
     {
-        let lines = delta_y as i32;
-        if lines != 0 {
-            shell.scroll(Scroll::Delta(lines));
-            state.render.dirty = true;
-            state.content_hashes.insert(tab_id, 0);
-            state.window.request_redraw();
-        }
+        shell.scroll(Scroll::Delta(lines_y));
+        state.render.dirty = true;
+        state.text_rebuild.insert(tab_id);
+        state.window.request_redraw();
     }
 }
 
@@ -556,7 +679,7 @@ mod tests {
         let now = Instant::now();
         let count = compute_click_count(
             now,
-            None,  // no previous click
+            None, // no previous click
             None,
             (5, 5),
             0,
@@ -702,7 +825,10 @@ mod tests {
 
     #[test]
     fn click_link_none_when_empty() {
-        assert!(matches!(resolve_click_link(&[], &[], 3, 0), ClickLink::None));
+        assert!(matches!(
+            resolve_click_link(&[], &[], 3, 0),
+            ClickLink::None
+        ));
     }
 
     // ── determine_click_target tests ───────────────────────────────────
@@ -745,14 +871,14 @@ mod tests {
 
     #[test]
     fn click_target_left_press_terminal() {
-        let target = determine_click_target(
-            MouseButton::Left,
-            ElementState::Pressed,
-            false,
-            false,
-            true,
+        let target =
+            determine_click_target(MouseButton::Left, ElementState::Pressed, false, false, true);
+        assert_eq!(
+            target,
+            MouseClickTarget::Terminal {
+                button: MOUSE_BUTTON_LEFT
+            }
         );
-        assert_eq!(target, MouseClickTarget::Terminal { button: MOUSE_BUTTON_LEFT });
     }
 
     #[test]
@@ -780,5 +906,78 @@ mod tests {
         let delta = MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(0.0, 32.0));
         let result = normalize_scroll_delta(&delta, 16.0);
         assert!((result - 2.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn scroll_delta_xy_reports_horizontal() {
+        let delta = MouseScrollDelta::LineDelta(-2.0, 0.0);
+        assert_eq!(normalize_scroll_delta_xy(&delta, 16.0), (-2.0, 0.0));
+        let delta = MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(48.0, 16.0));
+        let (x, y) = normalize_scroll_delta_xy(&delta, 16.0);
+        assert!((x - 3.0).abs() < 0.01);
+        assert!((y - 1.0).abs() < 0.01);
+    }
+
+    // ── accumulate_scroll tests (B15 trackpad) ─────────────────────────
+
+    #[test]
+    fn accumulate_scroll_sums_sub_line_deltas() {
+        // Four quarter-line ticks add up to one line.
+        let (acc, lines) = accumulate_scroll(0.0, 0.25);
+        assert_eq!(lines, 0);
+        let (acc, lines) = accumulate_scroll(acc, 0.25);
+        assert_eq!(lines, 0);
+        let (acc, lines) = accumulate_scroll(acc, 0.25);
+        assert_eq!(lines, 0);
+        let (acc, lines) = accumulate_scroll(acc, 0.25);
+        assert_eq!(lines, 1);
+        assert!(acc.abs() < 1e-6);
+    }
+
+    #[test]
+    fn accumulate_scroll_keeps_remainder_and_sign() {
+        let (acc, lines) = accumulate_scroll(0.0, -2.5);
+        assert_eq!(lines, -2);
+        assert!((acc + 0.5).abs() < 1e-6);
+        let (_, lines) = accumulate_scroll(acc, -0.5);
+        assert_eq!(lines, -1);
+    }
+
+    #[test]
+    fn accumulate_scroll_resets_on_direction_change() {
+        let (acc, _) = accumulate_scroll(0.0, 0.9);
+        // Reversing direction discards the pending 0.9 rather than netting.
+        let (acc, lines) = accumulate_scroll(acc, -0.5);
+        assert_eq!(lines, 0);
+        assert!((acc + 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn accumulate_scroll_whole_lines_pass_through() {
+        assert_eq!(accumulate_scroll(0.0, 3.0), (0.0, 3));
+        assert_eq!(accumulate_scroll(0.0, 0.0), (0.0, 0));
+    }
+
+    // ── screen_to_grid_position_clamped tests ─────────────────────────
+
+    #[test]
+    fn grid_position_clamped_snaps_outside_to_edges() {
+        let layout = test_layout();
+        // Left of / above the content area → (0, 0)
+        assert_eq!(
+            screen_to_grid_position_clamped(-50.0, -50.0, &layout),
+            (0, 0)
+        );
+        assert_eq!(screen_to_grid_position_clamped(5.0, 25.0, &layout), (0, 0));
+        // Far right / below → last cell
+        assert_eq!(
+            screen_to_grid_position_clamped(10000.0, 10000.0, &layout),
+            (79, 23)
+        );
+        // Inside agrees with the non-clamped conversion
+        assert_eq!(
+            screen_to_grid_position_clamped(90.0, 120.0, &layout),
+            (10, 5)
+        );
     }
 }

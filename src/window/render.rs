@@ -74,7 +74,7 @@ pub(crate) struct CollectedCell {
 
 /// A cell prepared for rendering, with computed colors and routing.
 /// This is renderer-agnostic — no GPU types involved.
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct PreparedCell {
     /// The character to render
     pub character: char,
@@ -131,7 +131,7 @@ pub struct RenderContext<'a> {
     pub highlight_style: Option<&'a crt_theme::HighlightStyle>,
     pub has_semantic_zones: bool,
     /// Function to determine semantic zone for a grid line
-    pub get_line_zone: Box<dyn Fn(i32) -> SemanticZone + 'a>,
+    pub get_line_zone: &'a dyn Fn(i32) -> SemanticZone,
 }
 
 /// Prepare terminal render data from collected cells.
@@ -165,8 +165,7 @@ pub fn prepare_render_cells(
         };
 
         // Get foreground color
-        let mut fg_color =
-            ansi_color_to_rgba(fg_ansi, ctx.palette, ctx.default_fg, ctx.default_bg);
+        let mut fg_color = ansi_color_to_rgba(fg_ansi, ctx.palette, ctx.default_fg, ctx.default_bg);
 
         // Apply DIM flag by reducing alpha
         if flags.contains(CellFlags::DIM) {
@@ -174,13 +173,12 @@ pub fn prepare_render_cells(
         }
 
         // Get background color and add decoration if non-default
-        let is_spacer = flags
-            .intersects(CellFlags::WIDE_CHAR_SPACER | CellFlags::LEADING_WIDE_CHAR_SPACER);
+        let is_spacer =
+            flags.intersects(CellFlags::WIDE_CHAR_SPACER | CellFlags::LEADING_WIDE_CHAR_SPACER);
         let is_hidden = flags.contains(CellFlags::HIDDEN);
 
         if !is_spacer && !is_hidden {
-            let bg_color =
-                ansi_color_to_rgba(bg_ansi, ctx.palette, ctx.default_fg, ctx.default_bg);
+            let bg_color = ansi_color_to_rgba(bg_ansi, ctx.palette, ctx.default_fg, ctx.default_bg);
             if bg_color != ctx.default_bg {
                 decorations.push(TextDecoration {
                     x,
@@ -259,28 +257,29 @@ pub fn prepare_render_cells(
         }
 
         // Check if this cell is part of a search match
-        if ctx.search_active && !ctx.search_matches.is_empty() {
-            if let Some(highlight_style) = ctx.highlight_style {
-                for (match_idx, search_match) in ctx.search_matches.iter().enumerate() {
-                    if search_match.line == grid_line
-                        && col >= search_match.start_col
-                        && col < search_match.end_col
-                    {
-                        let highlight_color = if match_idx == ctx.current_match {
-                            highlight_style.current_background.to_array()
-                        } else {
-                            highlight_style.background.to_array()
-                        };
-                        decorations.push(TextDecoration {
-                            x,
-                            y,
-                            cell_width: ctx.layout.cell_width,
-                            cell_height: ctx.layout.line_height,
-                            color: highlight_color,
-                            kind: DecorationKind::Background,
-                        });
-                        break;
-                    }
+        if ctx.search_active
+            && !ctx.search_matches.is_empty()
+            && let Some(highlight_style) = ctx.highlight_style
+        {
+            for (match_idx, search_match) in ctx.search_matches.iter().enumerate() {
+                if search_match.line == grid_line
+                    && col >= search_match.start_col
+                    && col < search_match.end_col
+                {
+                    let highlight_color = if match_idx == ctx.current_match {
+                        highlight_style.current_background.to_array()
+                    } else {
+                        highlight_style.background.to_array()
+                    };
+                    decorations.push(TextDecoration {
+                        x,
+                        y,
+                        cell_width: ctx.layout.cell_width,
+                        cell_height: ctx.layout.line_height,
+                        color: highlight_color,
+                        kind: DecorationKind::Background,
+                    });
+                    break;
                 }
             }
         }
@@ -324,18 +323,13 @@ pub struct CachedRenderState {
     pub(crate) line_texts: std::collections::BTreeMap<i32, String>,
     /// Reusable cell collection buffer (cleared and reused each update)
     pub(crate) collected_cells: Vec<CollectedCell>,
-    /// Per-line cached prepared cells from previous frame (for partial damage reuse)
-    pub(crate) line_cells: std::collections::HashMap<i32, Vec<PreparedCell>>,
-    /// Per-line cached decorations from previous frame
-    pub(crate) line_decorations: std::collections::HashMap<i32, Vec<TextDecoration>>,
 }
 
 /// Render state (dirty tracking, frame count, visibility)
 ///
 /// Groups state related to rendering decisions and caching.
-#[derive(Default)]
 pub struct RenderState {
-    /// Whether the window needs redrawing
+    /// Whether terminal content changed and the text layer must be rebuilt
     pub dirty: bool,
     /// Frame counter for periodic operations
     pub frame_count: u32,
@@ -345,8 +339,21 @@ pub struct RenderState {
     pub focused: bool,
     /// Cached decorations from last content update
     pub cached: CachedRenderState,
-    /// Paste operation just occurred - normalize INVERSE flags on next render
-    pub paste_pending: bool,
+    /// When the last frame started (frame pacing and animation `dt`)
+    pub last_frame_at: std::time::Instant,
+}
+
+impl Default for RenderState {
+    fn default() -> Self {
+        Self {
+            dirty: true,
+            frame_count: 0,
+            occluded: false,
+            focused: true,
+            cached: CachedRenderState::default(),
+            last_frame_at: std::time::Instant::now(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -418,7 +425,7 @@ mod tests {
             current_match: 0,
             highlight_style: None,
             has_semantic_zones: false,
-            get_line_zone: Box::new(|_| SemanticZone::Unknown),
+            get_line_zone: &|_| SemanticZone::Unknown,
         };
 
         let (prepared, decorations) = prepare_render_cells(&cells, &ctx);
@@ -509,7 +516,7 @@ mod tests {
             current_match: 0,
             highlight_style: None,
             has_semantic_zones: false,
-            get_line_zone: Box::new(|_| SemanticZone::Unknown),
+            get_line_zone: &|_| SemanticZone::Unknown,
         };
 
         // Hovered → both cells underlined.

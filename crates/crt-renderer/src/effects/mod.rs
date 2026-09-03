@@ -110,8 +110,9 @@ pub trait BackdropEffect: Send + Sync {
     ///
     /// # Arguments
     /// * `dt` - Delta time since last frame in seconds
-    /// * `time` - Total elapsed time in seconds
-    fn update(&mut self, dt: f32, time: f32);
+    /// * `time` - Total elapsed time in seconds (f64 so it does not lose
+    ///   precision or freeze after long uptimes)
+    fn update(&mut self, dt: f64, time: f64);
 
     /// Render to the Vello scene
     ///
@@ -130,36 +131,17 @@ pub trait BackdropEffect: Send + Sync {
     /// Check if the effect is enabled
     fn is_enabled(&self) -> bool;
 
-    /// Prepare GPU resources for effects that need persistent textures.
+    /// Whether the effect's output changes over time.
     ///
-    /// Called before rendering when GPU resources are available.
-    /// Effects can use `renderer.register_texture()` to pre-upload textures
-    /// that bypass vello's atlas system, preventing memory growth.
+    /// When every enabled effect reports `false`, the `EffectsRenderer` can
+    /// keep the previously rendered texture instead of re-encoding and
+    /// re-rendering the scene each frame. Implementations should return
+    /// `false` whenever their configuration makes them static (zero speed,
+    /// no motion/rotation, no twinkle, single-frame sprite, ...).
     ///
-    /// Default implementation does nothing.
-    fn prepare_gpu_resources(
-        &mut self,
-        _device: &wgpu::Device,
-        _queue: &wgpu::Queue,
-        _renderer: &mut vello::Renderer,
-    ) {
-        // Default: no GPU resources needed
-    }
-
-    /// Check if GPU resources need to be prepared or updated.
-    ///
-    /// Returns true if `prepare_gpu_resources` should be called.
-    /// Default implementation returns false.
-    fn needs_gpu_resources(&self) -> bool {
-        false
-    }
-
-    /// Cleanup GPU resources when effect is disabled or removed.
-    ///
-    /// Called to unregister textures and free GPU memory.
-    /// Default implementation does nothing.
-    fn cleanup_gpu_resources(&mut self, _renderer: &mut vello::Renderer) {
-        // Default: no cleanup needed
+    /// Default: assume animated.
+    fn is_animated(&self) -> bool {
+        true
     }
 }
 
@@ -244,8 +226,8 @@ mod tests {
     #[test]
     fn effect_config_get_f32() {
         let mut config = EffectConfig::new();
-        config.insert("val", "3.14");
-        assert!((config.get_f32("val").unwrap() - 3.14).abs() < 0.001);
+        config.insert("val", "2.5");
+        assert!((config.get_f32("val").unwrap() - 2.5).abs() < 0.001);
     }
 
     #[test]

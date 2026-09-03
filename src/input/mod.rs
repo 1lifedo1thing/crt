@@ -7,14 +7,24 @@ mod key_encoder;
 mod keyboard;
 mod mouse;
 
-pub use key_encoder::encode_key;
-pub use keyboard::{KeyboardAction, handle_keyboard_input};
+// Public API of the input layer. Not every entry point is wired into
+// `app/handler.rs` yet (`handle_keyboard_event`, `handle_ime`, `set_modifiers`
+// and the `*_with_modifiers` variants are the preferred replacements for the
+// older signatures), so the re-exports are allowed to be unused.
+#[allow(unused_imports)]
+pub use key_encoder::{EncodeModes, encode_key, encode_key_with_modes};
+#[allow(unused_imports)]
+pub use keyboard::{KeyboardAction, app_modifier_held, handle_keyboard_event};
+#[allow(unused_imports)]
 pub use mouse::{
     GridLayout, MouseClickTarget, compute_click_count, determine_click_target,
-    handle_cursor_moved, handle_mouse_input, handle_mouse_wheel, normalize_scroll_delta,
-    screen_to_grid_position,
+    handle_cursor_moved_with_modifiers, handle_mouse_input, handle_mouse_wheel_with_modifiers,
+    normalize_scroll_delta, normalize_scroll_delta_xy, screen_to_grid_position,
+    screen_to_grid_position_clamped,
 };
 
+use std::borrow::Cow;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -22,9 +32,26 @@ use std::time::{Duration, Instant};
 
 use crt_core::{Column, Line, Point, SelectionType, ShellTerminal, TermMode};
 use regex::Regex;
-use winit::keyboard::{Key, NamedKey};
+use winit::event::{Ime, Modifiers};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 
-use crate::window::WindowState;
+use crate::window::{TabId, WindowState};
+
+// ── Modifier state shared with the mouse layer ─────────────────────────────
+
+thread_local! {
+    /// Last known keyboard modifier state, for handlers whose public
+    /// signatures don't carry modifiers (`handle_mouse_wheel`,
+    /// `handle_cursor_moved`). Updated by [`set_modifiers`] and by every
+    /// keyboard / mouse-button handler that does receive modifiers.
+    static CURRENT_MODIFIERS: Cell<ModifiersState> = const { Cell::new(ModifiersState::empty()) };
+}
+
+/// Record the current keyboard modifier state (call from
+/// `WindowEvent::ModifiersChanged`).
+pub fn set_modifiers(modifiers: &Modifiers) {
+    CURRENT_MODIFIERS.with(|m| m.set(modifiers.state()));
+}
 
 /// Detected URL with its position in the terminal (supports multi-line spans)
 #[derive(Debug, Clone)]
@@ -94,14 +121,20 @@ fn trim_url_trailing_punctuation(url: &str) -> &str {
     &url[..end]
 }
 
-/// Scan a line of text for URLs and return their positions
+/// Scan a line of text for URLs and return their positions.
+///
+/// Matches are returned *untrimmed*: trailing prose punctuation is stripped
+/// once, after wrapped lines have been joined, by [`merge_wrapped_urls`]
+/// (trimming first would drop a `.` that is really part of a URL wrapping at
+/// the last column). Always run `merge_wrapped_urls` on the result — see
+/// [`detect_urls`] for the single-line convenience.
 pub fn detect_urls_in_line(line_text: &str, line_num: usize) -> Vec<DetectedUrl> {
     let regex = url_regex();
     regex
         .find_iter(line_text)
         .map(|m| {
             // Convert byte offsets to character indices for grid column comparison
-            let matched = trim_url_trailing_punctuation(m.as_str());
+            let matched = m.as_str();
             let start_col = line_text[..m.start()].chars().count();
             let end_col = start_col + matched.chars().count();
             DetectedUrl {
@@ -115,6 +148,16 @@ pub fn detect_urls_in_line(line_text: &str, line_num: usize) -> Vec<DetectedUrl>
         .collect()
 }
 
+/// Detect URLs in a single, standalone line (detect + trim).
+#[cfg(test)]
+pub fn detect_urls(line_text: &str, line_num: usize) -> Vec<DetectedUrl> {
+    let mut urls = detect_urls_in_line(line_text, line_num);
+    let mut lines = BTreeMap::new();
+    lines.insert(line_num as i32, line_text.to_string());
+    merge_wrapped_urls(&mut urls, &lines, usize::MAX);
+    urls
+}
+
 /// Check if a position (col, line) is within a detected URL (supports multi-line URLs)
 pub fn find_url_at_position(urls: &[DetectedUrl], col: usize, line: usize) -> Option<&DetectedUrl> {
     urls.iter().find(|url| is_position_in_url(url, col, line))
@@ -122,12 +165,20 @@ pub fn find_url_at_position(urls: &[DetectedUrl], col: usize, line: usize) -> Op
 
 /// Find the index of a URL at a given position (supports multi-line URLs)
 pub fn find_url_index_at_position(urls: &[DetectedUrl], col: usize, line: usize) -> Option<usize> {
-    urls.iter().position(|url| is_position_in_url(url, col, line))
+    urls.iter()
+        .position(|url| is_position_in_url(url, col, line))
 }
 
 /// Check if a (col, line) position falls within a URL's span
 fn is_position_in_url(url: &DetectedUrl, col: usize, line: usize) -> bool {
-    is_position_in_span(url.start_col, url.end_col, url.line, url.end_line, col, line)
+    is_position_in_span(
+        url.start_col,
+        url.end_col,
+        url.line,
+        url.end_line,
+        col,
+        line,
+    )
 }
 
 /// Check if a (col, line) position falls within a (possibly multi-line) span.
@@ -161,12 +212,17 @@ pub fn is_position_in_span(
     }
 }
 
-/// Merge URLs that wrap across multiple lines
+/// Merge URLs that wrap across multiple lines, then trim trailing punctuation.
 ///
 /// When a URL ends at the last column of a line and the next line continues
 /// with URL-like content (no protocol, no leading whitespace), merge them
-/// into a single multi-line URL.
-pub fn merge_wrapped_urls(urls: &mut Vec<DetectedUrl>, line_texts: &BTreeMap<i32, String>, cols: usize) {
+/// into a single multi-line URL. Trailing prose punctuation is trimmed once,
+/// here, after merging (see [`detect_urls_in_line`]).
+pub fn merge_wrapped_urls(
+    urls: &mut [DetectedUrl],
+    line_texts: &BTreeMap<i32, String>,
+    cols: usize,
+) {
     let mut i = 0;
     while i < urls.len() {
         // Check if URL ends at or near the last column (allowing for slight variance)
@@ -201,8 +257,8 @@ pub fn merge_wrapped_urls(urls: &mut Vec<DetectedUrl>, line_texts: &BTreeMap<i32
         i += 1;
     }
 
-    // Trailing punctuation may now sit at the end of a merged continuation line,
-    // so re-trim each final URL and fix up end_col on its last line.
+    // Trim trailing prose punctuation once, on the final (possibly merged)
+    // URL, and fix up end_col on its last line.
     for url in urls.iter_mut() {
         let new_len = trim_url_trailing_punctuation(&url.url).len();
         let removed = url.url[new_len..].chars().count();
@@ -327,13 +383,19 @@ pub fn detect_paths_in_line(line_text: &str, line_num: usize) -> Vec<DetectedPat
 
         // The on-screen token (what gets underlined) and the logical path text
         // (used for resolution) differ for quoted / escaped paths.
-        let (on_screen, candidate) = if let Some(inner) = unquote(raw) {
+        let (on_screen, candidate): (&str, Cow<str>) = if let Some(inner) = unquote(raw) {
             // Quoted: the quotes delimit exactly; spaces inside are literal.
-            (raw, inner.to_string())
+            (raw, Cow::Borrowed(inner))
         } else {
-            // Bare: trim trailing prose punctuation, then unescape `\ ` → ` `.
+            // Bare: trim trailing prose punctuation, then unescape `\ ` → ` `
+            // (only allocating when there is something to unescape).
             let trimmed = trim_url_trailing_punctuation(raw);
-            (trimmed, trimmed.replace("\\ ", " "))
+            let unescaped = if trimmed.contains("\\ ") {
+                Cow::Owned(trimmed.replace("\\ ", " "))
+            } else {
+                Cow::Borrowed(trimmed)
+            };
+            (trimmed, unescaped)
         };
 
         // URLs (including `file://`) are the URL detector's job.
@@ -382,7 +444,14 @@ pub fn find_path_index_at_position(
 
 /// Check if a (col, line) position falls within a path's span.
 fn is_position_in_path(path: &DetectedPath, col: usize, line: usize) -> bool {
-    is_position_in_span(path.start_col, path.end_col, path.line, path.end_line, col, line)
+    is_position_in_span(
+        path.start_col,
+        path.end_col,
+        path.line,
+        path.end_line,
+        col,
+        line,
+    )
 }
 
 /// Resolve a detected path token to an absolute [`PathBuf`].
@@ -448,8 +517,7 @@ impl PathValidator {
 
     /// Resolve and validate a single path, setting [`DetectedPath::exists`].
     pub fn validate(&mut self, path: &mut DetectedPath) {
-        let Some(resolved) =
-            resolve_path(&path.path, self.cwd.as_deref(), self.home.as_deref())
+        let Some(resolved) = resolve_path(&path.path, self.cwd.as_deref(), self.home.as_deref())
         else {
             path.exists = false;
             return;
@@ -541,13 +609,25 @@ pub fn open_file(
     if let Some(template) = command_template
         && let Some((program, args)) = build_open_command(template, file.as_ref(), line, col)
     {
-        if let Err(e) = std::process::Command::new(&program).args(&args).spawn() {
-            log::error!(
-                "Failed to open file '{}' with command '{}': {}",
-                file,
-                template,
-                e
-            );
+        match std::process::Command::new(&program).args(&args).spawn() {
+            Ok(mut child) => {
+                // Reap the editor process on a detached thread so it doesn't
+                // linger as a zombie once it exits.
+                std::thread::Builder::new()
+                    .name("crt-open-file-reaper".into())
+                    .spawn(move || {
+                        let _ = child.wait();
+                    })
+                    .ok();
+            }
+            Err(e) => {
+                log::error!(
+                    "Failed to open file '{}' with command '{}': {}",
+                    file,
+                    template,
+                    e
+                );
+            }
         }
         return;
     }
@@ -570,6 +650,34 @@ pub const MOUSE_BUTTON_RELEASE: u8 = 3;
 pub const MOUSE_BUTTON_MOTION: u8 = 32;
 pub const MOUSE_BUTTON_SCROLL_UP: u8 = 64;
 pub const MOUSE_BUTTON_SCROLL_DOWN: u8 = 65;
+pub const MOUSE_BUTTON_SCROLL_LEFT: u8 = 66;
+pub const MOUSE_BUTTON_SCROLL_RIGHT: u8 = 67;
+// xterm modifier bits OR'd into the button code
+pub const MOUSE_MOD_SHIFT: u8 = 4;
+pub const MOUSE_MOD_META: u8 = 8;
+pub const MOUSE_MOD_CTRL: u8 = 16;
+
+/// xterm modifier bits (Shift 4, Meta 8, Ctrl 16) for a mouse report.
+pub fn mouse_modifier_bits(mods: ModifiersState) -> u8 {
+    let mut bits = 0;
+    if mods.shift_key() {
+        bits |= MOUSE_MOD_SHIFT;
+    }
+    if mods.alt_key() {
+        bits |= MOUSE_MOD_META;
+    }
+    if mods.control_key() {
+        bits |= MOUSE_MOD_CTRL;
+    }
+    bits
+}
+
+/// Whether the terminal is in an alternate screen that asked for wheel
+/// events to be translated into cursor keys (DECSET 1007, on by default).
+pub fn alternate_scroll_active(shell: &ShellTerminal) -> bool {
+    let mode = shell.terminal().mode();
+    mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL)
+}
 
 /// Check if the terminal has mouse reporting enabled
 pub fn should_report_mouse(shell: &ShellTerminal) -> bool {
@@ -694,122 +802,159 @@ pub fn handle_tab_editing(state: &mut WindowState, key: &Key, mod_pressed: bool)
     }
 }
 
-/// Handle shell input (send to PTY)
+/// A key event as seen by the shell path.
+#[derive(Debug, Clone, Copy)]
+pub struct ShellKeyInput<'a> {
+    /// The logical key (modifiers such as Shift/Option already applied).
+    pub key: &'a Key,
+    /// The key with all modifiers removed, when the platform provides it.
+    pub unmodified_key: Option<&'a Key>,
+    /// The event's text field (fallback for keys termwiz can't encode).
+    pub text: Option<&'a str>,
+    /// Modifier state at the time of the event.
+    pub modifiers: ModifiersState,
+}
+
+/// Pure resolver: the bytes a key event sends to the PTY, or `None` if the
+/// event should not reach the shell.
 ///
-/// Uses termwiz for key-to-escape-sequence encoding, with platform-specific
-/// overrides for macOS word navigation. Falls back to the event's text field
-/// for any keys termwiz doesn't handle.
-pub fn handle_shell_input(
-    state: &mut WindowState,
-    key: &Key,
-    text: Option<&str>,
-    mod_pressed: bool,
-    ctrl_pressed: bool,
-    shift_pressed: bool,
-    alt_pressed: bool,
-) -> bool {
-    let tab_id = state.gpu.tab_bar.active_tab_id();
-    let Some(tab_id) = tab_id else { return false };
-    let Some(shell) = state.shells.get_mut(&tab_id) else {
-        return false;
-    };
+/// - Super chords are application shortcuts on every platform and are never
+///   forwarded. Ctrl chords *are* forwarded (any binding that claims a chord
+///   is resolved before this is reached).
+/// - macOS: Option+Backspace / Option+Arrow send readline word-navigation
+///   sequences and Cmd+Left/Right act as Home/End. Since Option is already
+///   folded into the logical key there (`Option+f` = `ƒ`), Meta chords are
+///   encoded from the unmodified key so they send `ESC f`.
+/// - Everything else is encoded by termwiz honouring `modes`, falling back to
+///   the event's text.
+pub fn shell_bytes_for_key(input: &ShellKeyInput, modes: EncodeModes) -> Option<Vec<u8>> {
+    let mods = input.modifiers;
+    let super_pressed = mods.super_key();
+    let ctrl_pressed = mods.control_key();
+    let shift_pressed = mods.shift_key();
+    let alt_pressed = mods.alt_key();
 
-    log::debug!(
-        "Shell input: key={:?} text={:?} mod={} ctrl={} shift={} alt={}",
-        key,
-        text,
-        mod_pressed,
-        ctrl_pressed,
-        shift_pressed,
-        alt_pressed
-    );
-
-    let mut input_sent = false;
-
-    // Handle Home/End keys explicitly using readline's native bindings
-    // Ctrl-A (0x01) = beginning of line, Ctrl-E (0x05) = end of line
-    // These work universally in bash, zsh, and other readline-based shells
-    match key {
-        Key::Named(NamedKey::Home) if !shift_pressed => {
-            shell.send_input(b"\x01"); // Ctrl-A = beginning of line
-            input_sent = true;
+    // macOS-specific word/line navigation shortcuts (Option+Arrow, Cmd+Arrow,
+    // Option+Backspace). These override standard encoding because macOS users
+    // expect this behaviour.
+    #[cfg(target_os = "macos")]
+    match input.key {
+        Key::Named(NamedKey::Backspace) if alt_pressed => {
+            return Some(b"\x1b\x7f".to_vec()); // ESC DEL = delete word backward
         }
-        Key::Named(NamedKey::End) if !shift_pressed => {
-            shell.send_input(b"\x05"); // Ctrl-E = end of line
-            input_sent = true;
+        // Cmd+Arrow = Home/End (encoded like the real keys, so DECCKM is honoured)
+        Key::Named(NamedKey::ArrowRight) if super_pressed && !shift_pressed => {
+            return encode_key_with_modes(&Key::Named(NamedKey::End), false, false, false, modes);
+        }
+        Key::Named(NamedKey::ArrowLeft) if super_pressed && !shift_pressed => {
+            return encode_key_with_modes(&Key::Named(NamedKey::Home), false, false, false, modes);
+        }
+        // Option+Arrow = word navigation
+        Key::Named(NamedKey::ArrowRight) if alt_pressed => {
+            return Some(b"\x1bf".to_vec()); // ESC f = forward word
+        }
+        Key::Named(NamedKey::ArrowLeft) if alt_pressed => {
+            return Some(b"\x1bb".to_vec()); // ESC b = backward word
         }
         _ => {}
     }
 
-    // macOS-specific word/line navigation shortcuts (Option+Arrow, Cmd+Arrow, Option+Backspace)
-    // These override standard encoding because macOS users expect this behavior
+    // Super chords are application shortcuts; never send them to the shell.
+    if super_pressed {
+        return None;
+    }
+
+    // On macOS the logical key already has Option applied (`Option+f` = `ƒ`),
+    // so encode Meta chords from the unmodified key to get `ESC f`.
     #[cfg(target_os = "macos")]
-    if !input_sent {
-        match key {
-            Key::Named(NamedKey::Backspace) if alt_pressed => {
-                shell.send_input(b"\x1b\x7f"); // ESC DEL = delete word backward
-                input_sent = true;
-            }
-            // Cmd+Arrow = Home/End (same as Home/End keys above)
-            // Use readline bindings for universal shell compatibility
-            Key::Named(NamedKey::ArrowRight) if mod_pressed && !shift_pressed => {
-                shell.send_input(b"\x05"); // Ctrl-E = end of line
-                input_sent = true;
-            }
-            Key::Named(NamedKey::ArrowLeft) if mod_pressed && !shift_pressed => {
-                shell.send_input(b"\x01"); // Ctrl-A = beginning of line
-                input_sent = true;
-            }
-            // Option+Arrow = word navigation
-            Key::Named(NamedKey::ArrowRight) if alt_pressed => {
-                shell.send_input(b"\x1bf"); // ESC f = forward word
-                input_sent = true;
-            }
-            Key::Named(NamedKey::ArrowLeft) if alt_pressed => {
-                shell.send_input(b"\x1bb"); // ESC b = backward word
-                input_sent = true;
-            }
-            _ => {}
-        }
-    }
+    let key = if alt_pressed {
+        input.unmodified_key.unwrap_or(input.key)
+    } else {
+        input.key
+    };
+    #[cfg(not(target_os = "macos"))]
+    let key = input.key;
 
-    // If not handled by platform-specific code, use termwiz encoding
-    if !input_sent {
-        // Don't send Cmd+key combinations to terminal (they're app shortcuts)
-        if !mod_pressed
-            && let Some(bytes) = encode_key(key, ctrl_pressed, shift_pressed, alt_pressed)
-        {
-            shell.send_input(&bytes);
-            input_sent = true;
-            log::debug!("Sent via termwiz: {:?}", bytes);
-        }
-    }
-
-    // Final fallback: use the text field from the key event
-    // This catches any keys termwiz doesn't handle
-    if !input_sent
-        && let Some(t) = text
-        && !t.is_empty()
-        && !mod_pressed
+    if let Some(bytes) = encode_key_with_modes(key, ctrl_pressed, shift_pressed, alt_pressed, modes)
     {
-        shell.send_input(t.as_bytes());
-        input_sent = true;
-        log::debug!("Forwarded via text field: {:?}", t);
+        return Some(bytes);
     }
 
-    if input_sent {
-        // Scroll to bottom when user types (show live output)
-        if shell.is_scrolled_back() {
-            shell.scroll_to_bottom();
+    // Final fallback: the text field from the key event (catches anything
+    // termwiz doesn't handle).
+    input
+        .text
+        .filter(|t| !t.is_empty())
+        .map(|t| t.as_bytes().to_vec())
+}
+
+/// Send raw bytes to the active shell, scrolling to the bottom and
+/// invalidating the tab's content hash so the next frame re-renders.
+fn send_bytes_to_active_shell(state: &mut WindowState, bytes: &[u8]) -> bool {
+    let Some(tab_id) = state.gpu.tab_bar.active_tab_id() else {
+        return false;
+    };
+    let Some(shell) = state.shells.get_mut(&tab_id) else {
+        return false;
+    };
+    shell.send_input(bytes);
+    // Scroll to bottom when user types (show live output)
+    if shell.is_scrolled_back() {
+        shell.scroll_to_bottom();
+    }
+    // Always invalidate content hash when input is sent to ensure re-render
+    // even if PTY output hasn't arrived yet (handles TUI apps like Claude Code)
+    state.text_rebuild.insert(tab_id);
+    state.render.dirty = true;
+    state.window.request_redraw();
+    true
+}
+
+/// Handle shell input (send to PTY)
+///
+/// Resolves the key via [`shell_bytes_for_key`] using the active terminal's
+/// cursor-key / newline modes, then sends the bytes. Returns whether anything
+/// was sent.
+pub fn handle_shell_input(state: &mut WindowState, input: &ShellKeyInput) -> bool {
+    let Some(tab_id) = state.gpu.tab_bar.active_tab_id() else {
+        return false;
+    };
+    let Some(shell) = state.shells.get(&tab_id) else {
+        return false;
+    };
+
+    log::debug!(
+        "Shell input: key={:?} unmodified={:?} text={:?} mods={:?}",
+        input.key,
+        input.unmodified_key,
+        input.text,
+        input.modifiers
+    );
+
+    let modes = EncodeModes::from_term_mode(shell.terminal().mode());
+    let Some(bytes) = shell_bytes_for_key(input, modes) else {
+        return false;
+    };
+    log::debug!("Sending to shell: {:?}", bytes);
+    send_bytes_to_active_shell(state, &bytes)
+}
+
+/// Handle an IME event.
+///
+/// Committed text is sent to the active shell verbatim (no bracketed-paste
+/// wrapping — it is typed input, not a paste). Preedit and enable/disable
+/// notifications are ignored for now.
+#[allow(dead_code)] // wired from `WindowEvent::Ime` in app/handler.rs
+pub fn handle_ime(state: &mut WindowState, ime: &Ime) {
+    match ime {
+        Ime::Commit(text) if !text.is_empty() => {
+            log::debug!("IME commit: {} bytes", text.len());
+            if send_bytes_to_active_shell(state, text.as_bytes()) {
+                clear_terminal_selection(state);
+            }
         }
-        // Always invalidate content hash when input is sent to ensure re-render
-        // even if PTY output hasn't arrived yet (handles TUI apps like Claude Code)
-        state.content_hashes.insert(tab_id, 0);
-        state.render.dirty = true;
-        state.window.request_redraw();
+        Ime::Commit(_) | Ime::Preedit(..) | Ime::Enabled | Ime::Disabled => {}
     }
-
-    input_sent
 }
 
 /// Handle mouse click on tab bar
@@ -947,6 +1092,30 @@ pub fn handle_resize(
     state.gpu.text_texture = text_texture;
     state.gpu.composite_bind_group = composite_bind_group;
 
+    // The CRT intermediate texture (when the effect is on) must match the
+    // surface size too, otherwise the post-process pass samples a stale,
+    // wrongly-sized texture after a resize.
+    if state.gpu.crt_texture.is_some() {
+        match shared
+            .texture_pool
+            .checkout(new_width, new_height, state.gpu.config.format)
+        {
+            Some(crt_texture) => {
+                let crt_bind_group = state
+                    .gpu
+                    .crt_pipeline
+                    .create_bind_group(&shared.device, crt_texture.view());
+                state.gpu.crt_texture = Some(crt_texture);
+                state.gpu.crt_bind_group = Some(crt_bind_group);
+            }
+            None => {
+                log::error!(
+                    "Failed to checkout CRT texture from pool during resize - keeping old texture"
+                );
+            }
+        }
+    }
+
     state
         .gpu
         .grid_renderer
@@ -968,17 +1137,14 @@ pub fn handle_resize(
         .resize(new_width as f32, new_height as f32);
 
     state.render.dirty = true;
-    for hash in state.content_hashes.values_mut() {
-        *hash = 0;
-    }
+    state.request_text_rebuild_all();
     state.window.request_redraw();
 }
 
-/// Convert screen coordinates to terminal cell (column, line)
-/// Returns None if the position is outside the terminal area
-pub fn screen_to_cell(state: &WindowState, x: f32, y: f32) -> Option<(usize, usize)> {
+/// Grid layout of the terminal content area for this window.
+fn grid_layout(state: &WindowState) -> GridLayout {
     let (offset_x, offset_y) = state.gpu.tab_bar.content_offset();
-    let layout = GridLayout {
+    GridLayout {
         content_offset_x: offset_x,
         content_offset_y: offset_y,
         padding: 10.0 * state.scale_factor,
@@ -986,18 +1152,27 @@ pub fn screen_to_cell(state: &WindowState, x: f32, y: f32) -> Option<(usize, usi
         line_height: state.gpu.glyph_cache.line_height(),
         max_cols: state.cols,
         max_rows: state.rows,
-    };
-    screen_to_grid_position(x, y, &layout)
+    }
 }
 
-/// Handle mouse press for terminal selection or mouse reporting
-/// Returns true if the press was handled (was in terminal area)
-#[allow(dead_code)]
-pub fn handle_terminal_mouse_press(state: &mut WindowState, x: f32, y: f32, now: Instant) -> bool {
-    handle_terminal_mouse_button(state, x, y, now, MOUSE_BUTTON_LEFT, true)
+/// Convert screen coordinates to terminal cell (column, line)
+/// Returns None if the position is outside the terminal area
+pub fn screen_to_cell(state: &WindowState, x: f32, y: f32) -> Option<(usize, usize)> {
+    screen_to_grid_position(x, y, &grid_layout(state))
+}
+
+/// Convert screen coordinates to the nearest terminal cell, clamping
+/// positions outside the content area to its edge. Used for releases and
+/// drags so an app never sees a button stuck down because the pointer left
+/// the grid.
+pub fn screen_to_cell_clamped(state: &WindowState, x: f32, y: f32) -> (usize, usize) {
+    screen_to_grid_position_clamped(x, y, &grid_layout(state))
 }
 
 /// Handle mouse button press/release for any button
+///
+/// `mods` supplies the xterm modifier bits for reports; while Shift is held
+/// mouse reporting is bypassed so local selection works under tmux/vim.
 /// Returns true if the event was handled (was in terminal area)
 pub fn handle_terminal_mouse_button(
     state: &mut WindowState,
@@ -1006,35 +1181,50 @@ pub fn handle_terminal_mouse_button(
     now: Instant,
     button: u8,
     pressed: bool,
+    mods: ModifiersState,
 ) -> bool {
-    // Check if click is in tab bar area first
-    let tab_bar_height = state.gpu.tab_bar.height() * state.scale_factor;
-    if y < tab_bar_height {
-        return false; // Let tab bar handle it
-    }
-
-    let Some((col, line)) = screen_to_cell(state, x, y) else {
-        return false;
+    let (col, line) = if pressed {
+        // Check if click is in tab bar area first
+        let tab_bar_height = state.gpu.tab_bar.height() * state.scale_factor;
+        if y < tab_bar_height {
+            return false; // Let tab bar handle it
+        }
+        let Some(cell) = screen_to_cell(state, x, y) else {
+            return false;
+        };
+        cell
+    } else {
+        // A release is always delivered, clamped to the nearest cell.
+        screen_to_cell_clamped(state, x, y)
     };
 
     // Get the active shell
     let tab_id = state.gpu.tab_bar.active_tab_id();
-    let Some(tab_id) = tab_id else { return false };
+    let Some(tab_id) = tab_id else {
+        state.interaction.mouse_pressed &= pressed;
+        return false;
+    };
     let Some(shell) = state.shells.get_mut(&tab_id) else {
+        state.interaction.mouse_pressed &= pressed;
         return false;
     };
 
     // Check if we should report mouse events to the terminal
-    if should_report_mouse(shell) {
-        let sgr = is_sgr_mouse_mode(shell);
-        let report_button = if !pressed && !sgr {
-            // In legacy mode, release is button 3
-            MOUSE_BUTTON_RELEASE
-        } else {
-            button
-        };
-        let seq = mouse_report(report_button, col, line, pressed, sgr);
-        shell.send_input(&seq);
+    if should_report_mouse(shell) && !mods.shift_key() {
+        // Don't report a left release whose press never reached the app
+        // (e.g. the press landed on the tab bar).
+        let report = pressed || button != MOUSE_BUTTON_LEFT || state.interaction.mouse_pressed;
+        if report {
+            let sgr = is_sgr_mouse_mode(shell);
+            let report_button = if !pressed && !sgr {
+                // In legacy mode, release is button 3
+                MOUSE_BUTTON_RELEASE
+            } else {
+                button
+            } | mouse_modifier_bits(mods);
+            let seq = mouse_report(report_button, col, line, pressed, sgr);
+            shell.send_input(&seq);
+        }
 
         // Track button state for drag reporting
         if button == MOUSE_BUTTON_LEFT {
@@ -1053,22 +1243,15 @@ pub fn handle_terminal_mouse_button(
 
     if pressed {
         // Determine click count for multi-click selection
-        let click_count = if let (Some(last_time), Some((last_col, last_line))) = (
+        let click_count = compute_click_count(
+            now,
             state.interaction.last_selection_click_time,
             state.interaction.last_selection_click_pos,
-        ) {
-            let time_ok = now.duration_since(last_time) < MULTI_CLICK_THRESHOLD;
-            let pos_ok = col.abs_diff(last_col) <= MULTI_CLICK_DISTANCE
-                && line.abs_diff(last_line) <= MULTI_CLICK_DISTANCE;
-
-            if time_ok && pos_ok {
-                (state.interaction.selection_click_count % 3) + 1
-            } else {
-                1
-            }
-        } else {
-            1
-        };
+            (col, line),
+            state.interaction.selection_click_count as usize,
+            MULTI_CLICK_THRESHOLD,
+            MULTI_CLICK_DISTANCE,
+        ) as u8;
 
         state.interaction.selection_click_count = click_count;
         state.interaction.last_selection_click_time = Some(now);
@@ -1100,6 +1283,7 @@ pub fn handle_terminal_mouse_button(
         }
     } else {
         state.interaction.mouse_pressed = false;
+        // Selection remains if we were doing local selection - user can copy with Cmd+C
     }
 
     state.render.dirty = true;
@@ -1108,9 +1292,17 @@ pub fn handle_terminal_mouse_button(
 }
 
 /// Handle mouse move for terminal selection (dragging) or mouse motion reporting
-pub fn handle_terminal_mouse_move(state: &mut WindowState, x: f32, y: f32) {
-    let Some((col, line)) = screen_to_cell(state, x, y) else {
-        return;
+pub fn handle_terminal_mouse_move(state: &mut WindowState, x: f32, y: f32, mods: ModifiersState) {
+    let pressed = state.interaction.mouse_pressed;
+    // While a button is down, keep tracking (clamped) even outside the grid so
+    // drags and drag-reports continue; hover motion outside the grid is ignored.
+    let (col, line) = if pressed {
+        screen_to_cell_clamped(state, x, y)
+    } else {
+        let Some(cell) = screen_to_cell(state, x, y) else {
+            return;
+        };
+        cell
     };
 
     let tab_id = state.gpu.tab_bar.active_tab_id();
@@ -1120,14 +1312,14 @@ pub fn handle_terminal_mouse_move(state: &mut WindowState, x: f32, y: f32) {
     };
 
     // Check if we should report motion to terminal
-    if should_report_motion(shell, state.interaction.mouse_pressed) {
+    if should_report_motion(shell, pressed) && !mods.shift_key() {
         let sgr = is_sgr_mouse_mode(shell);
-        // Button code: 32 + button for motion with button, or just 35 for motion without
-        let button = if state.interaction.mouse_pressed {
+        // Button code: 32 + button for motion with button, or 35 for motion without
+        let button = if pressed {
             MOUSE_BUTTON_MOTION + MOUSE_BUTTON_LEFT // 32 = motion with left button
         } else {
             MOUSE_BUTTON_MOTION + MOUSE_BUTTON_RELEASE // 35 = motion without button
-        };
+        } | mouse_modifier_bits(mods);
         let seq = mouse_report(button, col, line, true, sgr);
         shell.send_input(&seq);
 
@@ -1137,7 +1329,7 @@ pub fn handle_terminal_mouse_move(state: &mut WindowState, x: f32, y: f32) {
     }
 
     // Local selection handling
-    if !state.interaction.mouse_pressed {
+    if !pressed {
         return;
     }
 
@@ -1151,45 +1343,27 @@ pub fn handle_terminal_mouse_move(state: &mut WindowState, x: f32, y: f32) {
     state.window.request_redraw();
 }
 
-/// Handle mouse release for terminal selection or mouse reporting
-pub fn handle_terminal_mouse_release(state: &mut WindowState, x: f32, y: f32) {
-    let Some((col, line)) = screen_to_cell(state, x, y) else {
-        state.interaction.mouse_pressed = false;
-        return;
-    };
+/// Maximum wheel reports / cursor keys emitted for a single wheel event.
+const MAX_SCROLL_REPORTS_PER_EVENT: i32 = 32;
 
-    let tab_id = state.gpu.tab_bar.active_tab_id();
-    let Some(tab_id) = tab_id else {
-        state.interaction.mouse_pressed = false;
-        return;
-    };
-    let Some(shell) = state.shells.get_mut(&tab_id) else {
-        state.interaction.mouse_pressed = false;
-        return;
-    };
-
-    // Check if we should report the release to terminal
-    if should_report_mouse(shell) {
-        let sgr = is_sgr_mouse_mode(shell);
-        let button = if sgr {
-            MOUSE_BUTTON_LEFT // SGR mode sends button with release suffix 'm'
-        } else {
-            MOUSE_BUTTON_RELEASE // Legacy mode sends button 3 for release
-        };
-        let seq = mouse_report(button, col, line, false, sgr);
-        shell.send_input(&seq);
-    }
-
-    state.interaction.mouse_pressed = false;
-    // Selection remains if we were doing local selection - user can copy with Cmd+C
-}
-
-/// Handle mouse scroll wheel for terminal scrollback or mouse reporting
-/// Returns true if the scroll was handled by mouse reporting
-pub fn handle_terminal_scroll(state: &mut WindowState, x: f32, y: f32, delta_y: f32) -> bool {
-    let Some((col, line)) = screen_to_cell(state, x, y) else {
+/// Handle mouse scroll wheel for mouse reporting.
+///
+/// `lines_x` / `lines_y` are whole lines (positive = up / left). Returns true
+/// if the scroll was consumed by mouse reporting; false when the terminal is
+/// not reporting (or Shift is held, which bypasses reporting), in which case
+/// the caller falls back to alternate-scroll or local scrollback.
+pub fn handle_terminal_scroll(
+    state: &mut WindowState,
+    x: f32,
+    y: f32,
+    lines_x: i32,
+    lines_y: i32,
+    mods: ModifiersState,
+) -> bool {
+    if mods.shift_key() || (lines_x == 0 && lines_y == 0) {
         return false;
-    };
+    }
+    let (col, line) = screen_to_cell_clamped(state, x, y);
 
     let tab_id = state.gpu.tab_bar.active_tab_id();
     let Some(tab_id) = tab_id else { return false };
@@ -1197,24 +1371,63 @@ pub fn handle_terminal_scroll(state: &mut WindowState, x: f32, y: f32, delta_y: 
         return false;
     };
 
-    // Check if we should report scroll to terminal
-    if should_report_mouse(shell) {
-        let sgr = is_sgr_mouse_mode(shell);
-        // Scroll up = 64, scroll down = 65
-        let button = if delta_y > 0.0 {
-            MOUSE_BUTTON_SCROLL_UP
-        } else {
-            MOUSE_BUTTON_SCROLL_DOWN
-        };
-        let seq = mouse_report(button, col, line, true, sgr);
-        shell.send_input(&seq);
-
-        state.render.dirty = true;
-        state.window.request_redraw();
-        return true;
+    if !should_report_mouse(shell) {
+        return false;
     }
 
-    false
+    let sgr = is_sgr_mouse_mode(shell);
+    let mod_bits = mouse_modifier_bits(mods);
+    // Vertical: scroll up = 64, scroll down = 65. Horizontal: left = 66, right = 67.
+    for (lines, up_button, down_button) in [
+        (lines_y, MOUSE_BUTTON_SCROLL_UP, MOUSE_BUTTON_SCROLL_DOWN),
+        (lines_x, MOUSE_BUTTON_SCROLL_LEFT, MOUSE_BUTTON_SCROLL_RIGHT),
+    ] {
+        if lines == 0 {
+            continue;
+        }
+        let button = if lines > 0 { up_button } else { down_button } | mod_bits;
+        let seq = mouse_report(button, col, line, true, sgr);
+        for _ in 0..lines.abs().min(MAX_SCROLL_REPORTS_PER_EVENT) {
+            shell.send_input(&seq);
+        }
+    }
+
+    state.render.dirty = true;
+    state.window.request_redraw();
+    true
+}
+
+/// Alternate scroll (DECSET 1007): in the alternate screen, translate wheel
+/// lines into Up/Down cursor keys so `less`, `vim` & co. scroll without mouse
+/// reporting. Returns true if the event was consumed.
+pub fn handle_alternate_scroll(state: &mut WindowState, lines_y: i32) -> bool {
+    if lines_y == 0 {
+        return false;
+    }
+    let tab_id = state.gpu.tab_bar.active_tab_id();
+    let Some(tab_id) = tab_id else { return false };
+    let Some(shell) = state.shells.get_mut(&tab_id) else {
+        return false;
+    };
+    if !alternate_scroll_active(shell) || should_report_mouse(shell) {
+        return false;
+    }
+
+    let app_cursor = shell.terminal().mode().contains(TermMode::APP_CURSOR);
+    let seq: &[u8] = match (lines_y > 0, app_cursor) {
+        (true, false) => b"\x1b[A",
+        (true, true) => b"\x1bOA",
+        (false, false) => b"\x1b[B",
+        (false, true) => b"\x1bOB",
+    };
+    let count = lines_y.abs().min(MAX_SCROLL_REPORTS_PER_EVENT) as usize;
+    let bytes = seq.repeat(count);
+    shell.send_input(&bytes);
+
+    state.text_rebuild.insert(tab_id);
+    state.render.dirty = true;
+    state.window.request_redraw();
+    true
 }
 
 /// Clear terminal selection (e.g., when user types or presses Escape)
@@ -1257,7 +1470,9 @@ pub fn get_clipboard_content() -> Option<String> {
         return Some(text);
     }
 
-    // Try to get file paths (files copied from Finder/Explorer)
+    // Try to get file paths (files copied from Finder). The clipboard-files
+    // crate needs GTK on Linux, so this path is macOS-only.
+    #[cfg(target_os = "macos")]
     if let Ok(files) = clipboard_files::read()
         && !files.is_empty()
     {
@@ -1333,10 +1548,46 @@ pub fn set_clipboard_content(text: &str) {
     }
 }
 
+/// Sanitize clipboard text before sending it to the PTY.
+///
+/// - The bracketed-paste terminator `ESC [ 2 0 1 ~` is removed so pasted
+///   text can't end the paste early and inject commands.
+/// - All other control characters (C0, DEL, C1) are dropped, except `\t`,
+///   `\r` and `\n`.
+/// - When bracketed paste is *not* enabled, `\r\n` and `\n` become `\r`
+///   (the shell's line terminator); under bracketed paste newlines are kept
+///   verbatim for the application to interpret.
+pub fn sanitize_paste(content: &str, bracketed: bool) -> String {
+    let stripped: Cow<str> = if content.contains("\x1b[201~") {
+        Cow::Owned(content.replace("\x1b[201~", ""))
+    } else {
+        Cow::Borrowed(content)
+    };
+
+    let mut out = String::with_capacity(stripped.len());
+    let mut chars = stripped.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                if !bracketed && chars.peek() == Some(&'\n') {
+                    chars.next(); // fold CRLF into CR
+                }
+                out.push('\r');
+            }
+            '\n' => out.push(if bracketed { '\n' } else { '\r' }),
+            '\t' => out.push('\t'),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Paste content to terminal with bracketed paste mode support
 ///
 /// If the terminal has bracketed paste mode enabled, the content will be
-/// wrapped with escape sequences to indicate a paste operation.
+/// wrapped with escape sequences to indicate a paste operation. Content is
+/// sanitized first (see [`sanitize_paste`]).
 pub fn paste_to_terminal(state: &mut WindowState, content: &str) {
     let tab_id = state.gpu.tab_bar.active_tab_id();
     let Some(tab_id) = tab_id else { return };
@@ -1344,50 +1595,38 @@ pub fn paste_to_terminal(state: &mut WindowState, content: &str) {
         return;
     };
 
-    log::info!("=== PASTE START ===");
-    log::info!("Paste content length: {} bytes", content.len());
-    // Use chars().take() to safely handle multi-byte UTF-8 characters
-    let preview: String = content.chars().take(50).collect();
-    log::info!("Paste content preview: {:?}", preview);
-
     // Check if bracketed paste mode is enabled
     let bracketed = shell.bracketed_paste_enabled();
-    log::info!("Bracketed paste mode: {}", bracketed);
-
-    // Log cursor position before paste
-    let cursor_before = shell.terminal().cursor();
-    log::info!(
-        "Cursor before paste: line={}, col={}",
-        cursor_before.point.line.0,
-        cursor_before.point.column.0
+    let sanitized = sanitize_paste(content, bracketed);
+    log::debug!(
+        "Paste: {} bytes ({} after sanitizing), bracketed={}",
+        content.len(),
+        sanitized.len(),
+        bracketed
     );
 
     if bracketed {
         // Bracketed paste mode: wrap with escape sequences
         shell.send_input(b"\x1b[200~");
-        shell.send_input(content.as_bytes());
+        shell.send_input(sanitized.as_bytes());
         shell.send_input(b"\x1b[201~");
     } else {
-        shell.send_input(content.as_bytes());
+        shell.send_input(sanitized.as_bytes());
     }
 
     // Scroll to bottom and clear selection
     if shell.is_scrolled_back() {
         shell.scroll_to_bottom();
-        log::info!("Scrolled to bottom");
     }
     clear_terminal_selection(state);
-    log::info!("Selection cleared");
 
     // Always invalidate content hash when pasting to ensure re-render
     // even if PTY output hasn't arrived yet (fixes paste rendering artifacts)
-    state.content_hashes.insert(tab_id, 0);
+    state.text_rebuild.insert(tab_id);
     state.render.dirty = true;
     // Mark paste pending so renderer can normalize INVERSE flags
     // (zsh enables INVERSE mid-line for paste highlighting, creating visual discontinuity)
-    state.render.paste_pending = true;
     state.window.request_redraw();
-    log::info!("=== PASTE END (hash invalidated, paste_pending=true, redraw requested) ===");
 }
 
 /// Scroll terminal to make current search match visible
@@ -1429,13 +1668,87 @@ pub fn scroll_to_current_match(state: &mut WindowState) {
         if scroll_delta != 0 {
             shell.scroll(Scroll::Delta(scroll_delta));
             if let Some(tab_id) = active_tab_id {
-                state.content_hashes.insert(tab_id, 0);
+                state.text_rebuild.insert(tab_id);
             }
         }
     }
 }
 
+/// Case-fold a single grid cell character to one character, so folded text
+/// stays column-aligned with the grid (`to_lowercase` may expand some
+/// characters to several; we keep only the first).
+fn fold_char(c: char) -> char {
+    c.to_lowercase().next().unwrap_or(c)
+}
+
+/// Find every (start, end) *character column* span in `line` (already
+/// case-folded) matching `query` (already case-folded). Overlapping matches
+/// are reported, as before.
+pub fn find_matches_in_chars(line: &[char], query: &[char]) -> Vec<(usize, usize)> {
+    let mut matches = Vec::new();
+    if query.is_empty() || line.len() < query.len() {
+        return matches;
+    }
+    let mut start = 0;
+    while start + query.len() <= line.len() {
+        if line[start..start + query.len()] == *query {
+            matches.push((start, start + query.len()));
+        }
+        start += 1;
+    }
+    matches
+}
+
+/// Per-tab cache of case-folded terminal lines for incremental search.
+///
+/// Folding every line on each keystroke is the expensive part of
+/// `update_search_matches`; lines whose text is unchanged since the last
+/// query reuse their folded form.
+struct SearchLineCache {
+    tab_id: TabId,
+    /// (grid line index, original text, case-folded chars)
+    lines: Vec<(i32, String, Vec<char>)>,
+}
+
+impl SearchLineCache {
+    fn new(tab_id: TabId) -> Self {
+        Self {
+            tab_id,
+            lines: Vec::new(),
+        }
+    }
+
+    /// Bring the cache in line with `fresh`, re-folding only changed lines.
+    fn refresh(&mut self, fresh: Vec<(i32, String)>) {
+        let old = std::mem::take(&mut self.lines);
+        let mut old_iter = old.into_iter();
+        self.lines.reserve(fresh.len());
+        for (idx, text) in fresh {
+            let reused = match old_iter.next() {
+                Some((old_idx, old_text, folded)) if old_idx == idx && old_text == text => {
+                    Some(folded)
+                }
+                _ => None,
+            };
+            let folded = reused.unwrap_or_else(|| text.chars().map(fold_char).collect());
+            self.lines.push((idx, text, folded));
+        }
+    }
+}
+
+thread_local! {
+    static SEARCH_CACHE: RefCell<Option<SearchLineCache>> = const { RefCell::new(None) };
+}
+
+/// Drop the cached folded lines (call when search closes).
+pub fn clear_search_cache() {
+    SEARCH_CACHE.with(|c| *c.borrow_mut() = None);
+}
+
 /// Update search matches based on current query
+///
+/// Matches are case-insensitive and stored as *character columns* (not byte
+/// offsets), so non-ASCII text lines up with the grid.
 pub fn update_search_matches(state: &mut WindowState) {
     use crate::window::SearchMatch;
 
@@ -1446,32 +1759,37 @@ pub fn update_search_matches(state: &mut WindowState) {
     if query.is_empty() {
         return;
     }
+    let query_chars: Vec<char> = query.chars().map(fold_char).collect();
 
     // Get active shell's terminal content
     let active_tab_id = state.gpu.tab_bar.active_tab_id();
-    let shell = active_tab_id.and_then(|id| state.shells.get(&id));
-    let Some(shell) = shell else { return };
-
-    let terminal = shell.terminal();
+    let Some(tab_id) = active_tab_id else { return };
+    let Some(shell) = state.shells.get(&tab_id) else {
+        return;
+    };
 
     // Get all lines including history
-    let all_lines = terminal.all_lines_text();
+    let fresh = shell.terminal().all_lines_text();
 
-    // Search each line for the query (case-insensitive)
-    let query_lower = query.to_lowercase();
-    for (line_idx, line_text) in &all_lines {
-        let line_lower = line_text.to_lowercase();
-        let mut start = 0;
-        while let Some(pos) = line_lower[start..].find(&query_lower) {
-            let match_start = start + pos;
-            state.ui.search.matches.push(SearchMatch {
-                line: *line_idx,
-                start_col: match_start,
-                end_col: match_start + query.len(),
-            });
-            start = match_start + 1;
+    let mut matches = Vec::new();
+    SEARCH_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let entry = match cache.as_mut() {
+            Some(entry) if entry.tab_id == tab_id => entry,
+            _ => cache.insert(SearchLineCache::new(tab_id)),
+        };
+        entry.refresh(fresh);
+        for (line_idx, _, folded) in &entry.lines {
+            for (start_col, end_col) in find_matches_in_chars(folded, &query_chars) {
+                matches.push(SearchMatch {
+                    line: *line_idx,
+                    start_col,
+                    end_col,
+                });
+            }
         }
-    }
+    });
+    state.ui.search.matches = matches;
 
     // Scroll to first match if any found
     if !state.ui.search.matches.is_empty() {
@@ -1571,29 +1889,38 @@ mod tests {
     fn detect_url_with_query_and_fragment() {
         let urls = detect_urls_in_line("https://example.com/path?q=hello&lang=en#section", 0);
         assert_eq!(urls.len(), 1);
-        assert_eq!(urls[0].url, "https://example.com/path?q=hello&lang=en#section");
+        assert_eq!(
+            urls[0].url,
+            "https://example.com/path?q=hello&lang=en#section"
+        );
     }
 
     #[test]
     fn detect_url_trims_trailing_sentence_punctuation() {
-        let urls = detect_urls_in_line("see https://example.com/path.", 0);
+        let urls = detect_urls("see https://example.com/path.", 0);
         assert_eq!(urls.len(), 1);
         assert_eq!(urls[0].url, "https://example.com/path");
         // end_col must shrink with the trimmed text so hit-testing still lines up.
-        assert_eq!(urls[0].end_col, urls[0].start_col + "https://example.com/path".len());
+        assert_eq!(
+            urls[0].end_col,
+            urls[0].start_col + "https://example.com/path".len()
+        );
+        // The raw per-line detector leaves the trim to merge_wrapped_urls.
+        let raw = detect_urls_in_line("see https://example.com/path.", 0);
+        assert_eq!(raw[0].url, "https://example.com/path.");
     }
 
     #[test]
     fn detect_url_trims_multiple_trailing_punctuation() {
         // Wrapped in parens and followed by a comma: "(https://example.com),"
-        let urls = detect_urls_in_line("(https://example.com),", 0);
+        let urls = detect_urls("(https://example.com),", 0);
         assert_eq!(urls.len(), 1);
         assert_eq!(urls[0].url, "https://example.com");
     }
 
     #[test]
     fn detect_url_keeps_balanced_trailing_paren() {
-        let urls = detect_urls_in_line(
+        let urls = detect_urls(
             "https://en.wikipedia.org/wiki/Rust_(programming_language)",
             0,
         );
@@ -1607,14 +1934,14 @@ mod tests {
     #[test]
     fn detect_url_drops_unbalanced_trailing_paren_keeps_inner() {
         // Inner balanced paren kept; the extra wrapping ')' dropped.
-        let urls = detect_urls_in_line("(https://ex.com/a_(b)_c)", 0);
+        let urls = detect_urls("(https://ex.com/a_(b)_c)", 0);
         assert_eq!(urls.len(), 1);
         assert_eq!(urls[0].url, "https://ex.com/a_(b)_c");
     }
 
     #[test]
     fn detect_www_trims_trailing_period() {
-        let urls = detect_urls_in_line("go to www.example.com/page.", 0);
+        let urls = detect_urls("go to www.example.com/page.", 0);
         assert_eq!(urls.len(), 1);
         assert_eq!(urls[0].url, "www.example.com/page");
     }
@@ -1780,7 +2107,10 @@ mod tests {
         assert_eq!(paths[0].path, "/Users/me/My Docs/file.txt");
         // ...but the underline span covers the on-screen token (with backslashes).
         let on_screen = r"/Users/me/My\ Docs/file.txt";
-        assert_eq!(paths[0].end_col - paths[0].start_col, on_screen.chars().count());
+        assert_eq!(
+            paths[0].end_col - paths[0].start_col,
+            on_screen.chars().count()
+        );
     }
 
     #[test]
@@ -1831,7 +2161,10 @@ mod tests {
     fn parse_path_suffix_variants() {
         assert_eq!(parse_path_suffix("src/a.rs"), ("src/a.rs", None, None));
         assert_eq!(parse_path_suffix("src/a.rs:5"), ("src/a.rs", Some(5), None));
-        assert_eq!(parse_path_suffix("src/a.rs:5:9"), ("src/a.rs", Some(5), Some(9)));
+        assert_eq!(
+            parse_path_suffix("src/a.rs:5:9"),
+            ("src/a.rs", Some(5), Some(9))
+        );
         assert_eq!(parse_path_suffix("a:b"), ("a:b", None, None));
     }
 
@@ -2044,11 +2377,8 @@ mod tests {
     fn validate_follows_valid_symlink() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("target.txt"), b"x").unwrap();
-        std::os::unix::fs::symlink(
-            dir.path().join("target.txt"),
-            dir.path().join("link.txt"),
-        )
-        .unwrap();
+        std::os::unix::fs::symlink(dir.path().join("target.txt"), dir.path().join("link.txt"))
+            .unwrap();
         let mut p = dp("link.txt");
         let mut validator = PathValidator::default();
         validator.begin_pass(Some(dir.path().to_path_buf()), None);
@@ -2104,7 +2434,8 @@ mod tests {
     #[test]
     fn build_open_command_with_line_and_col() {
         let (_prog, args) =
-            build_open_command("code -g {file}:{line}:{col}", "/a/b.rs", Some(42), Some(7)).unwrap();
+            build_open_command("code -g {file}:{line}:{col}", "/a/b.rs", Some(42), Some(7))
+                .unwrap();
         assert_eq!(args, vec!["-g".to_string(), "/a/b.rs:42:7".to_string()]);
     }
 
@@ -2117,7 +2448,8 @@ mod tests {
 
     #[test]
     fn build_open_command_path_with_spaces_stays_one_arg() {
-        let (_prog, args) = build_open_command("code -g {file}", "/a b/c d.rs", None, None).unwrap();
+        let (_prog, args) =
+            build_open_command("code -g {file}", "/a b/c d.rs", None, None).unwrap();
         assert_eq!(args, vec!["-g".to_string(), "/a b/c d.rs".to_string()]);
     }
 
@@ -2204,6 +2536,37 @@ mod tests {
     }
 
     #[test]
+    fn merge_wrapped_urls_keeps_period_at_wrap_boundary() {
+        // "https://example.com/foo." wraps at column 24; the '.' is part of
+        // the URL ("foo.bar"), so trimming must happen only after merging.
+        let line0 = "https://example.com/foo.";
+        let line1 = "bar";
+        let mut urls = detect_urls_in_line(line0, 0);
+        let mut lines = std::collections::BTreeMap::new();
+        lines.insert(0, line0.to_string());
+        lines.insert(1, line1.to_string());
+        merge_wrapped_urls(&mut urls, &lines, line0.len());
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].url, "https://example.com/foo.bar");
+        assert_eq!(urls[0].end_line, 1);
+        assert_eq!(urls[0].end_col, 3);
+    }
+
+    #[test]
+    fn merge_wrapped_urls_trims_after_merge() {
+        // Punctuation at the end of the continuation line is trimmed once.
+        let line0 = "https://example.com/foo/";
+        let line1 = "bar).";
+        let mut urls = detect_urls_in_line(line0, 0);
+        let mut lines = std::collections::BTreeMap::new();
+        lines.insert(0, line0.to_string());
+        lines.insert(1, line1.to_string());
+        merge_wrapped_urls(&mut urls, &lines, line0.len());
+        assert_eq!(urls[0].url, "https://example.com/foo/bar");
+        assert_eq!(urls[0].end_col, 3);
+    }
+
+    #[test]
     fn merge_wrapped_urls_stops_at_new_protocol() {
         let line0 = "https://example.com/";
         let line1 = "https://other.com";
@@ -2214,5 +2577,112 @@ mod tests {
         merge_wrapped_urls(&mut urls, &lines, 20);
         // Should NOT merge — next line starts with https://
         assert_eq!(urls[0].end_line, 0);
+    }
+
+    // ── Paste sanitizing (B13) ─────────────────────────────────────
+
+    #[test]
+    fn sanitize_paste_strips_bracketed_paste_terminator() {
+        let s = sanitize_paste("echo hi\x1b[201~; rm -rf /", true);
+        assert_eq!(s, "echo hi; rm -rf /");
+    }
+
+    #[test]
+    fn sanitize_paste_strips_control_chars_but_keeps_tab_cr_lf() {
+        let s = sanitize_paste("a\x00b\x07c\td\x7fe\u{9b}f", true);
+        assert_eq!(s, "abc\tdef");
+        // A bare ESC (which could start a sequence) is dropped too.
+        assert_eq!(sanitize_paste("x\x1b[Ay", true), "x[Ay");
+    }
+
+    #[test]
+    fn sanitize_paste_bracketed_keeps_newlines() {
+        assert_eq!(sanitize_paste("a\r\nb\nc", true), "a\r\nb\nc");
+    }
+
+    #[test]
+    fn sanitize_paste_unbracketed_converts_newlines_to_cr() {
+        assert_eq!(sanitize_paste("a\r\nb\nc\r", false), "a\rb\rc\r");
+    }
+
+    #[test]
+    fn sanitize_paste_keeps_unicode() {
+        assert_eq!(sanitize_paste("héllo 🌍 日本", false), "héllo 🌍 日本");
+    }
+
+    // ── Search (B14) ───────────────────────────────────────────────
+
+    fn folded(s: &str) -> Vec<char> {
+        s.chars().map(fold_char).collect()
+    }
+
+    #[test]
+    fn search_matches_are_char_columns_with_non_ascii() {
+        // "café" is 5 bytes but 4 chars; a match after it must use char columns.
+        let line = folded("café résumé CAFÉ");
+        let m = find_matches_in_chars(&line, &folded("café"));
+        assert_eq!(m, vec![(0, 4), (12, 16)]);
+        let m = find_matches_in_chars(&line, &folded("É"));
+        assert_eq!(m, vec![(3, 4), (6, 7), (10, 11), (15, 16)]);
+    }
+
+    #[test]
+    fn search_matches_cjk() {
+        let line = folded("abc 日本語 def 日本");
+        let m = find_matches_in_chars(&line, &folded("日本"));
+        assert_eq!(m, vec![(4, 6), (12, 14)]);
+        let m = find_matches_in_chars(&line, &folded("語 d"));
+        assert_eq!(m, vec![(6, 9)]);
+    }
+
+    #[test]
+    fn search_overlapping_and_empty() {
+        let line = folded("aaaa");
+        assert_eq!(
+            find_matches_in_chars(&line, &folded("aa")),
+            vec![(0, 2), (1, 3), (2, 4)]
+        );
+        assert!(find_matches_in_chars(&line, &folded("")).is_empty());
+        assert!(find_matches_in_chars(&line, &folded("aaaaa")).is_empty());
+    }
+
+    #[test]
+    fn search_cache_reuses_unchanged_lines() {
+        let mut cache = SearchLineCache::new(1);
+        cache.refresh(vec![(-1, "Hello".into()), (0, "Wörld".into())]);
+        assert_eq!(cache.lines[1].2, folded("wörld"));
+        let before = cache.lines[0].2.as_ptr();
+        // Same content → folded buffer reused (same allocation).
+        cache.refresh(vec![(-1, "Hello".into()), (0, "Wörld".into())]);
+        assert_eq!(cache.lines[0].2.as_ptr(), before);
+        // Changed content → re-folded.
+        cache.refresh(vec![(-1, "Hello".into()), (0, "NEW".into())]);
+        assert_eq!(cache.lines[1].2, folded("new"));
+        assert_eq!(cache.lines.len(), 2);
+    }
+
+    // ── Mouse modifier bits (B15) ──────────────────────────────────
+
+    #[test]
+    fn mouse_modifier_bits_follow_xterm() {
+        assert_eq!(mouse_modifier_bits(ModifiersState::empty()), 0);
+        assert_eq!(mouse_modifier_bits(ModifiersState::SHIFT), 4);
+        assert_eq!(mouse_modifier_bits(ModifiersState::ALT), 8);
+        assert_eq!(mouse_modifier_bits(ModifiersState::CONTROL), 16);
+        assert_eq!(
+            mouse_modifier_bits(ModifiersState::CONTROL | ModifiersState::ALT),
+            24
+        );
+        // Ctrl+wheel-up in SGR mode: 64 + 16
+        let seq = mouse_report(MOUSE_BUTTON_SCROLL_UP | 16, 0, 0, true, true);
+        assert_eq!(String::from_utf8(seq).unwrap(), "\x1b[<80;1;1M");
+    }
+
+    #[test]
+    fn mouse_report_horizontal_wheel_buttons() {
+        let left = mouse_report(MOUSE_BUTTON_SCROLL_LEFT, 0, 0, true, true);
+        assert_eq!(String::from_utf8(left).unwrap(), "\x1b[<66;1;1M");
+        let right = mouse_report(MOUSE_BUTTON_SCROLL_RIGHT, 0, 0, true, true);
+        assert_eq!(String::from_utf8(right).unwrap(), "\x1b[<67;1;1M");
     }
 }

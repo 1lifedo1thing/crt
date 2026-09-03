@@ -3,24 +3,59 @@
 //! Handles spawning shell processes and I/O between the shell and terminal.
 
 use std::io::{Read, Write};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
 use portable_pty::{Child, CommandBuilder, PtySize, native_pty_system};
 use std::path::PathBuf;
 
+/// Callback invoked from the PTY reader thread after output has been queued.
+///
+/// The application uses this to wake its event loop so it can drain output
+/// without polling. It must be cheap and must not block.
+pub type WakeFn = Arc<dyn Fn() + Send + Sync>;
+
 /// Options for spawning a shell with semantic prompt support
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct SpawnOptions {
     /// Shell program to run (None = use $SHELL or /bin/sh)
     pub shell: Option<String>,
+    /// Explicit arguments for the shell. When non-empty they are passed
+    /// verbatim and replace the default `-l` login flag and any semantic
+    /// prompt integration flags.
+    pub args: Vec<String>,
     /// Working directory (None = use home directory)
     pub cwd: Option<PathBuf>,
     /// Enable semantic prompts (OSC 133) via shell integration scripts
     pub semantic_prompts: bool,
     /// Path to shell integration assets directory
     pub shell_assets_dir: Option<PathBuf>,
+    /// Called from the reader thread whenever new output is available
+    pub wake: Option<WakeFn>,
 }
+
+impl std::fmt::Debug for SpawnOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpawnOptions")
+            .field("shell", &self.shell)
+            .field("args", &self.args)
+            .field("cwd", &self.cwd)
+            .field("semantic_prompts", &self.semantic_prompts)
+            .field("shell_assets_dir", &self.shell_assets_dir)
+            .field("wake", &self.wake.as_ref().map(|_| "<fn>"))
+            .finish()
+    }
+}
+
+/// Maximum number of unread output chunks queued per PTY before the reader
+/// thread blocks. Bounding the queue applies back-pressure to a runaway child
+/// (it blocks on `write(2)`) instead of growing the heap without limit while
+/// a tab is in the background.
+const OUTPUT_QUEUE_DEPTH: usize = 64;
+
+/// Bytes read per `read(2)` on the PTY master.
+const READ_BUF_SIZE: usize = 64 * 1024;
 
 /// Messages sent to the PTY writer thread
 pub enum PtyInput {
@@ -73,9 +108,10 @@ pub struct Pty {
 fn spawn_pty_threads(
     pair: portable_pty::PtyPair,
     child: Box<dyn portable_pty::Child + Send + Sync>,
+    wake: Option<WakeFn>,
 ) -> anyhow::Result<Pty> {
     let (input_tx, input_rx) = mpsc::channel::<PtyInput>();
-    let (output_tx, output_rx) = mpsc::channel::<Vec<u8>>();
+    let (output_tx, output_rx) = mpsc::sync_channel::<Vec<u8>>(OUTPUT_QUEUE_DEPTH);
     let (recycle_tx, recycle_rx) = mpsc::channel::<Vec<u8>>();
 
     let mut reader = pair.master.try_clone_reader()?;
@@ -84,8 +120,6 @@ fn spawn_pty_threads(
     // Spawn reader thread — reads PTY output and sends to channel.
     // Recycles buffers returned by the consumer to avoid per-read allocations.
     thread::spawn(move || {
-        const READ_BUF_SIZE: usize = 4096;
-
         loop {
             // Try to reuse a recycled buffer, or allocate a new one
             let mut buf = recycle_rx
@@ -99,6 +133,9 @@ fn spawn_pty_threads(
                     buf.truncate(n);
                     if output_tx.send(buf).is_err() {
                         break;
+                    }
+                    if let Some(wake) = &wake {
+                        wake();
                     }
                 }
                 Err(e) => {
@@ -190,6 +227,20 @@ impl Pty {
             cmd.cwd(dir);
         }
 
+        // Explicit args replace the default login flag and integration flags:
+        // a custom command line (or a non-shell program) should run exactly
+        // as configured, not with `-l` or rcfile flags appended to it.
+        if !options.args.is_empty() {
+            if options.semantic_prompts {
+                log::warn!("shell.args is set; skipping semantic prompt integration flags");
+            }
+            for arg in &options.args {
+                cmd.arg(arg);
+            }
+            let child = pair.slave.spawn_command(cmd)?;
+            return spawn_pty_threads(pair, child, options.wake);
+        }
+
         // Apply semantic prompt integration based on shell type
         if options.semantic_prompts {
             if let Some(assets_dir) = options.shell_assets_dir {
@@ -243,7 +294,7 @@ impl Pty {
         }
 
         let child = pair.slave.spawn_command(cmd)?;
-        spawn_pty_threads(pair, child)
+        spawn_pty_threads(pair, child, options.wake)
     }
 
     /// Spawn a new shell in a PTY with a specific working directory
@@ -284,7 +335,7 @@ impl Pty {
             cmd.cwd(dir);
         }
         let child = pair.slave.spawn_command(cmd)?;
-        spawn_pty_threads(pair, child)
+        spawn_pty_threads(pair, child, None)
     }
 
     /// Get the process ID of the shell
@@ -369,12 +420,66 @@ impl Drop for Pty {
     }
 }
 
-/// Get the current working directory of a process by PID
+/// Get the current working directory of a process by PID.
+///
+/// Uses `proc_pidinfo(PROC_PIDVNODEPATHINFO)` from libproc, which is a single
+/// syscall; forking `lsof` is kept only as a fallback.
 #[cfg(target_os = "macos")]
 fn get_process_cwd(pid: u32) -> Option<PathBuf> {
+    get_process_cwd_libproc(pid).or_else(|| get_process_cwd_lsof(pid))
+}
+
+#[cfg(target_os = "macos")]
+fn get_process_cwd_libproc(pid: u32) -> Option<PathBuf> {
+    use std::ffi::CStr;
+    use std::os::raw::{c_int, c_void};
+    use std::os::unix::ffi::OsStrExt;
+
+    // From <sys/proc_info.h>: struct proc_vnodepathinfo { vnode_info_path pvi_cdir, pvi_rdir; }
+    // vnode_info_path = { vnode_info (152 bytes) ; char vip_path[MAXPATHLEN = 1024] }.
+    const PROC_PIDVNODEPATHINFO: c_int = 9;
+    const VNODE_INFO_SIZE: usize = 152;
+    const MAXPATHLEN: usize = 1024;
+    const VNODE_INFO_PATH_SIZE: usize = VNODE_INFO_SIZE + MAXPATHLEN;
+    const PROC_VNODEPATHINFO_SIZE: usize = 2 * VNODE_INFO_PATH_SIZE;
+
+    unsafe extern "C" {
+        fn proc_pidinfo(
+            pid: c_int,
+            flavor: c_int,
+            arg: u64,
+            buffer: *mut c_void,
+            buffersize: c_int,
+        ) -> c_int;
+    }
+
+    let mut buf = vec![0u8; PROC_VNODEPATHINFO_SIZE];
+    // SAFETY: buffer is sized to the struct the flavor fills; the kernel
+    // writes at most `buffersize` bytes.
+    let written = unsafe {
+        proc_pidinfo(
+            pid as c_int,
+            PROC_PIDVNODEPATHINFO,
+            0,
+            buf.as_mut_ptr() as *mut c_void,
+            PROC_VNODEPATHINFO_SIZE as c_int,
+        )
+    };
+    if written as usize != PROC_VNODEPATHINFO_SIZE {
+        return None;
+    }
+    let path_bytes = &buf[VNODE_INFO_SIZE..VNODE_INFO_SIZE + MAXPATHLEN];
+    let cstr = CStr::from_bytes_until_nul(path_bytes).ok()?;
+    if cstr.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(cstr.to_bytes())))
+}
+
+#[cfg(target_os = "macos")]
+fn get_process_cwd_lsof(pid: u32) -> Option<PathBuf> {
     use std::process::Command;
 
-    // Use lsof to get the current working directory of the process
     // lsof -p PID -a -d cwd -Fn outputs the cwd in a parseable format
     let output = Command::new("lsof")
         .args(["-p", &pid.to_string(), "-a", "-d", "cwd", "-Fn"])
