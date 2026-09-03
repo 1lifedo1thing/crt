@@ -75,7 +75,7 @@ impl WindowState {
                 .background_image_state
                 .as_ref()
                 .is_some_and(|bg| bg.image.is_animated())
-            || gpu.crt_pipeline.is_enabled()
+            || gpu.crt_pipeline.is_animated()
             || self.ui.bell.is_active()
             || self.ui.overrides.has_active()
             || self.ui.zoom_indicator.is_visible()

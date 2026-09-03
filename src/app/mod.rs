@@ -175,6 +175,7 @@ impl App {
     pub(crate) fn spawn_options(&self, cwd: Option<std::path::PathBuf>) -> SpawnOptions {
         SpawnOptions {
             shell: self.config.shell.program.clone(),
+            args: self.config.shell.args.clone(),
             cwd,
             semantic_prompts: self.config.shell.semantic_prompts,
             shell_assets_dir: Config::shell_assets_dir(),

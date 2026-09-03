@@ -21,6 +21,10 @@ pub type WakeFn = Arc<dyn Fn() + Send + Sync>;
 pub struct SpawnOptions {
     /// Shell program to run (None = use $SHELL or /bin/sh)
     pub shell: Option<String>,
+    /// Explicit arguments for the shell. When non-empty they are passed
+    /// verbatim and replace the default `-l` login flag and any semantic
+    /// prompt integration flags.
+    pub args: Vec<String>,
     /// Working directory (None = use home directory)
     pub cwd: Option<PathBuf>,
     /// Enable semantic prompts (OSC 133) via shell integration scripts
@@ -35,6 +39,7 @@ impl std::fmt::Debug for SpawnOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SpawnOptions")
             .field("shell", &self.shell)
+            .field("args", &self.args)
             .field("cwd", &self.cwd)
             .field("semantic_prompts", &self.semantic_prompts)
             .field("shell_assets_dir", &self.shell_assets_dir)
@@ -220,6 +225,20 @@ impl Pty {
         // Set working directory if specified
         if let Some(dir) = options.cwd {
             cmd.cwd(dir);
+        }
+
+        // Explicit args replace the default login flag and integration flags:
+        // a custom command line (or a non-shell program) should run exactly
+        // as configured, not with `-l` or rcfile flags appended to it.
+        if !options.args.is_empty() {
+            if options.semantic_prompts {
+                log::warn!("shell.args is set; skipping semantic prompt integration flags");
+            }
+            for arg in &options.args {
+                cmd.arg(arg);
+            }
+            let child = pair.slave.spawn_command(cmd)?;
+            return spawn_pty_threads(pair, child, options.wake);
         }
 
         // Apply semantic prompt integration based on shell type

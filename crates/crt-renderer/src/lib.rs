@@ -614,6 +614,15 @@ impl CrtPipeline {
         self.enabled
     }
 
+    /// Whether the effect's output changes over time.
+    ///
+    /// `time` only feeds the flicker term in the shader, so with flicker at
+    /// zero the pass is a pure function of its input and needs no frames of
+    /// its own — the event loop can sleep.
+    pub fn is_animated(&self) -> bool {
+        self.enabled && self.params.flicker > 0.001
+    }
+
     pub fn create_bind_group(
         &self,
         device: &wgpu::Device,
