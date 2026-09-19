@@ -184,8 +184,13 @@ impl EffectsRenderer {
     /// pending change (configure/patch/resize) still has to be rendered.
     /// The event loop can sleep instead of scheduling frames when this is
     /// `false`.
+    ///
+    /// Only enabled effects count: `needs_render` is cleared by `render()`,
+    /// which never runs while no effect is enabled, so without this guard a
+    /// theme with no backdrop effects would keep the event loop redrawing
+    /// forever.
     pub fn is_animating(&self) -> bool {
-        self.needs_render || any_animated(&self.effects)
+        self.has_enabled_effects() && (self.needs_render || any_animated(&self.effects))
     }
 
     /// Whether the next `render()` call will re-render the vello scene

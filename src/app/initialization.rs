@@ -148,6 +148,17 @@ impl App {
         tab_title_renderer.set_glyph_cache(&shared.device, &tab_glyph_cache);
         tab_title_renderer.update_screen_size(&shared.queue, size.width as f32, size.height as f32);
 
+        // Transient UI text (dialogs, context menu, indicators) gets its own
+        // renderer so it never disturbs the persistent tab-title instances.
+        let mut overlay_text_renderer =
+            GridRenderer::new_with_shared(&shared.device, &pipelines.grid);
+        overlay_text_renderer.set_glyph_cache(&shared.device, &tab_glyph_cache);
+        overlay_text_renderer.update_screen_size(
+            &shared.queue,
+            size.width as f32,
+            size.height as f32,
+        );
+
         // Effect pipeline for background rendering - get theme from registry
         let (theme_name, theme) = self.theme_registry.get_default_theme();
         let mut effect_pipeline = crt_renderer::EffectPipeline::new_with_shared(
@@ -280,6 +291,8 @@ impl App {
             tab_glyph_cache,
             tab_title_renderer,
             tab_titles_version: None,
+            tab_titles_instances: 0,
+            overlay_text_renderer,
             arena,
             effect_pipeline,
             effects_renderer,
@@ -467,10 +480,14 @@ pub(crate) fn handle_scale_factor_change(
     tab_glyph_cache.precache_ascii();
     tab_glyph_cache.flush(&shared.queue);
 
-    // Update tab title renderer with new glyph cache
+    // Update tab title and overlay text renderers with new glyph cache
     state
         .gpu
         .tab_title_renderer
+        .set_glyph_cache(&shared.device, &tab_glyph_cache);
+    state
+        .gpu
+        .overlay_text_renderer
         .set_glyph_cache(&shared.device, &tab_glyph_cache);
 
     state.gpu.tab_glyph_cache = tab_glyph_cache;

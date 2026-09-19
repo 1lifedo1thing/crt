@@ -27,7 +27,7 @@ use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crt_core::{Column, Line, Point, SelectionType, ShellTerminal, TermMode};
@@ -1130,6 +1130,11 @@ pub fn handle_resize(
         new_width as f32,
         new_height as f32,
     );
+    state.gpu.overlay_text_renderer.update_screen_size(
+        &shared.queue,
+        new_width as f32,
+        new_height as f32,
+    );
 
     state
         .gpu
@@ -1461,7 +1466,8 @@ pub fn get_terminal_selection_text(state: &WindowState) -> Option<String> {
 ///
 /// This allows pasting images into applications like Claude Code that accept file paths.
 pub fn get_clipboard_content() -> Option<String> {
-    let mut clipboard = arboard::Clipboard::new().ok()?;
+    let mut guard = clipboard_handle();
+    let clipboard = guard.as_mut()?;
 
     // First try to get text (most common case)
     if let Ok(text) = clipboard.get_text()
@@ -1543,9 +1549,34 @@ fn save_clipboard_image_to_temp(image_data: &arboard::ImageData) -> Option<Strin
 
 /// Set clipboard content
 pub fn set_clipboard_content(text: &str) {
-    if let Ok(mut clipboard) = arboard::Clipboard::new() {
-        let _ = clipboard.set_text(text.to_string());
+    if let Some(clipboard) = clipboard_handle().as_mut()
+        && let Err(e) = clipboard.set_text(text.to_string())
+    {
+        log::warn!("Failed to set clipboard contents: {}", e);
     }
+}
+
+/// The process-wide clipboard handle, created on first use.
+///
+/// On X11 (and Wayland) the process *is* the clipboard owner: the contents
+/// are served from a thread that lives as long as the `arboard::Clipboard`
+/// does, so a handle created per call and dropped immediately loses the
+/// copied text before any other application can request it. One long-lived
+/// handle keeps the data available; macOS and Windows are unaffected either
+/// way. If the clipboard cannot be opened (no display), the slot stays
+/// `None` and copy/paste become no-ops.
+fn clipboard_handle() -> std::sync::MutexGuard<'static, Option<arboard::Clipboard>> {
+    static CLIPBOARD: Mutex<Option<arboard::Clipboard>> = Mutex::new(None);
+    let mut guard = CLIPBOARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.is_none() {
+        match arboard::Clipboard::new() {
+            Ok(clipboard) => *guard = Some(clipboard),
+            Err(e) => log::warn!("Clipboard unavailable: {}", e),
+        }
+    }
+    guard
 }
 
 /// Sanitize clipboard text before sending it to the PTY.

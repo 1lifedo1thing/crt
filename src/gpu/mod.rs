@@ -158,11 +158,19 @@ pub struct WindowGpuState {
 
     // Fixed-size glyph cache for tab titles (doesn't scale with zoom)
     pub tab_glyph_cache: GlyphCache,
-    // Renderer for tab titles (owned buffer; rebuilt when the tab bar's
-    // titles_version changes) and, transiently, overlay text
+    // Renderer for tab titles (owned buffer; its instance list persists
+    // across frames and is rebuilt only when the tab bar's titles_version
+    // changes). Nothing else may clear or push into it.
     pub tab_title_renderer: GridRenderer,
     /// `TabBar::titles_version()` the title glyphs were last built for
     pub tab_titles_version: Option<u64>,
+    /// Instance count right after the last title build; a mismatch at draw
+    /// time means another pass has used `tab_title_renderer` as scratch space.
+    pub tab_titles_instances: usize,
+    // Renderer for transient UI text (search/rename bars, context menu,
+    // zoom/copy indicators, toasts). Shares the tab glyph cache; every pass
+    // that uses it clears it, fills it and draws from the frame arena.
+    pub overlay_text_renderer: GridRenderer,
 
     // Per-frame bump allocator for transient vertex data (overlays, dialogs, tab bar)
     pub arena: FrameArena,

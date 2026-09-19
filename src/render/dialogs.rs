@@ -95,7 +95,7 @@ pub fn render_search_bar(
     let text_height = bar_height - border_width * 2.0 - padding * 2.0;
 
     // Render search text using tab glyph cache
-    state.gpu.tab_title_renderer.clear();
+    state.gpu.overlay_text_renderer.clear();
 
     // Build display text: query with cursor + match count, truncated (from the
     // left, so the cursor end stays visible) to what fits inside the box.
@@ -146,7 +146,7 @@ pub fn render_search_bar(
 
     state
         .gpu
-        .tab_title_renderer
+        .overlay_text_renderer
         .push_glyphs(&glyphs, text_color);
     state.gpu.tab_glyph_cache.flush(&shared.queue);
 
@@ -167,10 +167,11 @@ pub fn render_search_bar(
         occlusion_query_set: None,
     });
 
-    state
-        .gpu
-        .tab_title_renderer
-        .render_transient(&shared.queue, &mut pass, &mut state.gpu.arena);
+    state.gpu.overlay_text_renderer.render_transient(
+        &shared.queue,
+        &mut pass,
+        &mut state.gpu.arena,
+    );
 }
 
 /// Render window rename input bar overlay
@@ -264,7 +265,7 @@ pub fn render_window_rename(
     let text_height = bar_height - border_width * 2.0 - padding * 2.0;
 
     // Render rename text using tab glyph cache
-    state.gpu.tab_title_renderer.clear();
+    state.gpu.overlay_text_renderer.clear();
 
     // Build display text: "Rename: " + input + cursor, truncated so it fits.
     let cell_width = state.gpu.tab_glyph_cache.cell_width();
@@ -299,7 +300,7 @@ pub fn render_window_rename(
             // Push label glyphs
             state
                 .gpu
-                .tab_title_renderer
+                .overlay_text_renderer
                 .push_glyphs(&glyphs, label_color);
             glyphs.clear();
         }
@@ -311,7 +312,7 @@ pub fn render_window_rename(
     if !glyphs.is_empty() {
         state
             .gpu
-            .tab_title_renderer
+            .overlay_text_renderer
             .push_glyphs(&glyphs, input_color);
     }
 
@@ -334,10 +335,11 @@ pub fn render_window_rename(
         occlusion_query_set: None,
     });
 
-    state
-        .gpu
-        .tab_title_renderer
-        .render_transient(&shared.queue, &mut pass, &mut state.gpu.arena);
+    state.gpu.overlay_text_renderer.render_transient(
+        &shared.queue,
+        &mut pass,
+        &mut state.gpu.arena,
+    );
 }
 
 /// Number of whole character cells that fit inside a box of `box_width`
