@@ -1452,9 +1452,23 @@ pub fn clear_terminal_selection(state: &mut WindowState) {
 
 /// Get selected text from terminal (for copy)
 pub fn get_terminal_selection_text(state: &WindowState) -> Option<String> {
-    let tab_id = state.gpu.tab_bar.active_tab_id()?;
-    let shell = state.shells.get(&tab_id)?;
-    shell.selection_to_string()
+    let Some(tab_id) = state.gpu.tab_bar.active_tab_id() else {
+        log::info!("Copy requested with no active tab");
+        return None;
+    };
+    let Some(shell) = state.shells.get(&tab_id) else {
+        log::info!("Copy requested but tab {} has no shell", tab_id);
+        return None;
+    };
+    let text = shell.selection_to_string();
+    match &text {
+        Some(t) => log::info!("Copy: selection is {} bytes", t.len()),
+        None => log::info!(
+            "Copy requested with no selection (has_selection={})",
+            shell.has_selection()
+        ),
+    }
+    text
 }
 
 /// Get clipboard content from system clipboard
@@ -1549,10 +1563,15 @@ fn save_clipboard_image_to_temp(image_data: &arboard::ImageData) -> Option<Strin
 
 /// Set clipboard content
 pub fn set_clipboard_content(text: &str) {
-    if let Some(clipboard) = clipboard_handle().as_mut()
-        && let Err(e) = clipboard.set_text(text.to_string())
-    {
-        log::warn!("Failed to set clipboard contents: {}", e);
+    match clipboard_handle().as_mut() {
+        Some(clipboard) => match clipboard.set_text(text.to_string()) {
+            Ok(()) => log::info!("Clipboard: wrote {} bytes", text.len()),
+            Err(e) => log::warn!("Failed to set clipboard contents: {}", e),
+        },
+        None => log::warn!(
+            "Clipboard: no handle available, {} bytes dropped",
+            text.len()
+        ),
     }
 }
 

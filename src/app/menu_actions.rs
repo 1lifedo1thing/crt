@@ -11,6 +11,7 @@ use winit::event_loop::ActiveEventLoop;
 
 impl App {
     pub(crate) fn handle_menu_action(&mut self, action: MenuAction, event_loop: &ActiveEventLoop) {
+        log::info!("Menu action: {:?}", action);
         match action {
             MenuAction::OpenConfig => self.open_config_file(),
             MenuAction::NewTab => self.open_new_tab(),
@@ -80,14 +81,15 @@ impl App {
                     paste_to_terminal(state, &content);
                 }
             }
-            MenuAction::Copy => {
-                if let Some(state) = self.focused_window_mut()
-                    && let Some(text) = get_terminal_selection_text(state)
-                {
-                    set_clipboard_content(&text);
-                    state.ui.copy_indicator.trigger();
+            MenuAction::Copy => match self.focused_window_mut() {
+                Some(state) => {
+                    if let Some(text) = get_terminal_selection_text(state) {
+                        set_clipboard_content(&text);
+                        state.ui.copy_indicator.trigger();
+                    }
                 }
-            }
+                None => log::info!("Menu copy ignored: no focused window"),
+            },
             MenuAction::Find => {
                 if let Some(state) = self.focused_window_mut() {
                     // Toggle search mode

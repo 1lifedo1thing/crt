@@ -66,11 +66,13 @@ impl ContextMenuItem {
             ContextMenuItem::Themes => "\u{25B6}", // Right-pointing triangle for submenu
             ContextMenuItem::Separator | ContextMenuItem::Theme(_) => "",
         }
+        // The application chord on Linux/Windows is Ctrl+Shift, so plain
+        // Ctrl chords (^C, ^A, ...) still reach the shell.
         #[cfg(not(target_os = "macos"))]
         match self {
-            ContextMenuItem::Copy => "Ctrl+C",
-            ContextMenuItem::Paste => "Ctrl+V",
-            ContextMenuItem::SelectAll => "Ctrl+A",
+            ContextMenuItem::Copy => "Ctrl+Shift+C",
+            ContextMenuItem::Paste => "Ctrl+Shift+V",
+            ContextMenuItem::SelectAll => "Ctrl+Shift+A",
             ContextMenuItem::Themes => "\u{25B6}", // Right-pointing triangle for submenu
             ContextMenuItem::Separator | ContextMenuItem::Theme(_) => "",
         }
