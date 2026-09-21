@@ -248,6 +248,7 @@ fn binding_fingerprint(keybindings: &KeybindingsConfig) -> u64 {
     for b in &keybindings.bindings {
         b.key.hash(&mut h);
         b.mods.hash(&mut h);
+        b.action.hash(&mut h);
     }
     h.finish()
 }
@@ -1122,6 +1123,29 @@ mod tests {
         assert_eq!(
             resolve_keybinding(&kb, &key, &primary_mods()),
             Some(KeyAction::NewTab)
+        );
+    }
+
+    /// Regression: the cache fingerprint covered keys and modifiers but not
+    /// actions, and a config reload replaces the config in place (same
+    /// address), so rebinding a chord to another action had no effect until
+    /// restart.
+    #[test]
+    fn binding_cache_notices_an_action_changed_in_place() {
+        let mut kb = KeybindingsConfig::default();
+        let key = Key::Character("t".into());
+        assert_eq!(
+            resolve_keybinding(&kb, &key, &primary_mods()),
+            Some(KeyAction::NewTab)
+        );
+        for b in kb.bindings.iter_mut() {
+            if b.action == KeyAction::NewTab {
+                b.action = KeyAction::Paste;
+            }
+        }
+        assert_eq!(
+            resolve_keybinding(&kb, &key, &primary_mods()),
+            Some(KeyAction::Paste)
         );
     }
 

@@ -341,6 +341,10 @@ pub struct RenderState {
     pub cached: CachedRenderState,
     /// When the last frame started (frame pacing and animation `dt`)
     pub last_frame_at: std::time::Instant,
+    /// The last frame drew something time-limited (indicator, toast, bell,
+    /// event override, animation). One more frame is owed after it ends so
+    /// the screen is repainted without it.
+    pub settling: bool,
 }
 
 impl Default for RenderState {
@@ -352,14 +356,133 @@ impl Default for RenderState {
             focused: true,
             cached: CachedRenderState::default(),
             last_frame_at: std::time::Instant::now(),
+            settling: false,
         }
     }
+}
+
+/// What a window currently needs from the frame scheduler.
+#[derive(Debug, Clone, Copy)]
+pub struct FrameDemand {
+    pub occluded: bool,
+    pub dirty: bool,
+    /// Something on screen changes continuously right now
+    pub animating: bool,
+    /// The previous frame was animating (see `RenderState::settling`)
+    pub settling: bool,
+    pub last_frame_at: std::time::Instant,
+    /// Minimum time between frames (depends on focus)
+    pub interval: std::time::Duration,
+    /// When a visible, blinking cursor next toggles
+    pub next_blink_toggle: Option<std::time::Instant>,
+}
+
+/// When a window next needs a frame, if ever.
+///
+/// `None` means the loop may sleep until an event arrives. A deadline in the
+/// past means "redraw now"; it is never earlier than one `interval` after the
+/// previous frame, which is what caps the frame rate.
+pub fn frame_deadline(demand: &FrameDemand) -> Option<std::time::Instant> {
+    if demand.occluded {
+        return None;
+    }
+    let earliest = demand.last_frame_at + demand.interval;
+    if demand.dirty || demand.animating || demand.settling {
+        return Some(earliest);
+    }
+    // A blinking cursor only needs a frame when it toggles.
+    demand.next_blink_toggle.map(|toggle| toggle.max(earliest))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crt_core::NamedColor;
+
+    const INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+
+    fn idle_demand(last_frame_at: std::time::Instant) -> FrameDemand {
+        FrameDemand {
+            occluded: false,
+            dirty: false,
+            animating: false,
+            settling: false,
+            last_frame_at,
+            interval: INTERVAL,
+            next_blink_toggle: None,
+        }
+    }
+
+    #[test]
+    fn idle_window_sleeps() {
+        assert_eq!(
+            frame_deadline(&idle_demand(std::time::Instant::now())),
+            None
+        );
+    }
+
+    #[test]
+    fn dirty_or_animating_window_is_capped_at_one_interval() {
+        let t0 = std::time::Instant::now();
+        for demand in [
+            FrameDemand {
+                dirty: true,
+                ..idle_demand(t0)
+            },
+            FrameDemand {
+                animating: true,
+                ..idle_demand(t0)
+            },
+        ] {
+            assert_eq!(frame_deadline(&demand), Some(t0 + INTERVAL));
+        }
+    }
+
+    /// Regression: an indicator, toast, bell flash or event override stops
+    /// counting as animation the instant it expires. Without a trailing
+    /// frame the sleeping loop left its last (partly faded) frame on screen
+    /// until the next input event.
+    #[test]
+    fn expired_animation_is_owed_one_final_frame() {
+        let t0 = std::time::Instant::now();
+        let settling = FrameDemand {
+            settling: true,
+            ..idle_demand(t0)
+        };
+        assert_eq!(frame_deadline(&settling), Some(t0 + INTERVAL));
+        // That frame records `settling = false`, after which the loop sleeps.
+        assert_eq!(frame_deadline(&idle_demand(t0 + INTERVAL)), None);
+    }
+
+    #[test]
+    fn occluded_window_never_schedules_frames() {
+        let demand = FrameDemand {
+            occluded: true,
+            dirty: true,
+            animating: true,
+            settling: true,
+            next_blink_toggle: Some(std::time::Instant::now()),
+            ..idle_demand(std::time::Instant::now())
+        };
+        assert_eq!(frame_deadline(&demand), None);
+    }
+
+    #[test]
+    fn blink_wakes_at_the_toggle_but_not_before_the_frame_cap() {
+        let t0 = std::time::Instant::now();
+        let later = t0 + std::time::Duration::from_millis(530);
+        let blink_later = FrameDemand {
+            next_blink_toggle: Some(later),
+            ..idle_demand(t0)
+        };
+        assert_eq!(frame_deadline(&blink_later), Some(later));
+
+        let overdue = FrameDemand {
+            next_blink_toggle: Some(t0),
+            ..idle_demand(t0)
+        };
+        assert_eq!(frame_deadline(&overdue), Some(t0 + INTERVAL));
+    }
 
     #[test]
     fn test_prepare_render_cells_smoke() {

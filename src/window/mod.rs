@@ -13,8 +13,8 @@ pub use interaction::{ContextMenu, ContextMenuItem, InteractionState, SearchMatc
 #[cfg_attr(not(test), allow(unused_imports))]
 pub use overrides::{ActiveOverride, OverrideEventType, OverrideState};
 pub use render::{
-    CursorInfo, DecorationKind, RenderContext, RenderLayout, RenderState, TextBufferUpdateResult,
-    prepare_render_cells,
+    CursorInfo, DecorationKind, FrameDemand, RenderContext, RenderLayout, RenderState,
+    TextBufferUpdateResult, frame_deadline, prepare_render_cells,
 };
 pub use types::{EffectId, TabId};
 pub use ui::{BellState, ToastType, UiState};
@@ -87,28 +87,29 @@ impl WindowState {
     ///
     /// `None` means the loop may sleep until an event arrives. A deadline in
     /// the past means "redraw now" (subject to the per-focus frame cap).
-    pub fn next_frame_deadline(&self, now: Instant, focused: bool) -> Option<Instant> {
-        if self.render.occluded {
-            return None;
-        }
-        let interval = if focused {
-            FOCUSED_FRAME_INTERVAL
-        } else {
-            UNFOCUSED_FRAME_INTERVAL
-        };
-        let earliest = self.render.last_frame_at + interval;
-
-        if self.render.dirty || self.is_animating() {
-            return Some(earliest.max(now.min(earliest)));
-        }
-
-        // A blinking cursor only needs a frame when it toggles.
+    pub fn next_frame_deadline(&self, focused: bool) -> Option<Instant> {
         let vello = &self.gpu.terminal_vello;
-        if focused && vello.blink_enabled() && self.render.cached.cursor.is_some_and(|c| c.visible)
-        {
-            return Some(vello.next_blink_toggle().max(earliest));
-        }
-        None
+        let cursor_blinks = focused
+            && vello.blink_enabled()
+            && self.render.cached.cursor.is_some_and(|c| c.visible);
+        // The tab bar versions every mutation and each presented frame
+        // records the version it drew, so a change made without marking the
+        // window dirty (a background tab's OSC title, a rename confirmed by
+        // clicking away) still gets its frame.
+        let tab_bar_stale = self.gpu.tab_titles_version != Some(self.gpu.tab_bar.titles_version());
+        frame_deadline(&FrameDemand {
+            occluded: self.render.occluded,
+            dirty: self.render.dirty || tab_bar_stale,
+            animating: self.is_animating(),
+            settling: self.render.settling,
+            last_frame_at: self.render.last_frame_at,
+            interval: if focused {
+                FOCUSED_FRAME_INTERVAL
+            } else {
+                UNFOCUSED_FRAME_INTERVAL
+            },
+            next_blink_toggle: cursor_blinks.then(|| vello.next_blink_toggle()),
+        })
     }
 
     /// Set the theme for this window, updating all GPU resources

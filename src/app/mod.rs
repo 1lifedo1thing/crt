@@ -245,6 +245,9 @@ impl App {
             ))
             .with_decorations(false)
             .with_resizable(false)
+            // Must not take focus from the window the drag started in
+            // (not honoured on X11/Wayland; see `drag::blur_cancels_drag`)
+            .with_active(false)
             .with_window_level(winit::window::WindowLevel::AlwaysOnTop);
 
         // Prevent macOS from grouping this with terminal windows

@@ -125,8 +125,16 @@ impl ApplicationHandler<WakeReason> for App {
                             .add(window::OverrideEventType::FocusLost, override_props.clone());
                         log::debug!("Focus lost - applied theme override");
                     }
-                    // A drag cannot continue once the source window loses focus
-                    self.cancel_drag_for_window(id);
+                    // A drag cannot continue once the source window is left
+                    // (but see `blur_cancels_drag` about the drag overlay)
+                    let overlay_open = self.drag_overlay.is_some();
+                    if self
+                        .drag_state
+                        .as_ref()
+                        .is_some_and(|d| drag::blur_cancels_drag(d, id, overlay_open))
+                    {
+                        self.cancel_drag_for_window(id);
+                    }
                 }
             }
 
@@ -319,9 +327,14 @@ impl ApplicationHandler<WakeReason> for App {
                 let mut handled_by_drag = false;
                 if button == MouseButton::Left && button_state == ElementState::Pressed {
                     // A press while a stale drag exists (release was lost) resets it
-                    if self.drag_state.take().is_some() {
+                    if let Some(stale) = self.drag_state.take() {
                         self.drag_overlay = None;
                         state.window.set_cursor(winit::window::CursorIcon::Default);
+                        // Repaint without the drag feedback it left behind
+                        if stale.drag_active && stale.source_window_id == id {
+                            state.render.dirty = true;
+                            state.window.request_redraw();
+                        }
                     }
                     let (x, y) = state.interaction.cursor_position;
                     if let Some(tab_id) = drag::should_start_drag(
@@ -522,7 +535,7 @@ impl ApplicationHandler<WakeReason> for App {
         let focused = self.focused_window;
         for (id, state) in self.windows.iter_mut() {
             let is_focused = focused == Some(*id);
-            match state.next_frame_deadline(now, is_focused) {
+            match state.next_frame_deadline(is_focused) {
                 Some(deadline) if deadline <= now => state.window.request_redraw(),
                 Some(deadline) => {
                     next_wake = Some(next_wake.map_or(deadline, |t| t.min(deadline)));
@@ -569,14 +582,18 @@ impl App {
             return;
         }
 
+        // An active drag has painted feedback (ghost, dimmed tab, insertion
+        // caret) on the source window. Whatever the drop does, including
+        // nothing, that window must be repainted without it.
+        state.render.dirty = true;
+        state.window.request_redraw();
+
         match drag.drop_target {
             drag::DragDropTarget::Reorder { insert_index } => {
                 if let Some(from_idx) = state.gpu.tab_bar.tab_index(drag.tab_id)
                     && from_idx != insert_index
                 {
                     state.gpu.tab_bar.move_tab(from_idx, insert_index);
-                    state.render.dirty = true;
-                    state.window.request_redraw();
                     log::debug!(
                         "Tab {} reordered: {} -> {}",
                         drag.tab_id,
@@ -591,8 +608,9 @@ impl App {
                     && let Some(shell) = state.shells.remove(&drag.tab_id)
                 {
                     state.text_rebuild.remove(&drag.tab_id);
-                    state.render.dirty = true;
-                    state.window.request_redraw();
+                    // Removing the tab made another one active; its text
+                    // layer is not on screen yet and may have no damage.
+                    state.invalidate_text();
 
                     // Convert cursor to screen position for window placement
                     let screen_pos = state.window.inner_position().ok().map(|wp| {
@@ -623,8 +641,9 @@ impl App {
                     && let Some(shell) = state.shells.remove(&drag.tab_id)
                 {
                     state.text_rebuild.remove(&drag.tab_id);
-                    state.render.dirty = true;
-                    state.window.request_redraw();
+                    // Removing the tab made another one active; its text
+                    // layer is not on screen yet and may have no damage.
+                    state.invalidate_text();
 
                     // Close source window if it's now empty
                     if state.gpu.tab_bar.tab_count() == 0 {
@@ -682,10 +701,15 @@ impl App {
             .as_ref()
             .is_some_and(|d| d.source_window_id == window_id)
         {
-            self.drag_state = None;
+            let was_active = self.drag_state.take().is_some_and(|d| d.drag_active);
             self.drag_overlay = None;
             if let Some(state) = self.windows.get_mut(&window_id) {
                 state.window.set_cursor(winit::window::CursorIcon::Default);
+                // Repaint without the drag feedback
+                if was_active {
+                    state.render.dirty = true;
+                    state.window.request_redraw();
+                }
             }
         }
     }

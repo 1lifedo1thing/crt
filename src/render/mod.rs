@@ -231,6 +231,11 @@ pub fn render_frame(state: &mut WindowState, shared: &mut SharedGpuState) {
         }
     }
 
+    // Timed visuals stop counting as animation the instant they expire, but
+    // the frame showing them is still on screen: remember that this frame
+    // drew one so the scheduler grants a final frame without it.
+    state.render.settling = state.is_animating();
+
     // Update text buffer and get cursor/decoration info
     let text_update_start = Instant::now();
     let update_result = if state.render.dirty {
@@ -1029,6 +1034,13 @@ pub fn render_frame(state: &mut WindowState, shared: &mut SharedGpuState) {
     let present_start = Instant::now();
     frame.present();
     timing.present_us = present_start.elapsed().as_micros() as u64;
+
+    // Draws that did not fit in the arena were skipped (cursor, selection,
+    // underlines, overlays). The arena grows when the next frame begins, so
+    // make sure there is one instead of sleeping on an incomplete frame.
+    if state.gpu.arena.overflowed() {
+        state.render.dirty = true;
+    }
 
     // Record frame timing for profiling
     timing.total_us = frame_start.elapsed().as_micros() as u64;

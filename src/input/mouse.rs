@@ -448,6 +448,10 @@ pub fn handle_mouse_input(
                     // Clicking on Themes just keeps it highlighted
                     return true;
                 }
+                // The padding and border around the rows are still the menu
+                if state.ui.context_menu.covers(x, y) {
+                    return true;
+                }
                 // Clicking outside the menu dismisses it
                 state.ui.context_menu.hide();
                 state.render.dirty = true;
