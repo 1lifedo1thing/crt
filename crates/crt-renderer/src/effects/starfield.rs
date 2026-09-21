@@ -303,6 +303,13 @@ impl StarfieldEffect {
     }
 }
 
+impl StarfieldEffect {
+    /// Number of stars currently generated (all layers)
+    pub fn star_count(&self) -> usize {
+        self.stars.len()
+    }
+}
+
 impl BackdropEffect for StarfieldEffect {
     fn effect_type(&self) -> &'static str {
         "starfield"

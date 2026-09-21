@@ -76,8 +76,8 @@ pub struct BackgroundPipeline {
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     theme: Arc<Theme>,
-    /// (width, height, theme pointer) of the last uniform write
-    uploaded: Option<(f32, f32, *const Theme)>,
+    /// (width, height) of the last uniform write; `None` after a theme change
+    uploaded: Option<(f32, f32)>,
 }
 
 impl BackgroundPipeline {
@@ -116,6 +116,9 @@ impl BackgroundPipeline {
 
     pub fn set_theme(&mut self, theme: Arc<Theme>) {
         self.theme = theme;
+        // Not keyed on the `Arc` pointer: a freed theme's address can be
+        // reused by the next one when no frame is rendered in between.
+        self.uploaded = None;
     }
 
     pub fn theme(&self) -> &Theme {
@@ -129,7 +132,7 @@ impl BackgroundPipeline {
     /// Write the theme uniforms if the size or theme changed since the last
     /// write (the shader does not read `time`).
     pub fn update_uniforms(&mut self, queue: &wgpu::Queue, width: f32, height: f32) {
-        let key = (width, height, Arc::as_ptr(&self.theme));
+        let key = (width, height);
         if self.uploaded == Some(key) {
             return;
         }
@@ -252,8 +255,8 @@ pub struct CompositePipeline {
     shared: Arc<SharedCompositePipeline>,
     uniform_buffer: wgpu::Buffer,
     theme: Arc<Theme>,
-    /// (width, height, theme pointer) of the last uniform write
-    uploaded: Option<(f32, f32, *const Theme)>,
+    /// (width, height) of the last uniform write; `None` after a theme change
+    uploaded: Option<(f32, f32)>,
     /// Horizontally-blurred alpha target (sized to the frame)
     blur: Option<GlowBlurTarget>,
 }
@@ -417,6 +420,8 @@ impl CompositePipeline {
 
     pub fn set_theme(&mut self, theme: Arc<Theme>) {
         self.theme = theme;
+        // See `BackgroundPipeline::set_theme`
+        self.uploaded = None;
     }
 
     pub fn theme(&self) -> &Theme {
@@ -451,7 +456,7 @@ impl CompositePipeline {
     /// Write the theme uniforms if the size or theme changed since the last
     /// write (the shader does not read `time`).
     pub fn update_uniforms(&mut self, queue: &wgpu::Queue, width: f32, height: f32) {
-        let key = (width, height, Arc::as_ptr(&self.theme));
+        let key = (width, height);
         if self.uploaded == Some(key) {
             return;
         }
