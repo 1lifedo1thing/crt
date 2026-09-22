@@ -235,8 +235,8 @@ pub fn resolve_drop_target(
 /// Check whether a tab drag should be initiated for a mouse press at (x, y).
 ///
 /// Returns `Some(tab_id)` if:
-/// - The click hits a tab (not the close button)
-/// - The window has more than 1 tab (last-tab guard)
+/// - The click hits a tab (not the close button); single-tab windows
+///   included, so their tab can be merged into another window
 /// - The tab bar is not in edit mode
 /// - The context menu is not visible
 ///
@@ -259,6 +259,16 @@ pub fn should_start_drag(
         return Some(tab_id);
     }
     None
+}
+
+/// Whether `blurred` losing focus ends the drag.
+///
+/// A drag cannot continue once its source window is really left, but the
+/// floating drag overlay is itself a window: where the platform lets it take
+/// focus, creating it blurs the source the moment the drag becomes active.
+/// Treating that as "left" cancelled every drag as it started.
+pub fn blur_cancels_drag(drag: &TabDragState, blurred: WindowId, overlay_open: bool) -> bool {
+    drag.source_window_id == blurred && !overlay_open
 }
 
 #[cfg(test)]
@@ -666,5 +676,30 @@ mod tests {
             &windows,
         );
         assert_eq!(target, DragDropTarget::Detach);
+    }
+
+    /// Regression: on macOS the drag overlay window becomes key when it is
+    /// created, which blurs the source window. That blur used to cancel the
+    /// drag the instant it became active, so no tab could be reordered,
+    /// detached or merged.
+    #[test]
+    fn overlay_taking_focus_does_not_cancel_the_drag() {
+        let source = WindowId::from(1u64);
+        let drag = TabDragState::new(42, source, PhysicalPosition::new(10.0, 10.0));
+        assert!(!blur_cancels_drag(&drag, source, true));
+    }
+
+    #[test]
+    fn source_window_blur_without_overlay_cancels_the_drag() {
+        let source = WindowId::from(1u64);
+        let drag = TabDragState::new(42, source, PhysicalPosition::new(10.0, 10.0));
+        assert!(blur_cancels_drag(&drag, source, false));
+    }
+
+    #[test]
+    fn another_window_blurring_never_cancels_the_drag() {
+        let drag = TabDragState::new(42, WindowId::from(1u64), PhysicalPosition::new(10.0, 10.0));
+        assert!(!blur_cancels_drag(&drag, WindowId::from(2u64), false));
+        assert!(!blur_cancels_drag(&drag, WindowId::from(2u64), true));
     }
 }

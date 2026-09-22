@@ -135,10 +135,10 @@ pub fn render_zoom_indicator(
     }
 
     // Render text using tab title renderer
-    state.gpu.tab_title_renderer.clear();
+    state.gpu.overlay_text_renderer.clear();
     state
         .gpu
-        .tab_title_renderer
+        .overlay_text_renderer
         .update_screen_size(&shared.queue, screen_width, screen_height);
 
     let text_x = pill_x + padding_x;
@@ -154,7 +154,7 @@ pub fn render_zoom_indicator(
     }
     state
         .gpu
-        .tab_title_renderer
+        .overlay_text_renderer
         .push_glyphs(&glyphs, text_color);
     state.gpu.tab_glyph_cache.flush(&shared.queue);
 
@@ -175,7 +175,7 @@ pub fn render_zoom_indicator(
             occlusion_query_set: None,
         });
 
-        state.gpu.tab_title_renderer.render_transient(
+        state.gpu.overlay_text_renderer.render_transient(
             &shared.queue,
             &mut pass,
             &mut state.gpu.arena,
@@ -258,10 +258,10 @@ pub fn render_copy_indicator(
     }
 
     // Render text using tab title renderer
-    state.gpu.tab_title_renderer.clear();
+    state.gpu.overlay_text_renderer.clear();
     state
         .gpu
-        .tab_title_renderer
+        .overlay_text_renderer
         .update_screen_size(&shared.queue, screen_width, screen_height);
 
     let text_x = pill_x + padding_x;
@@ -277,7 +277,7 @@ pub fn render_copy_indicator(
     }
     state
         .gpu
-        .tab_title_renderer
+        .overlay_text_renderer
         .push_glyphs(&glyphs, text_color);
     state.gpu.tab_glyph_cache.flush(&shared.queue);
 
@@ -298,7 +298,7 @@ pub fn render_copy_indicator(
             occlusion_query_set: None,
         });
 
-        state.gpu.tab_title_renderer.render_transient(
+        state.gpu.overlay_text_renderer.render_transient(
             &shared.queue,
             &mut pass,
             &mut state.gpu.arena,
@@ -393,10 +393,10 @@ pub fn render_toast(
     }
 
     // Render text using tab title renderer
-    state.gpu.tab_title_renderer.clear();
+    state.gpu.overlay_text_renderer.clear();
     state
         .gpu
-        .tab_title_renderer
+        .overlay_text_renderer
         .update_screen_size(&shared.queue, screen_width, screen_height);
 
     let text_x = pill_x + padding_x;
@@ -412,7 +412,7 @@ pub fn render_toast(
     }
     state
         .gpu
-        .tab_title_renderer
+        .overlay_text_renderer
         .push_glyphs(&glyphs, text_color);
     state.gpu.tab_glyph_cache.flush(&shared.queue);
 
@@ -433,7 +433,7 @@ pub fn render_toast(
             occlusion_query_set: None,
         });
 
-        state.gpu.tab_title_renderer.render_transient(
+        state.gpu.overlay_text_renderer.render_transient(
             &shared.queue,
             &mut pass,
             &mut state.gpu.arena,

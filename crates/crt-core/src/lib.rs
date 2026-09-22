@@ -584,10 +584,12 @@ enum Osc133Scan {
     Incomplete,
 }
 
-/// Longest OSC 133 sequence we recognise (`ESC ] 133 ; D ; <exit code> ESC \`).
-const OSC133_MAX_LEN: usize = 24;
+/// Longest OSC 133 sequence we recognise, parameters included
+/// (`ESC ] 133 ; D ; <exit code> ; aid=<pid> ESC \`). Also bounds how much of
+/// a chunk's tail is carried over to the next read.
+const OSC133_MAX_LEN: usize = 128;
 
-/// Probe `bytes[i..]` for `ESC ] 133 ; X [; digits] (BEL | ESC \)`.
+/// Probe `bytes[i..]` for `ESC ] 133 ; X [; digits] [; params] (BEL | ESC \)`.
 fn scan_osc133_at(bytes: &[u8], i: usize) -> Osc133Scan {
     const PREFIX: &[u8] = b"\x1b]133;";
     let rest = &bytes[i..];
@@ -617,6 +619,13 @@ fn scan_osc133_at(bytes: &[u8], i: usize) -> Osc133Scan {
                 .and_then(|s| s.parse::<i32>().ok());
         }
         pos = end;
+    }
+    // Optional `;key=value` parameters (WezTerm `aid=`, kitty `cl=`, ...):
+    // printable bytes up to the terminator. They carry nothing we use.
+    if rest.get(pos) == Some(&b';') {
+        while pos < rest.len() && pos < OSC133_MAX_LEN && (0x20..0x7f).contains(&rest[pos]) {
+            pos += 1;
+        }
     }
     // Terminator: BEL or ESC \ (ST). Anything else is not a marker we handle.
     match rest.get(pos) {
@@ -1116,6 +1125,44 @@ mod tests {
         let events = term.take_shell_events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0], ShellEvent::CommandFail(1));
+    }
+
+    /// Regression: the v0.1.4 scanner only accepted a bare marker, so shell
+    /// integrations that attach parameters (WezTerm `D;<code>;aid=<pid>`,
+    /// kitty/fish `A;k=v`) lost their prompt zones and command events.
+    #[test]
+    fn osc133_markers_with_parameters_are_recognised() {
+        let mut term = Terminal::new(Size::new(80, 24));
+        term.process_input(b"\x1b]133;D;1;aid=4242\x07");
+        assert_eq!(term.take_shell_events(), vec![ShellEvent::CommandFail(1)]);
+
+        term.process_input(b"\x1b]133;D;0;aid=4242\x1b\\");
+        assert_eq!(term.take_shell_events(), vec![ShellEvent::CommandSuccess]);
+
+        let mut term = Terminal::new(Size::new(80, 24));
+        term.process_input(b"\x1b]133;A;cl=m;aid=4242\x07$ ");
+        assert_eq!(term.get_line_zone(0), SemanticZone::Prompt);
+    }
+
+    /// A marker with parameters may also be split across two PTY reads.
+    #[test]
+    fn osc133_marker_with_parameters_split_across_reads() {
+        let mut term = Terminal::new(Size::new(80, 24));
+        term.process_input(b"\x1b]133;D;3;ai");
+        assert!(term.take_shell_events().is_empty());
+        term.process_input(b"d=4242\x07");
+        assert_eq!(term.take_shell_events(), vec![ShellEvent::CommandFail(3)]);
+    }
+
+    /// Parameters are bounded and printable: a stray prefix must not make
+    /// the scanner hold back or swallow ordinary output.
+    #[test]
+    fn osc133_unterminated_parameters_are_not_a_marker() {
+        let mut term = Terminal::new(Size::new(80, 24));
+        let mut input = b"\x1b]133;A;".to_vec();
+        input.extend(std::iter::repeat_n(b'x', 1024));
+        term.process_input(&input);
+        assert!(!term.has_semantic_zones());
     }
 
     #[test]

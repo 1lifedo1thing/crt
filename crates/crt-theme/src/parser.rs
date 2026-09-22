@@ -851,7 +851,8 @@ fn number_opt<T: FromStr>(v: &str, prop: &str, warnings: &mut Vec<String>) -> Op
 
 /// Parse a boolean custom property value.
 fn parse_bool(v: &str, prop: &str, warnings: &mut Vec<String>) -> Option<bool> {
-    match v.trim().to_ascii_lowercase().as_str() {
+    // Hand-written themes often quote booleans (`"false"`)
+    match strip_quotes(v).trim().to_ascii_lowercase().as_str() {
         "true" | "1" | "yes" | "on" => Some(true),
         "false" | "0" | "no" | "off" => Some(false),
         _ => {
@@ -901,6 +902,8 @@ struct RuleProperties {
     background: Option<LinearGradient>,
     /// Typed text shadow.
     text_shadow: Option<TextShadow>,
+    /// Custom properties whose value uses `var()`/`env()` (already warned about).
+    substituted: std::collections::HashSet<String>,
 }
 
 impl RuleProperties {
@@ -938,6 +941,9 @@ impl RuleProperties {
 
     /// Typed colour for a custom property, falling back to the string parser.
     fn custom_color(&self, key: &str) -> Result<Option<Color>, ThemeParseError> {
+        if self.substituted.contains(key) {
+            return Ok(None);
+        }
         if let Some(c) = self.custom_colors.get(key) {
             return Ok(Some(*c));
         }
@@ -973,6 +979,7 @@ impl RuleProperties {
             return Ok(Some(ts));
         }
         match self.standard.get("text-shadow") {
+            Some(s) if s.trim().eq_ignore_ascii_case("none") => Ok(None),
             Some(s) => parse_text_shadow(s).map(Some),
             None => Ok(None),
         }
@@ -1004,6 +1011,34 @@ fn single_string(tokens: &TokenList) -> Option<String> {
     }
 }
 
+/// Whether a value contains `var()` or `env()`, at any nesting depth. Themes
+/// are not resolved against a cascade, so such a value cannot be computed.
+fn uses_substitution(tokens: &TokenList) -> bool {
+    tokens.0.iter().any(|t| match t {
+        TokenOrValue::Var(_) | TokenOrValue::Env(_) => true,
+        TokenOrValue::Function(f) => uses_substitution(&f.arguments),
+        _ => false,
+    })
+}
+
+fn unsupported_substitution(name: &str) -> String {
+    format!("{name}: var() and env() are not supported; ignoring declaration")
+}
+
+/// A declaration's value without the spaces the pretty printer puts between
+/// tokens, so an unquoted `sprites/cat.png` keeps its spelling. Only used
+/// for string-like custom properties; colours and numbers use the typed or
+/// pretty-printed value.
+fn compact_value(decl: &Property) -> Option<String> {
+    let options = PrinterOptions {
+        minify: true,
+        ..PrinterOptions::default()
+    };
+    let value = decl.value_to_css_string(options).ok()?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| strip_quotes(value))
+}
+
 /// Extract properties from a style rule's declarations
 fn extract_properties(
     rule: &lightningcss::rules::style::StyleRule,
@@ -1021,6 +1056,11 @@ fn extract_properties(
         match decl {
             Property::Custom(prop) => {
                 let name = prop.name.as_ref().to_string();
+                // Kept as raw text, but never read as a colour
+                if uses_substitution(&prop.value) {
+                    warnings.push(unsupported_substitution(&name));
+                    props.substituted.insert(name.clone());
+                }
                 let value = decl
                     .value_to_css_string(opts())
                     .unwrap_or_default()
@@ -1032,7 +1072,9 @@ fn extract_properties(
                         if let Some(c) = typed {
                             props.custom_colors.insert(name.clone(), c);
                         }
-                        if let Some(text) = single_string(&prop.value) {
+                        if let Some(text) =
+                            single_string(&prop.value).or_else(|| compact_value(decl))
+                        {
                             props.custom_strings.insert(name.clone(), text);
                         }
                         props.custom.insert(name, value);
@@ -1069,7 +1111,11 @@ fn extract_properties(
                     .insert("outline-width".to_string(), border_side_width_string(width));
             }
             Property::Outline(outline) => {
-                insert_color(&mut props, "outline-color", &outline.color)?;
+                // Without an explicit colour the shorthand means
+                // `currentColor`: keep the theme's ring colour.
+                if outline.color != CssColor::CurrentColor {
+                    insert_color(&mut props, "outline-color", &outline.color)?;
+                }
                 props.standard.insert(
                     "outline-width".to_string(),
                     border_side_width_string(&outline.width),
@@ -1079,13 +1125,15 @@ fn extract_properties(
                 for bg in backgrounds.iter() {
                     match &bg.image {
                         Image::Gradient(gradient) => {
-                            if let Ok(css_str) = gradient.to_css_string(opts()) {
-                                props.standard.insert("background".to_string(), css_str);
-                            }
                             match gradient.as_ref() {
                                 Gradient::Linear(lg) | Gradient::RepeatingLinear(lg) => {
+                                    if let Ok(css_str) = gradient.to_css_string(opts()) {
+                                        props.standard.insert("background".to_string(), css_str);
+                                    }
                                     props.background = Some(convert_linear_gradient(lg, warnings)?);
                                 }
+                                // Really ignored: leaving the text behind would
+                                // make the colour fallback reject the theme.
                                 _ => warnings.push(
                                     "background: only linear-gradient() is supported; ignoring gradient"
                                         .to_string(),
@@ -1229,6 +1277,10 @@ fn extract_properties(
             Property::Unparsed(unparsed) => {
                 // Known property whose value lightningcss could not type: keep the raw tokens.
                 if let Ok(name) = unparsed.property_id.to_css_string(opts()) {
+                    if uses_substitution(&unparsed.value) {
+                        warnings.push(unsupported_substitution(&name));
+                        continue;
+                    }
                     let value = decl
                         .value_to_css_string(opts())
                         .unwrap_or_default()
@@ -1404,6 +1456,17 @@ pub fn parse_theme_report(css: &str) -> Result<ParseReport, ThemeParseError> {
     if let Ok(recovered) = css_warnings.read() {
         for w in recovered.iter() {
             let text = w.to_string();
+            // A declaration that fails to tokenize (missing colon, unclosed
+            // paren or quote) is not recoverable: lightningcss has already
+            // discarded every other declaration of that rule, and an unclosed
+            // token swallows the rules after it. Applying what is left would
+            // silently reset most of the theme, so report it instead and let
+            // the caller keep the theme it already has.
+            if matches!(w.kind, lightningcss::error::ParserError::UnexpectedToken(_)) {
+                return Err(ThemeParseError::CssError(format!(
+                    "{text}: malformed declaration, the rule cannot be recovered"
+                )));
+            }
             // `:terminal::cursor` & co. are our own pseudo-selectors; lightningcss
             // flags each of them.  Genuinely unknown selectors are reported below.
             if text.contains("is not recognized as a valid pseudo-") {
@@ -1646,7 +1709,9 @@ fn resolve_enabled(
 ) -> bool {
     let key = format!("{prefix}enabled");
     if let Some(v) = props.custom(&key) {
-        return parse_bool(v, &key, warnings).unwrap_or(true);
+        // An unrecognised value is ignored, as its warning says: it must
+        // not switch the effect on.
+        return parse_bool(v, &key, warnings).unwrap_or(current);
     }
     if props.has_custom_prefix(prefix) {
         return true;
@@ -4543,5 +4608,119 @@ mod tests {
             checked += 1;
         }
         assert!(checked > 0, "no themes found in {}", dir.display());
+    }
+
+    // ------------------------------------------------------------------
+    // Regressions from the typed-value parser rewrite (v0.1.4). The v0.1.3
+    // parser ignored what it did not understand; a theme that loaded then
+    // must still load, with a warning instead of an error.
+    // ------------------------------------------------------------------
+
+    /// `text-shadow: none` in an event block is straight from
+    /// docs/how-to/set-up-reactive-themes.md. It used to be ignored; the
+    /// rewrite made it reject the whole theme.
+    #[test]
+    fn regression_event_block_text_shadow_none_keeps_the_theme() {
+        let theme = parse_theme(
+            ":terminal::on-blur { --duration: 0ms; color: #666666; text-shadow: none; }",
+        )
+        .expect("documented on-blur block must parse");
+        let on_blur = theme.on_blur.expect("on-blur block");
+        let fg = on_blur.foreground.expect("color applies");
+        assert!(close(fg.r, 0.4) && close(fg.g, 0.4) && close(fg.b, 0.4));
+        assert!(on_blur.text_shadow.is_none());
+    }
+
+    #[test]
+    fn regression_event_block_unsupported_background_keeps_the_theme() {
+        let report = parse_theme_report(
+            ":terminal::on-bell { color: #ff0000; background: radial-gradient(red, blue); }",
+        )
+        .expect("unsupported gradient in an event block must not be fatal");
+        let on_bell = report.theme.on_bell.expect("on-bell block");
+        assert!(on_bell.foreground.is_some(), "valid declaration kept");
+        assert!(on_bell.background.is_none());
+        assert!(!report.warnings.is_empty(), "expected a warning");
+    }
+
+    /// `outline` without a colour resolves to `currentColor`, which is not a
+    /// colour this parser knows. It must leave the ring colour alone.
+    #[test]
+    fn regression_outline_without_color_is_not_fatal() {
+        let d = crate::FocusStyle::default();
+        for css in [
+            ":terminal::ui-focus { outline: none; }",
+            ":terminal::ui-focus { outline: 0; }",
+            ":terminal { outline: none; }",
+        ] {
+            let theme = parse_theme(css).unwrap_or_else(|e| panic!("{css}: {e}"));
+            assert_eq!(theme.ui.focus.ring_color, d.ring_color, "{css}");
+        }
+        let theme = parse_theme(":terminal::ui-focus { outline: 3px solid; }").expect("parses");
+        assert!(close(theme.ui.focus.ring_thickness, 3.0));
+        assert_eq!(theme.ui.focus.ring_color, d.ring_color);
+    }
+
+    /// `var()`/`env()` were never supported, but they used to degrade to the
+    /// default value instead of rejecting the theme.
+    #[test]
+    fn regression_unsupported_color_values_fall_back_with_a_warning() {
+        let defaults = Theme::default();
+        for css in [
+            ":terminal { --accent: #00ff00; color: var(--accent); }",
+            ":terminal { background: var(--bg); }",
+            ":terminal::backdrop { --grid-color: var(--c); }",
+        ] {
+            let report = parse_theme_report(css).unwrap_or_else(|e| panic!("{css}: {e}"));
+            assert_eq!(report.theme.foreground, defaults.foreground, "{css}");
+            assert!(!report.warnings.is_empty(), "{css}: expected a warning");
+        }
+    }
+
+    /// Unquoted paths must survive token serialisation byte for byte.
+    #[test]
+    fn regression_unquoted_custom_strings_are_not_respaced() {
+        let theme = parse_theme(
+            ":terminal::backdrop { --sprite-path: sprites/cat-run_8.png; --sprite-columns: 8; }",
+        )
+        .expect("parses");
+        let sprite = theme.sprite.expect("sprite effect");
+        assert_eq!(sprite.path.as_deref(), Some("sprites/cat-run_8.png"));
+
+        let theme =
+            parse_theme(":terminal::backdrop { --sprite-path: ./cat.png; }").expect("parses");
+        assert_eq!(
+            theme.sprite.expect("sprite").path.as_deref(),
+            Some("./cat.png")
+        );
+    }
+
+    /// lightningcss drops EVERY declaration of a rule when one of them fails
+    /// to tokenize, so `colr red;` used to reset `color` and `font-size` to
+    /// their defaults with only a vague warning. An unclosed paren or quote
+    /// additionally swallows the rules after it. Accepting either result
+    /// would snap a theme to defaults while it is being edited; an error
+    /// lets hot reload keep the last good one (as v0.1.3 did).
+    #[test]
+    fn regression_malformed_declaration_is_an_error_not_a_partial_theme() {
+        for css in [
+            ":terminal { color: #00ff00; font-size: 16px; colr red; background: #111111; }",
+            ":terminal { color: #00ff00; background: rgb(1,2,3; }\n:terminal::cursor { background: #ff0000; }",
+            ":terminal { font-family: \"Meslo; }\n:terminal::cursor { background: #ff0000; }",
+        ] {
+            assert!(parse_theme_report(css).is_err(), "accepted: {css}");
+        }
+    }
+
+    /// An unrecognised boolean must not switch an effect ON.
+    #[test]
+    fn regression_unrecognised_enabled_value_does_not_enable_the_effect() {
+        for value in ["\"false\"", "none", "disabled"] {
+            let css = format!(":terminal::backdrop {{ --grid-enabled: {value}; }}");
+            let report = parse_theme_report(&css).unwrap_or_else(|e| panic!("{css}: {e}"));
+            assert!(report.theme.grid.is_none(), "{css} enabled the grid");
+        }
+        let theme = parse_theme(":terminal::backdrop { --grid-enabled: true; }").expect("parses");
+        assert!(theme.grid.is_some_and(|g| g.enabled));
     }
 }

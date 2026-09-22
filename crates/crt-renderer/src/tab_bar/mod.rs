@@ -866,6 +866,31 @@ mod tests {
         assert_eq!(bar.titles_version(), v5);
     }
 
+    /// The frame scheduler redraws a window whose tab bar version differs
+    /// from the one last drawn, so these must bump even though their call
+    /// sites do not mark the window dirty.
+    #[test]
+    fn titles_version_bumps_for_background_title_and_edit_confirm() {
+        let mut bar = bar_with_tabs(2);
+        bar.select_tab(0);
+        let v0 = bar.titles_version();
+        // OSC title from a tab that is not active
+        assert!(bar.set_tab_title(1, "build finished"));
+        let v1 = bar.titles_version();
+        assert!(v1 > v0);
+
+        assert!(bar.start_editing(0));
+        let v2 = bar.titles_version();
+        bar.confirm_editing();
+        let v3 = bar.titles_version();
+        assert!(v3 > v2, "confirming a rename must restyle the tab");
+
+        assert!(bar.start_editing(0));
+        let v4 = bar.titles_version();
+        bar.cancel_editing();
+        assert!(bar.titles_version() > v4, "cancelling a rename too");
+    }
+
     #[test]
     fn labels_are_borrowed_and_clipped_to_tab_width() {
         let mut bar = TabBar::default();

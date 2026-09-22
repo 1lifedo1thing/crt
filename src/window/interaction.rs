@@ -66,11 +66,13 @@ impl ContextMenuItem {
             ContextMenuItem::Themes => "\u{25B6}", // Right-pointing triangle for submenu
             ContextMenuItem::Separator | ContextMenuItem::Theme(_) => "",
         }
+        // The application chord on Linux/Windows is Ctrl+Shift, so plain
+        // Ctrl chords (^C, ^A, ...) still reach the shell.
         #[cfg(not(target_os = "macos"))]
         match self {
-            ContextMenuItem::Copy => "Ctrl+C",
-            ContextMenuItem::Paste => "Ctrl+V",
-            ContextMenuItem::SelectAll => "Ctrl+A",
+            ContextMenuItem::Copy => "Ctrl+Shift+C",
+            ContextMenuItem::Paste => "Ctrl+Shift+V",
+            ContextMenuItem::SelectAll => "Ctrl+Shift+A",
             ContextMenuItem::Themes => "\u{25B6}", // Right-pointing triangle for submenu
             ContextMenuItem::Separator | ContextMenuItem::Theme(_) => "",
         }
@@ -548,6 +550,13 @@ impl ContextMenu {
         x >= self.x && x <= self.x + w && y >= self.y && y <= self.y + h
     }
 
+    /// Whether a point is on the menu or its open submenu, including the
+    /// padding and border around the rows where `item_at` finds nothing.
+    /// A click there belongs to the menu, not to whatever is underneath.
+    pub fn covers(&self, x: f32, y: f32) -> bool {
+        self.contains(x, y) || self.contains_submenu(x, y)
+    }
+
     /// Check if a point is inside the submenu
     pub fn contains_submenu(&self, x: f32, y: f32) -> bool {
         if !self.submenu_visible {
@@ -657,6 +666,30 @@ mod tests {
         no_themes.show(0.0, 0.0);
         assert_eq!(no_themes.items().len(), 3);
         assert_eq!(no_themes.themes_item_index(), None);
+    }
+
+    /// Regression: the padded layout left a frame around the rows that is
+    /// inside the menu but hits no item. Clicks there were treated as
+    /// "outside", closing the menu and starting a selection underneath.
+    #[test]
+    fn menu_padding_is_covered_but_hits_no_item() {
+        for scale in [1.0, 2.0] {
+            let menu = menu_with_themes(scale);
+            let m = menu.metrics();
+            assert!(m.padding_y > 0.0);
+            let (width, height) = menu.menu_size();
+            let x = menu.x + width / 2.0;
+            for y in [
+                menu.y + m.padding_y / 2.0,
+                menu.y + height - m.padding_y / 2.0,
+            ] {
+                assert!(menu.item_at(x, y).is_none(), "padding hit an item");
+                assert!(menu.covers(x, y), "padding not covered at scale {scale}");
+            }
+            assert!(!menu.covers(menu.x - 1.0, menu.y));
+            assert!(!menu.covers(x, menu.y + height + 1.0));
+        }
+        assert!(!ContextMenu::default().covers(0.0, 0.0), "hidden menu");
     }
 
     #[test]

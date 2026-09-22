@@ -231,6 +231,11 @@ pub fn render_frame(state: &mut WindowState, shared: &mut SharedGpuState) {
         }
     }
 
+    // Timed visuals stop counting as animation the instant they expire, but
+    // the frame showing them is still on screen: remember that this frame
+    // drew one so the scheduler grants a final frame without it.
+    state.render.settling = state.is_animating();
+
     // Update text buffer and get cursor/decoration info
     let text_update_start = Instant::now();
     let update_result = if state.render.dirty {
@@ -269,6 +274,21 @@ pub fn render_frame(state: &mut WindowState, shared: &mut SharedGpuState) {
         Ok(f) => f,
         Err(e) => {
             log::warn!("Failed to get surface texture: {:?}", e);
+            // The text layer above was rebuilt for a frame that will never be
+            // presented. The loop only redraws on demand, so put the window
+            // back in the state it was in before this frame: dirty, with the
+            // active tab's text layer to rebuild. `about_to_wait` then
+            // schedules the retry at the normal frame cap (and not at all
+            // while the window is occluded), so a surface that keeps failing
+            // cannot spin the loop. A stale or lost swapchain is reconfigured
+            // first.
+            if matches!(e, wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) {
+                state
+                    .gpu
+                    .surface
+                    .configure(&shared.device, &state.gpu.config);
+            }
+            state.invalidate_text();
             return;
         }
     };
@@ -1015,6 +1035,13 @@ pub fn render_frame(state: &mut WindowState, shared: &mut SharedGpuState) {
     frame.present();
     timing.present_us = present_start.elapsed().as_micros() as u64;
 
+    // Draws that did not fit in the arena were skipped (cursor, selection,
+    // underlines, overlays). The arena grows when the next frame begins, so
+    // make sure there is one instead of sleeping on an incomplete frame.
+    if state.gpu.arena.overflowed() {
+        state.render.dirty = true;
+    }
+
     // Record frame timing for profiling
     timing.total_us = frame_start.elapsed().as_micros() as u64;
     profiling::record_frame(timing);
@@ -1078,9 +1105,16 @@ fn render_tab_titles(
     // Tab titles change rarely; rebuild the glyph list only when the tab
     // bar reports a new version (titles, active tab, editing, layout, theme).
     let version = state.gpu.tab_bar.titles_version();
-    if state.gpu.tab_titles_version != Some(version) {
+    let clobbered = state.gpu.tab_title_renderer.instance_count() != state.gpu.tab_titles_instances;
+    debug_assert!(
+        !clobbered,
+        "tab_title_renderer was modified outside build_tab_title_glyphs; \
+         transient UI text must use overlay_text_renderer"
+    );
+    if state.gpu.tab_titles_version != Some(version) || clobbered {
         state.gpu.tab_titles_version = Some(version);
         build_tab_title_glyphs(state, shared);
+        state.gpu.tab_titles_instances = state.gpu.tab_title_renderer.instance_count();
     }
 
     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {

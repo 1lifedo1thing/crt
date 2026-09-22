@@ -200,7 +200,7 @@ pub fn render(
 
     // ---- Text ----
     let glyphs = &mut state.gpu.tab_glyph_cache;
-    let text = &mut state.gpu.tab_title_renderer;
+    let text = &mut state.gpu.overlay_text_renderer;
     text.clear();
 
     let cell_width = glyphs.cell_width();
@@ -292,7 +292,7 @@ pub fn render(
             occlusion_query_set: None,
         });
 
-        state.gpu.tab_title_renderer.render_transient(
+        state.gpu.overlay_text_renderer.render_transient(
             &shared.queue,
             &mut pass,
             &mut state.gpu.arena,

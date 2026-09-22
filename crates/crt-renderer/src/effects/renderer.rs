@@ -138,7 +138,7 @@ impl EffectsRenderer {
                 }
             }
 
-            effect.configure(&effect_config);
+            configure_now(effect.as_mut(), &effect_config, self.time);
             log::info!(
                 "Configured effect '{}': enabled={}",
                 effect.effect_type(),
@@ -184,8 +184,13 @@ impl EffectsRenderer {
     /// pending change (configure/patch/resize) still has to be rendered.
     /// The event loop can sleep instead of scheduling frames when this is
     /// `false`.
+    ///
+    /// Only enabled effects count: `needs_render` is cleared by `render()`,
+    /// which never runs while no effect is enabled, so without this guard a
+    /// theme with no backdrop effects would keep the event loop redrawing
+    /// forever.
     pub fn is_animating(&self) -> bool {
-        self.needs_render || any_animated(&self.effects)
+        needs_frames(&self.effects, self.needs_render)
     }
 
     /// Whether the next `render()` call will re-render the vello scene
@@ -205,7 +210,7 @@ impl EffectsRenderer {
     pub fn apply_effect_patch(&mut self, effect_type: &str, config: &EffectConfig) {
         for effect in &mut self.effects {
             if effect.effect_type() == effect_type {
-                effect.configure(config);
+                configure_now(effect.as_mut(), config, self.time);
                 self.needs_render = true;
                 log::debug!(
                     "Applied patch to effect '{}' with {} properties",
@@ -386,6 +391,28 @@ fn any_animated(effects: &[Box<dyn BackdropEffect>]) -> bool {
     effects.iter().any(|e| e.is_enabled() && e.is_animated())
 }
 
+/// Configure `effect` and let it act on the change straight away.
+///
+/// Effects defer expensive rebuilds (regenerating stars, drops, particles) to
+/// their next `update()`. A frame calls `update()` before it applies theme
+/// patches and renders, so without this the patched frame drew the old item
+/// set; a static effect then never asked for another render and kept showing
+/// it (100 stars during an `on-bell` that asked for 400).
+fn configure_now(effect: &mut dyn BackdropEffect, config: &EffectConfig, time: f64) {
+    effect.configure(config);
+    if effect.is_enabled() {
+        effect.update(0.0, time);
+    }
+}
+
+/// True when the backdrop still has frames to draw: an enabled effect exists
+/// and either a change is pending (`needs_render`) or one of them is animated.
+/// A pending change with nothing enabled never gets rendered, so it must not
+/// count.
+fn needs_frames(effects: &[Box<dyn BackdropEffect>], needs_render: bool) -> bool {
+    effects.iter().any(|e| e.is_enabled()) && (needs_render || any_animated(effects))
+}
+
 impl Drop for EffectsRenderer {
     fn drop(&mut self) {
         // Destroy render target texture to release GPU memory
@@ -431,6 +458,80 @@ mod tests {
         assert!(!any_animated(&[stub(false, true)]));
         assert!(any_animated(&[stub(true, true)]));
         assert!(any_animated(&[stub(true, false), stub(true, true)]));
+    }
+
+    /// Regression: `needs_render` starts `true` and only `render()` clears
+    /// it, but `render()` is skipped while no effect is enabled. Counting it
+    /// anyway kept the sleeping event loop redrawing forever on themes
+    /// without backdrop effects.
+    #[test]
+    fn pending_render_without_enabled_effects_does_not_need_frames() {
+        assert!(!needs_frames(&[], true));
+        assert!(!needs_frames(&[stub(false, false)], true));
+        assert!(!needs_frames(&[stub(false, true)], true));
+    }
+
+    #[test]
+    fn static_effect_needs_frames_only_while_a_render_is_pending() {
+        assert!(needs_frames(&[stub(true, false)], true));
+        assert!(!needs_frames(&[stub(true, false)], false));
+    }
+
+    #[test]
+    fn animated_effect_always_needs_frames() {
+        assert!(needs_frames(&[stub(true, true)], false));
+        assert!(needs_frames(&[stub(false, false), stub(true, true)], false));
+    }
+
+    /// Regression: a static starfield patched from 50 to 400 stars kept
+    /// drawing the old set, because regeneration waited for an `update()`
+    /// that runs before patches are applied and the patched frame was the
+    /// last one a static effect asks for.
+    #[test]
+    fn configure_now_applies_deferred_regeneration_before_the_next_render() {
+        use crate::effects::starfield::StarfieldEffect;
+
+        let mut base = EffectConfig::new();
+        base.insert("enabled", "true");
+        base.insert("density", "50");
+        base.insert("layers", "1");
+        let mut stars = StarfieldEffect::default();
+        configure_now(&mut stars, &base, 0.0);
+        let before = stars.star_count();
+        assert!(before > 0);
+
+        let mut patch = EffectConfig::new();
+        patch.insert("density", "400");
+        configure_now(&mut stars, &patch, 1.0);
+        assert!(
+            stars.star_count() > before,
+            "patched density not applied: {} -> {}",
+            before,
+            stars.star_count()
+        );
+    }
+
+    #[test]
+    fn configure_now_leaves_disabled_effects_alone() {
+        struct CountingStub {
+            updates: u32,
+        }
+        impl BackdropEffect for CountingStub {
+            fn effect_type(&self) -> &'static str {
+                "counting"
+            }
+            fn update(&mut self, _dt: f64, _time: f64) {
+                self.updates += 1;
+            }
+            fn render(&self, _scene: &mut Scene, _bounds: Rect) {}
+            fn configure(&mut self, _config: &EffectConfig) {}
+            fn is_enabled(&self) -> bool {
+                false
+            }
+        }
+        let mut stub = CountingStub { updates: 0 };
+        configure_now(&mut stub, &EffectConfig::new(), 0.0);
+        assert_eq!(stub.updates, 0);
     }
 
     #[test]
