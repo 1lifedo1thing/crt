@@ -75,11 +75,12 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Run visual tests
-        # Fail instead of silently skipping when the runner has no GPU adapter
+      - name: Run GPU tests
+        # Fail instead of silently skipping when the runner has no GPU adapter.
+        # Covers the golden-image tests and the headless per-pass buffer tests.
         env:
           CRT_REQUIRE_GPU: "1"
-        run: cargo test --test visual_tests
+        run: cargo test --test visual_tests --test transient_render_tests
 
       - name: Upload failure artifacts
         if: failure()
