@@ -898,6 +898,7 @@ dependencies = [
  "crt-core",
  "crt-renderer",
  "crt-theme",
+ "crt-update",
  "dhat",
  "dirs 5.0.1",
  "env_logger",
@@ -967,7 +968,9 @@ version = "0.1.0"
 dependencies = [
  "log",
  "semver 1.0.27",
+ "serde",
  "thiserror 2.0.17",
+ "toml",
 ]
 
 [[package]]

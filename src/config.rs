@@ -236,6 +236,34 @@ impl Default for BellConfig {
     }
 }
 
+/// Update check configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdatesConfig {
+    /// Check for a newer release on launch. When false, CRT makes no network
+    /// requests of its own; "Check for Updates" in the menu still works,
+    /// because that is the user asking.
+    pub check: bool,
+    /// Minimum hours between automatic checks.
+    pub interval_hours: u32,
+}
+
+impl Default for UpdatesConfig {
+    fn default() -> Self {
+        Self {
+            check: true,
+            interval_hours: 24,
+        }
+    }
+}
+
+impl UpdatesConfig {
+    pub fn interval(&self) -> std::time::Duration {
+        // Zero would mean a check on every launch; one hour is the floor.
+        std::time::Duration::from_secs(u64::from(self.interval_hours.max(1)) * 3600)
+    }
+}
+
 /// Keybinding action
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -425,6 +453,7 @@ pub struct Config {
     pub cursor: CursorConfig,
     pub bell: BellConfig,
     pub keybindings: KeybindingsConfig,
+    pub updates: UpdatesConfig,
     /// Command used to open a Cmd/Ctrl-clicked file path. When `None`, the OS
     /// default application is used (`open`/`xdg-open`). When set, the string is
     /// split on whitespace and the placeholders `{file}`, `{line}`, `{col}` are

@@ -14,6 +14,7 @@ impl App {
         log::info!("Menu action: {:?}", action);
         match action {
             MenuAction::OpenConfig => self.open_config_file(),
+            MenuAction::CheckForUpdates => self.request_update_check(),
             MenuAction::NewTab => self.open_new_tab(),
             MenuAction::NewWindow => {
                 self.pending_new_window = true;

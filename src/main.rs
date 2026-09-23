@@ -20,6 +20,20 @@ mod window;
 use winit::event_loop::{ControlFlow, EventLoop};
 
 fn main() {
+    // Answer --version before any window exists: scripts and bug reports ask
+    // for it, and the install kind is the other half of "what am I running?".
+    if std::env::args()
+        .skip(1)
+        .any(|a| a == "--version" || a == "-V")
+    {
+        println!(
+            "crt {} ({})",
+            app::updates::running_version(),
+            app::updates::current_install_kind().label()
+        );
+        return;
+    }
+
     // Enable debug logging when profiling is enabled
     let profiling_enabled = std::env::var("CRT_PROFILE").is_ok();
     let default_filter = if profiling_enabled {

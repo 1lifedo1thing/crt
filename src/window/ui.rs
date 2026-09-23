@@ -139,6 +139,9 @@ pub struct UiState {
     pub overrides: OverrideState,
     /// Pending theme change from context menu (processed by main loop)
     pub pending_theme: Option<String>,
+    /// Set when the context menu update entry is clicked; the app picks it
+    /// up in `about_to_wait`, where it can reach the waker and config.
+    pub pending_update_check: bool,
 }
 
 /// Toast notification for errors and status messages

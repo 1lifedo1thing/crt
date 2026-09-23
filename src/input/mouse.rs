@@ -619,6 +619,10 @@ pub(super) fn handle_context_menu_action(state: &mut WindowState, item: ContextM
             // Store pending theme change for main loop to process
             state.ui.pending_theme = Some(name);
         }
+        ContextMenuItem::Update(_) => {
+            // Checking needs the waker and config, which live on App.
+            state.ui.pending_update_check = true;
+        }
     }
 }
 

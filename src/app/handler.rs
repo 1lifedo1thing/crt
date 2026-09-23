@@ -386,7 +386,14 @@ impl ApplicationHandler<WakeReason> for App {
                             &self.modifiers,
                             self.config.open_file_command.as_deref(),
                         );
+                        // Update entry clicked in the context menu
+                        if std::mem::take(&mut state.ui.pending_update_check) {
+                            self.request_update_check();
+                        }
                         // Check for pending theme change from context menu
+                        let Some(state) = self.windows.get_mut(&id) else {
+                            return;
+                        };
                         if let Some(theme_name) = state.ui.pending_theme.take() {
                             if let Some(theme) = self.theme_registry.get_theme(&theme_name).cloned()
                             {
@@ -492,6 +499,16 @@ impl ApplicationHandler<WakeReason> for App {
         {
             self.handle_menu_action(action, event_loop);
         }
+
+        // The update check waits for the first frame to be on screen: it
+        // resolves a hostname, and nobody should pay for that at startup.
+        if self.windows.values().any(|w| w.render.frame_count > 0) {
+            let config = self.config.updates.clone();
+            let state_path = Self::update_state_path();
+            self.updates
+                .start_launch_check(&self.waker, &config, state_path);
+        }
+        self.drain_update_events();
 
         // Config/theme file changes (debounced on the trailing edge by the watcher)
         let events: Vec<_> = self

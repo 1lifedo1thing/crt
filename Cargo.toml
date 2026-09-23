@@ -72,6 +72,7 @@ log = { workspace = true }
 crt-core = { path = "crates/crt-core" }
 crt-renderer = { path = "crates/crt-renderer" }
 crt-theme = { path = "crates/crt-theme" }
+crt-update = { path = "crates/crt-update" }
 anyhow = { workspace = true }
 notify = { workspace = true }
 dirs = { workspace = true }
