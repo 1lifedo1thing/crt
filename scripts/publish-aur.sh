@@ -56,11 +56,51 @@ if ! download_with_retry "$AARCH64_URL" "$WORK_DIR/aarch64.tar.gz"; then
     exit 1
 fi
 
-# Compute checksums
-SHA256_X86_64=$(sha256sum "$WORK_DIR/x86_64.tar.gz" | cut -d' ' -f1)
+# Take the checksums from the release's own SHA256SUMS rather than hashing
+# what we just downloaded: that way the AUR package and the in-app updater
+# (CRT-I-0034) trust one published list, and a corrupted download is caught
+# here instead of being blessed into the PKGBUILD.
+SUMS_URL="https://github.com/colliery-io/crt/releases/download/v${VERSION}/SHA256SUMS"
+echo "Downloading SHA256SUMS..."
+if ! download_with_retry "$SUMS_URL" "$WORK_DIR/SHA256SUMS"; then
+    echo "Error: SHA256SUMS not found for v${VERSION}"
+    echo "  Releases from v0.1.5 and earlier do not publish it."
+    exit 1
+fi
+
+# Look up one bare filename in SHA256SUMS. Tolerates the "*" binary marker
+# some sha256sum modes emit.
+sum_for() {
+    local filename="$1"
+    local sum
+    sum=$(awk -v f="$filename" '{ name = $2; sub(/^\*/, "", name); if (name == f) print $1 }' \
+        "$WORK_DIR/SHA256SUMS")
+    if [ -z "$sum" ]; then
+        echo "Error: no SHA256SUMS entry for $filename" >&2
+        exit 1
+    fi
+    printf '%s' "$sum"
+}
+
+# Confirm the bytes we downloaded are the bytes the release published.
+verify_sum() {
+    local file="$1" expected="$2" label="$3"
+    local actual
+    actual=$(sha256sum "$file" | cut -d' ' -f1)
+    if [ "$actual" != "$expected" ]; then
+        echo "Error: $label checksum mismatch against SHA256SUMS" >&2
+        echo "  expected: $expected" >&2
+        echo "  actual:   $actual" >&2
+        exit 1
+    fi
+}
+
+SHA256_X86_64=$(sum_for "crt-${VERSION}-linux-x86_64.tar.gz")
+verify_sum "$WORK_DIR/x86_64.tar.gz" "$SHA256_X86_64" "x86_64"
 echo "x86_64 checksum: $SHA256_X86_64"
 
-SHA256_AARCH64=$(sha256sum "$WORK_DIR/aarch64.tar.gz" | cut -d' ' -f1)
+SHA256_AARCH64=$(sum_for "crt-${VERSION}-linux-aarch64.tar.gz")
+verify_sum "$WORK_DIR/aarch64.tar.gz" "$SHA256_AARCH64" "aarch64"
 echo "aarch64 checksum: $SHA256_AARCH64"
 
 # Generate PKGBUILD from template

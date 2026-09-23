@@ -51,6 +51,23 @@ echo "Platform: $PLATFORM"
 echo "Architecture: $ARCH"
 echo ""
 
+# Write SHA256SUMS over every tarball in the dist dir, in the same coreutils
+# format the release workflow publishes ("<hex><two spaces><filename>").
+# CI regenerates it across all four platform artifacts; locally it covers
+# whatever this machine built, which is enough for an offline AUR dry run.
+write_sha256sums() {
+    local dir="$1"
+    (
+        cd "$dir"
+        if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum crt-*.tar.gz > SHA256SUMS
+        else
+            # macOS: shasum -a 256 emits the identical format
+            shasum -a 256 crt-*.tar.gz > SHA256SUMS
+        fi
+    )
+}
+
 # Build release binary
 echo "Building release binary..."
 cd "$PROJECT_ROOT"
@@ -147,10 +164,13 @@ elif [ "$PLATFORM" = "linux" ]; then
     ls -lh "$RELEASE_DIR/${ARTIFACT_NAME}.tar.gz"
 fi
 
+write_sha256sums "$RELEASE_DIR"
+
 echo ""
 echo "Release build complete!"
 echo ""
 echo "Artifact: $RELEASE_DIR/${ARTIFACT_NAME}.tar.gz"
+echo "Checksums: $RELEASE_DIR/SHA256SUMS"
 echo ""
 echo "To create a GitHub release:"
 echo "  gh release create v${VERSION} '$RELEASE_DIR/${ARTIFACT_NAME}.tar.gz' --title 'v${VERSION}' --notes 'Release notes here'"
