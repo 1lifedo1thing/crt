@@ -441,9 +441,10 @@ mod tests {
         let path = AssetManifest::path(dir.path());
         assert_eq!(AssetManifest::load(&path), AssetManifest::default());
 
-        let mut manifest = AssetManifest::default();
-        manifest.version = Some("0.1.6".into());
-        manifest.files.insert("themes/a.css".into(), "abc".into());
+        let manifest = AssetManifest {
+            version: Some("0.1.6".into()),
+            files: BTreeMap::from([("themes/a.css".to_string(), "abc".to_string())]),
+        };
         manifest.save(&path).unwrap();
         assert_eq!(AssetManifest::load(&path), manifest);
 
