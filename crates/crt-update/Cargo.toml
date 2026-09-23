@@ -1,0 +1,20 @@
+[package]
+name = "crt-update"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+# Lets CRT_UPDATE_URL redirect the updater in an optimised build, so a
+# release candidate can be tested against a local release. Never enabled
+# for a build that ships.
+dev-update-url = []
+
+[dependencies]
+flate2 = "1.0"
+log.workspace = true
+semver = "1.0"
+serde.workspace = true
+sha2 = "0.10"
+tar = "0.4"
+thiserror = "2.0"
+toml.workspace = true

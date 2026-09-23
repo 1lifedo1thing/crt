@@ -367,6 +367,7 @@ impl App {
                 window_rename: Default::default(),
                 overrides: Default::default(),
                 pending_theme: None,
+                pending_update_check: false,
             },
             custom_title: None,
             theme: theme.clone(),

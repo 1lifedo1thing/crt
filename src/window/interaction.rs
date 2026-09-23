@@ -41,6 +41,9 @@ pub enum ContextMenuItem {
     Themes,
     /// Individual theme (shown in submenu)
     Theme(String),
+    /// Update entry. Carries its own label because the text changes with
+    /// what the last check found ("Check for Updates…" / "Update to vX…").
+    Update(String),
 }
 
 impl ContextMenuItem {
@@ -53,6 +56,7 @@ impl ContextMenuItem {
             ContextMenuItem::Separator => "",
             ContextMenuItem::Themes => "Theme",
             ContextMenuItem::Theme(name) => name.as_str(),
+            ContextMenuItem::Update(label) => label.as_str(),
         }
     }
 
@@ -64,7 +68,9 @@ impl ContextMenuItem {
             ContextMenuItem::Paste => "Cmd+V",
             ContextMenuItem::SelectAll => "Cmd+A",
             ContextMenuItem::Themes => "\u{25B6}", // Right-pointing triangle for submenu
-            ContextMenuItem::Separator | ContextMenuItem::Theme(_) => "",
+            ContextMenuItem::Separator | ContextMenuItem::Theme(_) | ContextMenuItem::Update(_) => {
+                ""
+            }
         }
         // The application chord on Linux/Windows is Ctrl+Shift, so plain
         // Ctrl chords (^C, ^A, ...) still reach the shell.
@@ -74,7 +80,9 @@ impl ContextMenuItem {
             ContextMenuItem::Paste => "Ctrl+Shift+V",
             ContextMenuItem::SelectAll => "Ctrl+Shift+A",
             ContextMenuItem::Themes => "\u{25B6}", // Right-pointing triangle for submenu
-            ContextMenuItem::Separator | ContextMenuItem::Theme(_) => "",
+            ContextMenuItem::Separator | ContextMenuItem::Theme(_) | ContextMenuItem::Update(_) => {
+                ""
+            }
         }
     }
 
@@ -150,6 +158,9 @@ pub const MENU_WIDTH: f32 = 160.0;
 pub const SUBMENU_WIDTH: f32 = 200.0;
 /// Border thickness.
 pub const MENU_BORDER: f32 = 1.0;
+
+/// Shown on the update entry until a check says otherwise.
+pub const DEFAULT_UPDATE_LABEL: &str = "Check for Updates…";
 
 /// Context menu metrics in physical pixels for a given scale factor.
 ///
@@ -268,6 +279,8 @@ pub struct ContextMenu {
     pub themes: Vec<String>,
     /// Currently active theme name
     pub current_theme: String,
+    /// Label for the update entry, refreshed by the app after every check.
+    pub update_label: String,
     /// Whether the theme submenu is visible
     pub submenu_visible: bool,
     /// Submenu position (top-left corner)
@@ -298,6 +311,16 @@ impl ContextMenu {
             self.items.push(ContextMenuItem::Separator);
             self.items.push(ContextMenuItem::Themes);
         }
+        // Always last: on Linux and Windows this is the only menu there is,
+        // and on macOS it mirrors the app menu entry. Empty means no check
+        // has reported yet, which is the same thing the user can ask for.
+        self.items.push(ContextMenuItem::Separator);
+        let update_label = if self.update_label.is_empty() {
+            DEFAULT_UPDATE_LABEL.to_string()
+        } else {
+            self.update_label.clone()
+        };
+        self.items.push(ContextMenuItem::Update(update_label));
         self.theme_items = self
             .themes
             .iter()
@@ -309,6 +332,15 @@ impl ContextMenu {
     pub fn set_themes(&mut self, themes: Vec<String>) {
         self.themes = themes;
         self.rebuild_items();
+    }
+
+    /// Replace the update entry label ("Check for Updates…" or
+    /// "Update to vX.Y.Z…") and rebuild the cached items.
+    pub fn set_update_label(&mut self, label: String) {
+        if self.update_label != label {
+            self.update_label = label;
+            self.rebuild_items();
+        }
     }
 
     /// Set the scale factor used for layout.
@@ -656,16 +688,24 @@ mod tests {
     #[test]
     fn items_are_cached_and_borrowed() {
         let menu = menu_with_themes(1.0);
-        assert_eq!(menu.items().len(), 5); // Copy, Paste, SelectAll, Sep, Themes
+        // Copy, Paste, SelectAll, Sep, Themes, Sep, Update
+        assert_eq!(menu.items().len(), 7);
         assert_eq!(menu.theme_items().len(), 3);
         assert_eq!(menu.items()[4].label(), "Theme");
         assert_eq!(menu.theme_items()[0].label(), "alpha");
         assert_eq!(menu.themes_item_index(), Some(4));
+        // The update entry is always last, whatever else the menu has.
+        assert_eq!(menu.items().last().unwrap().label(), DEFAULT_UPDATE_LABEL);
 
         let mut no_themes = ContextMenu::default();
         no_themes.show(0.0, 0.0);
-        assert_eq!(no_themes.items().len(), 3);
+        // Copy, Paste, SelectAll, Sep, Update
+        assert_eq!(no_themes.items().len(), 5);
         assert_eq!(no_themes.themes_item_index(), None);
+        assert_eq!(
+            no_themes.items().last().unwrap().label(),
+            DEFAULT_UPDATE_LABEL
+        );
     }
 
     /// Regression: the padded layout left a frame around the rows that is
@@ -871,6 +911,12 @@ mod tests {
         // Right enters again; Right on a non-Themes item does nothing.
         assert!(menu.enter_submenu());
         assert!(menu.leave_submenu());
+        menu.focus_next(); // past the separator, onto the update entry
+        assert_eq!(menu.focused_item, Some(6));
+        assert!(matches!(
+            menu.get_focused_item(),
+            Some(ContextMenuItem::Update(_))
+        ));
         menu.focus_next(); // wraps to Copy
         assert_eq!(menu.focused_item, Some(0));
         assert!(!menu.submenu_visible);

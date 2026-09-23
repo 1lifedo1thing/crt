@@ -78,6 +78,17 @@ blink_interval_ms = 530
 # =============================================================================
 # Bell Configuration
 # =============================================================================
+[updates]
+# Check GitHub for a newer release on launch, at most once per interval.
+# When false, CRT makes no network requests of its own; "Check for Updates"
+# in the menu still works, because that is you asking for one.
+# The check is one HTTPS request to github.com for the release checksums,
+# and it never installs anything on its own.
+check = true
+
+# Minimum hours between automatic checks (minimum 1).
+interval_hours = 24
+
 [bell]
 # Enable visual bell (screen flash on bell character)
 visual = true

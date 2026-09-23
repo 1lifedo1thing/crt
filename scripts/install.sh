@@ -175,8 +175,11 @@ install_binary() {
             cp -R "${tmp_dir}/crt.app" "/Applications/"
 
             # Remove quarantine attribute (requires sudo)
-            info "Removing quarantine attribute (may require password)..."
-            sudo xattr -rd com.apple.quarantine "/Applications/crt.app" 2>/dev/null || true
+            # Defensive only: curl does not set the quarantine attribute and
+            # the bundle has no LSFileQuarantineEnabled, so there is normally
+            # nothing to remove. These are files this user just wrote, so it
+            # never needs sudo (and a password prompt here surprised people).
+            xattr -dr com.apple.quarantine "/Applications/crt.app" 2>/dev/null || true
         else
             error "App bundle not found in release archive"
         fi
@@ -191,6 +194,7 @@ install_binary() {
 setup_config() {
     local tmp_dir="$1"
     local os="$2"
+    local install_dir="${3:-}"
     local config_dir="${HOME}/.config/crt"
 
     info "Setting up configuration in ${config_dir}..."
@@ -208,6 +212,21 @@ setup_config() {
     fi
 
     if [ -n "$assets_dir" ]; then
+        # Prefer the binary we just installed: `crt update --finish-install`
+        # applies the same rules the in-app updater uses, which means a
+        # bundled theme you edited in place is kept instead of overwritten.
+        # The copy loops below are the fallback for older binaries that do
+        # not have the subcommand yet.
+        local installed_bin="${install_dir}/crt"
+        if [ "$os" = "macos" ]; then
+            installed_bin="/Applications/crt.app/Contents/MacOS/crt"
+        fi
+        if [ -x "$installed_bin" ] && \
+           "$installed_bin" update --finish-install "$assets_dir" 2>/dev/null; then
+            return 0
+        fi
+        info "Falling back to copying assets directly"
+
         # Copy default config (only if user doesn't have one)
         if [ ! -f "${config_dir}/config.toml" ]; then
             if [ -f "${assets_dir}/config.toml" ]; then
@@ -346,7 +365,7 @@ main() {
     install_binary "$tmp_dir" "$install_dir" "$os"
 
     # Set up config
-    setup_config "$tmp_dir" "$os"
+    setup_config "$tmp_dir" "$os" "$install_dir"
 
     echo ""
     success "crt v${version} installed successfully!"

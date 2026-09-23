@@ -8,6 +8,7 @@ mod handler;
 mod initialization;
 #[cfg(target_os = "macos")]
 mod menu_actions;
+pub(crate) mod updates;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -35,6 +36,8 @@ pub(crate) enum WakeReason {
     Pty,
     /// The config watcher saw a file change
     Watcher,
+    /// The update check finished
+    Update,
 }
 
 /// Wakes the winit loop from other threads, coalescing bursts.
@@ -46,6 +49,7 @@ pub(crate) struct Waker {
     proxy: EventLoopProxy<WakeReason>,
     pty_pending: AtomicBool,
     watcher_pending: AtomicBool,
+    update_pending: AtomicBool,
 }
 
 impl Waker {
@@ -54,6 +58,7 @@ impl Waker {
             proxy,
             pty_pending: AtomicBool::new(false),
             watcher_pending: AtomicBool::new(false),
+            update_pending: AtomicBool::new(false),
         }
     }
 
@@ -61,6 +66,7 @@ impl Waker {
         match reason {
             WakeReason::Pty => &self.pty_pending,
             WakeReason::Watcher => &self.watcher_pending,
+            WakeReason::Update => &self.update_pending,
         }
     }
 
@@ -124,6 +130,13 @@ pub(crate) struct App {
     pub(crate) menu: Option<Menu>,
     #[cfg(target_os = "macos")]
     pub(crate) menu_ids: Option<MenuIds>,
+    /// Update check state (install kind, latest known release, worker)
+    pub(crate) updates: updates::Updates,
+    /// Whether the check now running was asked for by the user, which
+    /// decides whether a boring result is worth a toast.
+    pub(crate) update_check_requested: bool,
+    /// First-launch cleanup after an update has run this session.
+    pub(crate) update_finished: bool,
 }
 
 impl App {
@@ -161,6 +174,9 @@ impl App {
             menu: None,
             #[cfg(target_os = "macos")]
             menu_ids: None,
+            updates: updates::Updates::new(),
+            update_check_requested: false,
+            update_finished: false,
         }
     }
 

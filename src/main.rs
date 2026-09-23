@@ -20,6 +20,40 @@ mod window;
 use winit::event_loop::{ControlFlow, EventLoop};
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Answer --version before any window exists: scripts and bug reports ask
+    // for it, and the install kind is the other half of "what am I running?".
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!(
+            "crt {} ({})",
+            app::updates::running_version(),
+            app::updates::current_install_kind().label()
+        );
+        return;
+    }
+
+    // `crt update` is the headless half of the in-app updater: the same code
+    // paths, no window, and exit codes a script can branch on.
+    if args.first().is_some_and(|a| a == "update") {
+        env_logger::Builder::from_env(
+            env_logger::Env::default().default_filter_or("warn,crt=info"),
+        )
+        .init();
+        // `--finish-install <assets dir>` is how install.sh hands the
+        // bundled themes and fonts over, so the script and the updater
+        // share one set of rules about overwriting them.
+        if let Some(index) = args.iter().position(|a| a == "--finish-install") {
+            let Some(assets_dir) = args.get(index + 1) else {
+                eprintln!("crt update --finish-install needs an assets directory");
+                std::process::exit(1);
+            };
+            std::process::exit(app::updates::run_finish_install(assets_dir));
+        }
+        let check_only = args.iter().any(|a| a == "--check");
+        std::process::exit(app::updates::run_cli(check_only));
+    }
+
     // Enable debug logging when profiling is enabled
     let profiling_enabled = std::env::var("CRT_PROFILE").is_ok();
     let default_filter = if profiling_enabled {

@@ -56,10 +56,26 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      # SHA256SUMS is what the in-app updater fetches: it is both the version
+      # discovery source and the integrity check (CRT-I-0034). The format is a
+      # contract the app parses, so keep it exactly as coreutils writes it:
+      #   - one line per asset: "<64 lowercase hex><two spaces><filename>"
+      #   - filenames are bare (no path), "crt-<semver>-<os>-<arch>.tar.gz"
+      #   - every entry carries the same <semver>
+      # The app reads the version from these filenames, so a release whose
+      # entries disagree on the version is rejected rather than guessed at.
+      - name: Generate SHA256SUMS
+        working-directory: artifacts
+        run: |
+          sha256sum crt-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
       - name: Create release
         uses: softprops/action-gh-release@v1
         with:
-          files: artifacts/*.tar.gz
+          files: |
+            artifacts/*.tar.gz
+            artifacts/SHA256SUMS
 
   publish-aur:
     needs: release

@@ -39,6 +39,11 @@ This is the result. It's not as fast as [rio](https://rioterm.com/) or [alacritt
 curl -sSL https://raw.githubusercontent.com/colliery-io/crt/main/scripts/install.sh | sh
 ```
 
+CRT tells you when a new release is out and can install it for you, from
+the menu or with `crt update` — your shells keep running. See
+[Updating CRT](docs/how-to/update.md) for what it checks, how to turn the
+check off, and how to go back a version.
+
 > Windows support coming [Soon™](https://wowpedia.fandom.com/wiki/Soon)
 
 ## Quick Start

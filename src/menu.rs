@@ -13,6 +13,7 @@ use muda::{
 pub enum MenuAction {
     // App menu
     OpenConfig,
+    CheckForUpdates,
     // Shell menu
     NewTab,
     NewWindow,
@@ -70,6 +71,9 @@ impl MenuAction {
 #[cfg(target_os = "macos")]
 pub struct MenuIds {
     pub open_config: MenuId,
+    pub check_for_updates: MenuId,
+    /// Handle kept so the label can change to "Update to vX.Y.Z…".
+    pub check_for_updates_item: MenuItem,
     pub new_tab: MenuId,
     pub new_window: MenuId,
     pub rename_window: MenuId,
@@ -229,12 +233,15 @@ pub fn build_menu_bar(
             Accelerator::new(Some(AccelMods::SUPER), Code::Comma),
         )),
     );
+    let check_for_updates =
+        MenuItem::with_id("check_for_updates", "Check for Updates…", true, None);
     let app_menu = Submenu::with_items(
         "CRT",
         true,
         &[
             &PredefinedMenuItem::about(None, Some(about_metadata)),
             &PredefinedMenuItem::separator(),
+            &check_for_updates,
             &open_config,
             &PredefinedMenuItem::separator(),
             &PredefinedMenuItem::services(None),
@@ -614,6 +621,8 @@ pub fn build_menu_bar(
 
     let ids = MenuIds {
         open_config: open_config.id().clone(),
+        check_for_updates: check_for_updates.id().clone(),
+        check_for_updates_item: check_for_updates.clone(),
         new_tab: new_tab.id().clone(),
         new_window: new_window.id().clone(),
         rename_window: rename_window.id().clone(),
@@ -682,6 +691,9 @@ pub fn set_windows_menu(window_submenu: &Submenu) {
 pub fn menu_id_to_action(id: &MenuId, ids: &MenuIds) -> Option<MenuAction> {
     if *id == ids.open_config {
         return Some(MenuAction::OpenConfig);
+    }
+    if *id == ids.check_for_updates {
+        return Some(MenuAction::CheckForUpdates);
     }
     if *id == ids.new_tab {
         return Some(MenuAction::NewTab);
