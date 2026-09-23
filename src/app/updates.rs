@@ -14,9 +14,10 @@ use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::SystemTime;
 
 use crt_update::{
-    Applied, ApplyError, CheckConfig, CurlFetch, Fetch, InstallKind, RealFs, ReleaseManifest,
-    Stage, UpdateEvent, UpdatePlan, UpdateState, Version, apply, availability_message, classify,
-    failure_message, manifest, menu_label, run_check, up_to_date_message,
+    Applied, ApplyError, CheckConfig, CurlFetch, Fetch, InstallKind, ManagedHint, RealFs,
+    ReleaseManifest, Stage, UpdateEvent, UpdatePlan, UpdateState, Version, apply,
+    availability_message, classify, failure_message, manifest, menu_label, run_check,
+    up_to_date_message,
 };
 
 use crate::config::UpdatesConfig;
@@ -604,9 +605,16 @@ pub(crate) fn run_cli(check_only: bool) -> i32 {
     }
 
     if !kind.can_self_replace() {
-        match kind.upgrade_hint() {
-            Some(hint) => println!("This install is managed elsewhere; update it with: {hint}"),
-            None => println!("This install cannot be updated in place"),
+        match &kind {
+            InstallKind::Managed {
+                hint: ManagedHint::NotWritable,
+            } => println!(
+                "CRT cannot write to its install directory; re-run the install script to update"
+            ),
+            _ => match kind.upgrade_hint() {
+                Some(hint) => println!("This install is managed elsewhere; update it with: {hint}"),
+                None => println!("This install cannot be updated in place"),
+            },
         }
         return 2;
     }
