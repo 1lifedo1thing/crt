@@ -167,3 +167,30 @@ Each phase ships value on its own; decompose into one task per line item.
 8. **HTTPS via a `curl` subprocess** behind a `Fetch` trait; no in-process TLS stack.
 
 Corrections folded in from the review: `~/.cargo/bin` and unwritable paths are `Managed`; symlinks are canonicalised before classification; `Dev` covers release builds run from `target/`; the quarantine step is defensive only and never uses sudo; staging is a hidden same-filesystem dir with a lock file; rollback is the `.old` sibling plus a documented rename, not a flag; Linux icons/`.desktop` are refreshed with the assets.
+
+## Status Updates
+
+### 2026-09-23 - all six tasks complete, ready for review
+
+Commits on `feat/self-update`: `89d9a78` (SHA256SUMS), `5c134d0` (crate, pure layers), `a3ab352` (check + notify), `019110e` (apply + CLI), `c752e67` (macOS bundle), `b44b08b` (assets, first launch, docs).
+
+865 workspace tests (up from 848 before this initiative; 81 in `crt-update`), `cargo clippy --all-targets` clean, `cargo fmt` applied.
+
+**Deviations from the plan above, all recorded on their tasks:**
+
+- **REQ-006**: bundled assets are refreshed at *install* time, not on first launch. The tarball carries `assets/` and the updater has it unpacked in hand; first launch keeps the other half of the requirement (removing the retired copy, which is the moment the new binary has proved it starts). The `.desktop`/icons half of REQ-006 was dropped: `scripts/install.sh` never installed them - `installer/linux/install.sh` does - so the assumption behind it was wrong, and silently rewriting a user's `.desktop` file is worse than leaving it.
+- **`Fetch`** has `get_text` and `download` rather than one method with a destination enum; the two transfers want different error handling.
+- **`UpdateEvent`** gained `Unreadable` alongside `Failed`: a release we cannot parse is not a network problem and must not read as "up to date".
+- **Background failures are silent** (logged only); only a check the user asked for reports a failure.
+- **`CRT_UPDATE_URL`** (debug builds, or release builds with the `crt-update/dev-update-url` feature) points the updater at a local release so the whole download-verify-swap path can be exercised over curl's `file://` support. A shipped build ignores it.
+
+**Bugs this work found in its own design:** `with_extension("old")` would have turned `crt.app` into `crt.old`, making the documented recovery path a directory macOS will not launch. Fixed and pinned by a test before it could ship.
+
+**Verified end to end on macOS** with an optimised binary and a local release: check, install, asset refresh keeping an edited theme, `.old` kept, first launch removing it and recording the version. The failure paths were verified against the real network too (no release carries `SHA256SUMS` yet, so the 404 path is exercised for real, and `check = false` makes no request at all).
+
+**Left for a human before this ships:**
+
+1. **The first release with `SHA256SUMS` closes the last gap.** No published release has the file yet, so the "an update is available" toast and the retitled menu entry have never run against a real GitHub release. Everything up to that point is covered.
+2. **Manual macOS checks**: launching a `release.sh` bundle through Finder/LaunchServices after an update, and the non-admin `/Applications` case (covered by a read-only-directory test, not by a real account).
+3. **Manual Linux check**: a real `install.sh` install updating itself. Same code path as the verified macOS single-binary case.
+4. The initiative is left in `decompose` for review rather than transitioned.
