@@ -20,18 +20,28 @@ mod window;
 use winit::event_loop::{ControlFlow, EventLoop};
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
     // Answer --version before any window exists: scripts and bug reports ask
     // for it, and the install kind is the other half of "what am I running?".
-    if std::env::args()
-        .skip(1)
-        .any(|a| a == "--version" || a == "-V")
-    {
+    if args.iter().any(|a| a == "--version" || a == "-V") {
         println!(
             "crt {} ({})",
             app::updates::running_version(),
             app::updates::current_install_kind().label()
         );
         return;
+    }
+
+    // `crt update` is the headless half of the in-app updater: the same code
+    // paths, no window, and exit codes a script can branch on.
+    if args.first().is_some_and(|a| a == "update") {
+        env_logger::Builder::from_env(
+            env_logger::Env::default().default_filter_or("warn,crt=info"),
+        )
+        .init();
+        let check_only = args.iter().any(|a| a == "--check");
+        std::process::exit(app::updates::run_cli(check_only));
     }
 
     // Enable debug logging when profiling is enabled

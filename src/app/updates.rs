@@ -14,8 +14,9 @@ use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::SystemTime;
 
 use crt_update::{
-    CheckConfig, CurlFetch, InstallKind, RealFs, UpdateEvent, UpdateState, Version,
-    availability_message, classify, failure_message, menu_label, run_check, up_to_date_message,
+    Applied, ApplyError, CheckConfig, CurlFetch, Fetch, InstallKind, RealFs, ReleaseManifest,
+    Stage, UpdateEvent, UpdatePlan, UpdateState, Version, apply, availability_message, classify,
+    failure_message, manifest, menu_label, run_check, up_to_date_message,
 };
 
 use crate::config::UpdatesConfig;
@@ -58,6 +59,14 @@ pub(crate) enum UpdateOutcome {
     Silent,
 }
 
+/// What an in-progress update reports back to the main thread.
+#[derive(Debug)]
+pub(crate) enum ApplyEvent {
+    Stage(Stage),
+    Done(Applied),
+    Failed(ApplyError),
+}
+
 /// Update state owned by the app.
 pub(crate) struct Updates {
     pub(crate) kind: InstallKind,
@@ -68,6 +77,10 @@ pub(crate) struct Updates {
     in_flight: bool,
     /// The automatic launch check has been started (or deliberately skipped).
     launch_check_done: bool,
+    /// Receives progress from an in-progress update.
+    apply_rx: Option<Receiver<ApplyEvent>>,
+    /// An update is being installed.
+    applying: bool,
 }
 
 impl Updates {
@@ -80,6 +93,8 @@ impl Updates {
             rx: None,
             in_flight: false,
             launch_check_done: false,
+            apply_rx: None,
+            applying: false,
         }
     }
 
@@ -172,6 +187,80 @@ impl Updates {
         });
     }
 
+    /// Download and install the newest release, reporting progress.
+    ///
+    /// The release is read again here rather than cached from the check: the
+    /// asset list and its hashes belong together, they are a few hundred
+    /// bytes, and fetching them now means the download is verified against
+    /// what the release says at the moment it is installed.
+    pub(crate) fn start_apply(&mut self, waker: &Arc<Waker>) {
+        if self.applying {
+            log::debug!("an update is already being installed");
+            return;
+        }
+        if !self.kind.can_self_replace() {
+            return;
+        }
+
+        let (tx, rx) = channel();
+        self.apply_rx = Some(rx);
+        self.applying = true;
+
+        let kind = self.kind.clone();
+        let waker = waker.clone();
+        let running = running_version();
+        std::thread::spawn(move || {
+            let fetch = CurlFetch::new(&running);
+            let send = |event| {
+                let _ = tx.send(event);
+                waker.wake(WakeReason::Update);
+            };
+
+            let outcome = plan_update(&fetch, &kind)
+                .and_then(|plan| apply(&plan, &fetch, &mut |stage| send(ApplyEvent::Stage(stage))));
+
+            send(match outcome {
+                Ok(applied) => ApplyEvent::Done(applied),
+                Err(error) => ApplyEvent::Failed(error),
+            });
+        });
+    }
+
+    /// Collect progress from an in-progress update.
+    pub(crate) fn poll_apply(&mut self) -> Vec<ApplyEvent> {
+        let mut events = Vec::new();
+        let mut disconnected = false;
+        if let Some(rx) = self.apply_rx.as_ref() {
+            loop {
+                match rx.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if events
+            .iter()
+            .any(|e| matches!(e, ApplyEvent::Done(_) | ApplyEvent::Failed(_)))
+        {
+            self.applying = false;
+        }
+        if disconnected {
+            self.apply_rx = None;
+            self.applying = false;
+        }
+
+        // An update that succeeded is no longer available to install.
+        if events.iter().any(|e| matches!(e, ApplyEvent::Done(_))) {
+            self.available = None;
+        }
+        events
+    }
+
     /// Collect whatever the worker has finished, and decide what to show.
     ///
     /// Returns one outcome per event; the caller turns `Toast` into a toast
@@ -258,16 +347,9 @@ impl super::App {
 
     /// Run a check because the user picked the menu entry.
     pub(crate) fn request_update_check(&mut self) {
-        // A self-replaceable install with a known update: this is where
-        // applying will hook in (CRT-T-0214 / CRT-T-0215). Until then, say
-        // so plainly rather than pretending the entry does nothing.
-        if self.updates.kind.can_self_replace()
-            && let Some(version) = self.updates.available.clone()
-        {
-            self.show_update_toast(format!(
-                "v{version} is available. In-place update lands in a later release; \
-                 re-run the install script for now."
-            ));
+        // A self-replaceable install with an update waiting: install it.
+        if self.updates.kind.can_self_replace() && self.updates.available.is_some() {
+            self.updates.start_apply(&self.waker);
             return;
         }
 
@@ -287,15 +369,36 @@ impl super::App {
             .start_user_check(&self.waker, &config, state_path);
     }
 
-    /// Turn finished checks into toasts and refresh the menu entry.
-    pub(crate) fn drain_update_events(&mut self) {
-        let requested = self.update_check_requested;
-        let outcomes = self.updates.poll(requested);
-        if outcomes.is_empty() {
-            return;
+    /// Turn update progress into toasts.
+    pub(crate) fn drain_apply_events(&mut self) {
+        for event in self.updates.poll_apply() {
+            match event {
+                ApplyEvent::Stage(stage) => {
+                    let version = self.updates.available.clone();
+                    self.show_update_toast(stage.message(version.as_ref()));
+                }
+                ApplyEvent::Done(applied) => {
+                    log::info!(
+                        "installed v{}; previous version kept at {}",
+                        applied.version,
+                        applied.previous.display()
+                    );
+                    self.show_update_toast(format!(
+                        "v{} installed. It takes effect the next time you open CRT.",
+                        applied.version
+                    ));
+                    self.refresh_update_menu_label();
+                }
+                ApplyEvent::Failed(error) => {
+                    log::warn!("update failed: {error}");
+                    self.show_update_toast(error.user_message());
+                }
+            }
         }
-        self.update_check_requested = false;
+    }
 
+    /// Put the current label on the update entry in every menu.
+    fn refresh_update_menu_label(&mut self) {
         let label = self.updates.menu_label();
         for state in self.windows.values_mut() {
             state.ui.context_menu.set_update_label(label.clone());
@@ -304,6 +407,20 @@ impl super::App {
         if let Some(ids) = self.menu_ids.as_ref() {
             ids.check_for_updates_item.set_text(&label);
         }
+    }
+
+    /// Turn finished checks into toasts and refresh the menu entry.
+    pub(crate) fn drain_update_events(&mut self) {
+        self.drain_apply_events();
+
+        let requested = self.update_check_requested;
+        let outcomes = self.updates.poll(requested);
+        if outcomes.is_empty() {
+            return;
+        }
+        self.update_check_requested = false;
+
+        self.refresh_update_menu_label();
 
         for outcome in outcomes {
             if let UpdateOutcome::Toast(message) = outcome {
@@ -332,6 +449,105 @@ impl super::App {
 /// Where a user without an in-place update is sent to read about the release.
 const RELEASES_PAGE: &str = "https://github.com/colliery-io/crt/releases/latest";
 
+/// Read the current release and build the plan for installing it.
+fn plan_update(fetch: &dyn Fetch, kind: &InstallKind) -> Result<UpdatePlan, ApplyError> {
+    let text = fetch.get_text(&manifest::sums_url(), crt_update::CHECK_TIMEOUT)?;
+    let release = ReleaseManifest::parse(&text).map_err(|e| ApplyError::ReleaseUnreadable {
+        reason: e.to_string(),
+    })?;
+    let asset = release
+        .asset_for_current_platform()
+        .ok_or_else(|| {
+            let (os, arch) = manifest::current_platform();
+            ApplyError::ReleaseUnreadable {
+                reason: format!("v{} has no {os}-{arch} build", release.version),
+            }
+        })?
+        .clone();
+
+    Ok(UpdatePlan {
+        kind: kind.clone(),
+        version: release.version,
+        asset,
+    })
+}
+
+/// Run `crt update` without a window.
+///
+/// Exit codes are meant for scripts: 0 did something, 2 nothing to do,
+/// 1 failed.
+pub(crate) fn run_cli(check_only: bool) -> i32 {
+    let running = running_version();
+    let kind = current_install_kind();
+    println!("crt {running} ({})", kind.label());
+
+    let fetch = CurlFetch::new(&running);
+    let text = match fetch.get_text(&manifest::sums_url(), crt_update::CHECK_TIMEOUT) {
+        Ok(text) => text,
+        Err(e) => {
+            eprintln!("{}", failure_message(&e));
+            return 1;
+        }
+    };
+    let release = match ReleaseManifest::parse(&text) {
+        Ok(release) => release,
+        Err(e) => {
+            eprintln!("Could not read the latest release: {e}");
+            return 1;
+        }
+    };
+
+    let status = match manifest::compare(&running, &release.version) {
+        Ok(status) => status,
+        Err(e) => {
+            eprintln!("Could not compare versions: {e}");
+            return 1;
+        }
+    };
+    let Some(version) = status.available_version().cloned() else {
+        println!("{}", up_to_date_message(&running));
+        return 2;
+    };
+
+    println!("v{version} is available");
+    if check_only {
+        return 0;
+    }
+
+    if !kind.can_self_replace() {
+        match kind.upgrade_hint() {
+            Some(hint) => println!("This install is managed elsewhere; update it with: {hint}"),
+            None => println!("This install cannot be updated in place"),
+        }
+        return 2;
+    }
+
+    let plan = match plan_update(&fetch, &kind) {
+        Ok(plan) => plan,
+        Err(e) => {
+            eprintln!("{}", e.user_message());
+            return 1;
+        }
+    };
+
+    match apply(&plan, &fetch, &mut |stage| {
+        println!("{}", stage.message(Some(&plan.version)));
+    }) {
+        Ok(applied) => {
+            println!(
+                "v{} installed. The previous version is at {}.",
+                applied.version,
+                applied.previous.display()
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("{}", e.user_message());
+            1
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,6 +560,8 @@ mod tests {
             rx: None,
             in_flight: false,
             launch_check_done: false,
+            apply_rx: None,
+            applying: false,
         }
     }
 

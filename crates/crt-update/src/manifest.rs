@@ -30,6 +30,23 @@ pub const LATEST_SUMS_URL: &str =
 /// Base for per-tag asset downloads.
 const RELEASE_DOWNLOAD_BASE: &str = "https://github.com/colliery-io/crt/releases/download";
 
+/// Where to look for the release description.
+///
+/// Debug builds honour `CRT_UPDATE_URL`, which is how the download, verify
+/// and swap path gets exercised end to end against a local release (curl
+/// takes `file://` URLs) without publishing one. Release builds always use
+/// GitHub: an environment variable that redirects the updater would be a way
+/// to feed it someone else's bytes.
+pub fn sums_url() -> String {
+    #[cfg(debug_assertions)]
+    if let Ok(url) = std::env::var("CRT_UPDATE_URL")
+        && !url.is_empty()
+    {
+        return url;
+    }
+    LATEST_SUMS_URL.to_string()
+}
+
 /// Release assets are named `crt-<version>-<os>-<arch>.tar.gz`.
 const ASSET_PREFIX: &str = "crt-";
 const ASSET_SUFFIX: &str = ".tar.gz";

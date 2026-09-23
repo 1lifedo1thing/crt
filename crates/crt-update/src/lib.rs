@@ -16,11 +16,13 @@
 //! takes its filesystem facts from an [`FsProbe`] so every branch is testable
 //! on any platform. The I/O that acts on their output lives elsewhere.
 
+pub mod apply;
 pub mod check;
 pub mod fetch;
 pub mod install_kind;
 pub mod manifest;
 
+pub use apply::{Applied, ApplyError, Stage, UpdatePlan, apply};
 pub use check::{
     CHECK_TIMEOUT, CheckConfig, UpdateEvent, UpdateState, availability_message, failure_message,
     menu_label, run_check, up_to_date_message,
@@ -28,6 +30,7 @@ pub use check::{
 pub use fetch::{CurlFetch, Fetch, FetchError, MemoryFetch};
 pub use install_kind::{FsProbe, InstallKind, ManagedHint, RealFs, classify};
 pub use manifest::{
-    Asset, LATEST_SUMS_URL, ManifestError, ReleaseManifest, UpdateStatus, compare, current_platform,
+    Asset, LATEST_SUMS_URL, ManifestError, ReleaseManifest, UpdateStatus, compare,
+    current_platform, sums_url,
 };
 pub use semver::Version;

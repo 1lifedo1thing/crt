@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::fetch::{Fetch, FetchError};
 use crate::install_kind::InstallKind;
-use crate::manifest::{self, LATEST_SUMS_URL, ReleaseManifest, UpdateStatus};
+use crate::manifest::{self, ReleaseManifest, UpdateStatus};
 
 /// How long to wait for the check. Short: it runs on every launch and nobody
 /// is waiting for its answer.
@@ -152,7 +152,7 @@ pub fn run_check(
         state.last_check = Some(unix.as_secs());
     }
 
-    let text = match fetch.get_text(LATEST_SUMS_URL, CHECK_TIMEOUT) {
+    let text = match fetch.get_text(&manifest::sums_url(), CHECK_TIMEOUT) {
         Ok(text) => text,
         Err(error) => return Some(UpdateEvent::Failed { error }),
     };
