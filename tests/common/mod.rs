@@ -184,6 +184,18 @@ impl TerminalTestHarness {
     }
 }
 
+/// How long a wait may take before the test is declared failed.
+///
+/// Only the failing path pays this: every wait returns the moment its
+/// condition holds, so a generous bound costs a passing test nothing while
+/// stopping a loaded machine from failing a test that is merely slow. The
+/// old value was 2s, which a CI runner building four release targets at
+/// once could miss for a real shell round trip.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bound for waiting on the shell to produce its very first output.
+const FIRST_OUTPUT_TIMEOUT: Duration = Duration::from_millis(750);
+
 /// Test harness for shell integration testing
 pub struct ShellTestHarness {
     shell: ShellTerminal,
@@ -197,7 +209,7 @@ impl ShellTestHarness {
         let shell = ShellTerminal::new(Size::new(cols, lines))?;
         Ok(Self {
             shell,
-            timeout: Duration::from_secs(2),
+            timeout: DEFAULT_TIMEOUT,
         })
     }
 
@@ -206,7 +218,7 @@ impl ShellTestHarness {
         let shell = ShellTerminal::with_shell(Size::new(cols, lines), shell_path)?;
         Ok(Self {
             shell,
-            timeout: Duration::from_secs(2),
+            timeout: DEFAULT_TIMEOUT,
         })
     }
 
@@ -232,23 +244,44 @@ impl ShellTestHarness {
         let start = Instant::now();
         let mut last_change = Instant::now();
 
+        // A blank terminal means the shell has not printed anything yet, so
+        // "nothing new for 50ms" means "not started", not "settled" - and
+        // returning then races the test ahead of the prompt it is waiting
+        // for. Once there is something on screen, silence really does mean
+        // settled, and demanding more output would stall every later call.
+        let mut needs_first_output = self.terminal_is_blank();
+
         loop {
             if self.process_output() {
+                needs_first_output = false;
                 last_change = Instant::now();
             }
 
-            // Stable for 50ms = prompt likely rendered
-            if last_change.elapsed() >= Duration::from_millis(50) {
+            if !needs_first_output && last_change.elapsed() >= Duration::from_millis(50) {
                 break;
             }
 
-            // Safety timeout
-            if start.elapsed() > self.timeout {
+            // A shell that never starts must not cost the full failure
+            // timeout on every call, so waiting for first output is bounded
+            // more tightly than waiting for output to settle.
+            let budget = if needs_first_output {
+                self.timeout.min(FIRST_OUTPUT_TIMEOUT)
+            } else {
+                self.timeout
+            };
+            if start.elapsed() > budget {
                 break;
             }
 
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// Whether the screen is still completely empty.
+    fn terminal_is_blank(&self) -> bool {
+        self.visible_lines()
+            .iter()
+            .all(|line| line.trim().is_empty())
     }
 
     /// Send input to the shell
