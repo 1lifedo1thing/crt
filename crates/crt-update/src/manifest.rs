@@ -32,16 +32,21 @@ const RELEASE_DOWNLOAD_BASE: &str = "https://github.com/colliery-io/crt/releases
 
 /// Where to look for the release description.
 ///
-/// Debug builds honour `CRT_UPDATE_URL`, which is how the download, verify
-/// and swap path gets exercised end to end against a local release (curl
-/// takes `file://` URLs) without publishing one. Release builds always use
-/// GitHub: an environment variable that redirects the updater would be a way
-/// to feed it someone else's bytes.
+/// Debug builds, and release builds explicitly compiled with the
+/// `dev-update-url` feature, honour `CRT_UPDATE_URL`. That is how the
+/// download, verify and swap path is exercised end to end against a local
+/// release (curl takes `file://` URLs) without publishing one, including
+/// against a real optimised binary before a release goes out.
+///
+/// A shipped build ignores it. An environment variable that redirects the
+/// updater would otherwise be a way to feed someone else's bytes to a
+/// program that installs them.
 pub fn sums_url() -> String {
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "dev-update-url"))]
     if let Ok(url) = std::env::var("CRT_UPDATE_URL")
         && !url.is_empty()
     {
+        log::warn!("using CRT_UPDATE_URL={url} instead of the published release");
         return url;
     }
     LATEST_SUMS_URL.to_string()
@@ -122,7 +127,7 @@ impl ReleaseManifest {
                 Some(_) => {}
             }
 
-            let download_url = format!("{RELEASE_DOWNLOAD_BASE}/v{}/{}", asset_version, name);
+            let download_url = asset_url(&asset_version, &name);
             assets.insert(
                 name.clone(),
                 Asset {
@@ -153,6 +158,24 @@ impl ReleaseManifest {
         let (os, arch) = current_platform();
         self.asset_for(os, arch)
     }
+}
+
+/// Where one asset of a release is downloaded from.
+///
+/// Normally the tagged path on GitHub. When [`sums_url`] has been pointed at
+/// a local release, assets are taken from beside that file instead: an
+/// asset list is only meaningful together with the assets it describes, and
+/// resolving them apart would make the override untestable in the one way
+/// that matters.
+pub fn asset_url(version: &Version, name: &str) -> String {
+    #[cfg(any(debug_assertions, feature = "dev-update-url"))]
+    if let Ok(url) = std::env::var("CRT_UPDATE_URL")
+        && let Some((base, _)) = url.rsplit_once('/')
+        && !base.is_empty()
+    {
+        return format!("{base}/{name}");
+    }
+    format!("{RELEASE_DOWNLOAD_BASE}/v{version}/{name}")
 }
 
 /// Split one line into its hash and filename.

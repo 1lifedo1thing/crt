@@ -35,8 +35,20 @@ pub const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 /// or a file listing next to the binary.
 const STAGING_DIR: &str = ".crt-update";
 
-/// Extension given to the outgoing version.
+/// Suffix given to the outgoing version.
 const PREVIOUS_EXT: &str = "old";
+
+/// Where the outgoing version is moved to.
+///
+/// The suffix is appended rather than replacing an extension: a bundle is
+/// `crt.app`, and `with_extension` would turn that into `crt.old` and lose
+/// the `.app`, which macOS treats as a different kind of thing entirely.
+fn previous_path(target: &Path) -> PathBuf {
+    let mut name = target.file_name().unwrap_or_default().to_os_string();
+    name.push(".");
+    name.push(PREVIOUS_EXT);
+    target.with_file_name(name)
+}
 
 /// What the updater is doing, for progress reporting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -325,6 +337,7 @@ fn run_pipeline(
     let staged = locate_payload(&unpacked, layout, target)?;
 
     progress(Stage::Installing);
+    strip_quarantine(&staged);
     let previous = swap(&staged, target)?;
 
     Ok(Applied {
@@ -420,15 +433,51 @@ fn locate_payload(unpacked: &Path, layout: Layout, target: &Path) -> Result<Path
             })
         }
         Layout::AppBundle => {
+            // Check the bundle is whole before it replaces a working one: a
+            // directory named crt.app that macOS will not launch is worse
+            // than no update.
             let bundle = unpacked.join("crt.app");
-            if bundle.join("Contents").join("MacOS").join("crt").is_file() {
-                Ok(bundle)
-            } else {
-                Err(ApplyError::MissingPayload {
-                    expected: "crt.app".to_string(),
-                })
+            let contents = bundle.join("Contents");
+            for required in [
+                contents.join("MacOS").join("crt"),
+                contents.join("Info.plist"),
+            ] {
+                if !required.is_file() {
+                    return Err(ApplyError::MissingPayload {
+                        expected: required
+                            .strip_prefix(unpacked)
+                            .unwrap_or(&required)
+                            .display()
+                            .to_string(),
+                    });
+                }
             }
+            Ok(bundle)
         }
+    }
+}
+
+/// Remove the quarantine attribute from what we are about to install.
+///
+/// Defensive: `curl` does not set it and the app has no
+/// `LSFileQuarantineEnabled`, so it should never be present on something we
+/// downloaded ourselves. It costs one process to be sure, and a bundle that
+/// is quarantined is one Gatekeeper refuses to launch. Never `sudo`: these
+/// are files this user just wrote.
+fn strip_quarantine(path: &Path) {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    match std::process::Command::new("xattr")
+        .args(["-dr", "com.apple.quarantine"])
+        .arg(path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        // A non-zero status here just means there was nothing to remove.
+        Ok(status) => log::debug!("xattr -dr on {} exited {status}", path.display()),
+        Err(e) => log::debug!("could not run xattr on {}: {e}", path.display()),
     }
 }
 
@@ -437,7 +486,7 @@ fn locate_payload(unpacked: &Path, layout: Layout, target: &Path) -> Result<Path
 /// Two renames within one directory. If the second fails, the first is undone
 /// so the user is never left without an install.
 fn swap(staged: &Path, target: &Path) -> Result<PathBuf, ApplyError> {
-    let previous = target.with_extension(PREVIOUS_EXT);
+    let previous = previous_path(target);
 
     // A leftover .old from an update whose first launch never happened.
     if previous.exists() {
@@ -881,6 +930,159 @@ mod tests {
             );
         }
         assert!(!dir.path().join(STAGING_DIR).exists());
+    }
+
+    // ---- macOS app bundle layout -------------------------------------
+    //
+    // These run on Linux too: nothing here needs a real bundle, and the
+    // layout rules should not silently rot on the platform CI mostly uses.
+
+    /// An installed `crt.app` whose executable prints `version`.
+    fn install_bundle(dir: &Path, version: &str) -> PathBuf {
+        let bundle = dir.join("crt.app");
+        let macos = bundle.join("Contents").join("MacOS");
+        fs::create_dir_all(&macos).unwrap();
+        fs::write(bundle.join("Contents").join("Info.plist"), "<plist/>").unwrap();
+        let exe = macos.join("crt");
+        fs::write(&exe, format!("#!/bin/sh\necho {version}\n")).unwrap();
+        set_executable(&exe);
+        bundle
+    }
+
+    /// A release tarball containing a whole `crt.app`.
+    fn bundle_tarball(version: &str, with_plist: bool) -> Vec<u8> {
+        let mut files: Vec<(&str, Vec<u8>)> = vec![(
+            "crt.app/Contents/MacOS/crt",
+            format!("#!/bin/sh\necho {version}\n").into_bytes(),
+        )];
+        if with_plist {
+            files.push(("crt.app/Contents/Info.plist", b"<plist/>".to_vec()));
+        }
+        let borrowed: Vec<(&str, &[u8])> = files.iter().map(|(n, c)| (*n, c.as_slice())).collect();
+        make_tarball(&borrowed)
+    }
+
+    fn bundle_plan(bundle: &Path, tarball: Vec<u8>) -> (UpdatePlan, MemoryFetch) {
+        let asset = Asset {
+            name: "crt-0.1.6-macos-aarch64.tar.gz".to_string(),
+            os: "macos".to_string(),
+            arch: "aarch64".to_string(),
+            sha256: sha256(&tarball),
+            download_url: "https://example.invalid/crt-0.1.6-macos-aarch64.tar.gz".to_string(),
+        };
+        let fetch = MemoryFetch::new().serving("crt-0.1.6", tarball);
+        let plan = UpdatePlan {
+            kind: InstallKind::AppBundle {
+                bundle_root: bundle.to_path_buf(),
+            },
+            asset,
+            version: Version::parse("0.1.6").unwrap(),
+        };
+        (plan, fetch)
+    }
+
+    #[test]
+    fn a_bundle_is_replaced_whole_and_keeps_its_app_extension() {
+        let dir = TempDir::new("bundle");
+        let bundle = install_bundle(dir.path(), "0.1.5");
+        let (plan, fetch) = bundle_plan(&bundle, bundle_tarball("0.1.6", true));
+
+        let applied = apply(&plan, &fetch, &mut no_progress()).expect("applies");
+
+        // Regression: with_extension() would have made this "crt.old" and
+        // dropped the .app, which macOS treats as something else entirely.
+        assert_eq!(applied.previous, dir.path().join("crt.app.old"));
+        assert!(applied.previous.is_dir());
+
+        let exe = bundle.join("Contents").join("MacOS").join("crt");
+        assert!(fs::read_to_string(&exe).unwrap().contains("0.1.6"));
+        assert!(bundle.join("Contents").join("Info.plist").is_file());
+        assert!(
+            fs::read_to_string(applied.previous.join("Contents").join("MacOS").join("crt"))
+                .unwrap()
+                .contains("0.1.5")
+        );
+        assert!(!dir.path().join(STAGING_DIR).exists());
+    }
+
+    #[test]
+    fn a_bundle_without_its_plist_is_refused() {
+        let dir = TempDir::new("noplist");
+        let bundle = install_bundle(dir.path(), "0.1.5");
+        let (plan, fetch) = bundle_plan(&bundle, bundle_tarball("0.1.6", false));
+
+        let err = apply(&plan, &fetch, &mut no_progress()).unwrap_err();
+        assert!(
+            matches!(&err, ApplyError::MissingPayload { expected } if expected.contains("Info.plist")),
+            "{err:?}"
+        );
+        // The working bundle is untouched.
+        let exe = bundle.join("Contents").join("MacOS").join("crt");
+        assert!(fs::read_to_string(&exe).unwrap().contains("0.1.5"));
+        assert!(!dir.path().join("crt.app.old").exists());
+    }
+
+    #[test]
+    fn an_old_bundle_from_a_previous_update_is_replaced() {
+        let dir = TempDir::new("oldbundle");
+        let bundle = install_bundle(dir.path(), "0.1.5");
+        // A .old directory left because a first launch never happened.
+        let stale = dir.path().join("crt.app.old");
+        fs::create_dir_all(stale.join("Contents")).unwrap();
+        fs::write(stale.join("Contents").join("marker"), "0.1.4").unwrap();
+
+        let (plan, fetch) = bundle_plan(&bundle, bundle_tarball("0.1.6", true));
+        apply(&plan, &fetch, &mut no_progress()).expect("applies");
+
+        assert!(!stale.join("Contents").join("marker").exists());
+        assert!(
+            fs::read_to_string(stale.join("Contents").join("MacOS").join("crt"))
+                .unwrap()
+                .contains("0.1.5")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_bundle_in_an_unwritable_directory_fails_without_touching_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new("roapps");
+        // Stand-in for /Applications on a non-admin account.
+        let applications = dir.path().join("Applications");
+        fs::create_dir_all(&applications).unwrap();
+        let bundle = install_bundle(&applications, "0.1.5");
+        let (plan, fetch) = bundle_plan(&bundle, bundle_tarball("0.1.6", true));
+
+        let mut perms = fs::metadata(&applications).unwrap().permissions();
+        perms.set_mode(0o555);
+        fs::set_permissions(&applications, perms).unwrap();
+
+        let err = apply(&plan, &fetch, &mut no_progress()).unwrap_err();
+
+        let mut perms = fs::metadata(&applications).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&applications, perms).unwrap();
+
+        assert!(
+            matches!(err, ApplyError::PermissionDenied { .. }),
+            "{err:?}"
+        );
+        assert!(err.user_message().contains("install script"));
+        let exe = bundle.join("Contents").join("MacOS").join("crt");
+        assert!(fs::read_to_string(&exe).unwrap().contains("0.1.5"));
+        assert!(!applications.join("crt.app.old").exists());
+    }
+
+    #[test]
+    fn the_previous_path_appends_rather_than_replacing_an_extension() {
+        assert_eq!(
+            previous_path(Path::new("/home/dev/.local/bin/crt")),
+            PathBuf::from("/home/dev/.local/bin/crt.old")
+        );
+        assert_eq!(
+            previous_path(Path::new("/Applications/crt.app")),
+            PathBuf::from("/Applications/crt.app.old")
+        );
     }
 
     #[test]
