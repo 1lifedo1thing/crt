@@ -54,8 +54,12 @@ pub enum ManagedHint {
     Pacman,
     Cargo,
     Homebrew,
-    /// Somewhere under a system prefix, or a directory we cannot write to.
+    /// Somewhere under a system prefix.
     SystemPrefix,
+    /// A layout we could otherwise replace, in a directory this user cannot
+    /// write to - a `/Applications` owned by another admin, say. Kept apart
+    /// from `SystemPrefix` because the advice is completely different.
+    NotWritable,
 }
 
 impl ManagedHint {
@@ -66,6 +70,7 @@ impl ManagedHint {
             ManagedHint::Cargo => "cargo install crt",
             ManagedHint::Homebrew => "brew upgrade crt",
             ManagedHint::SystemPrefix => "your system package manager",
+            ManagedHint::NotWritable => "the install script",
         }
     }
 
@@ -76,6 +81,7 @@ impl ManagedHint {
             ManagedHint::Cargo => "cargo",
             ManagedHint::Homebrew => "Homebrew",
             ManagedHint::SystemPrefix => "a package manager",
+            ManagedHint::NotWritable => "an install this user cannot write to",
         }
     }
 }
@@ -125,6 +131,10 @@ impl InstallKind {
         match self {
             InstallKind::AppBundle { .. } => "app bundle",
             InstallKind::UserBinary { .. } => "user install",
+            // Not a package manager's doing, so do not say it was.
+            InstallKind::Managed {
+                hint: ManagedHint::NotWritable,
+            } => "read-only install",
             InstallKind::Managed { .. } => "package manager install",
             InstallKind::Dev => "development build",
         }
@@ -164,14 +174,17 @@ pub fn classify(exe: &Path, probe: &dyn FsProbe) -> InstallKind {
         // A path with no parent is nothing we can rename next to.
         None => {
             return InstallKind::Managed {
-                hint: ManagedHint::SystemPrefix,
+                hint: ManagedHint::NotWritable,
             };
         }
     };
 
     if !probe.is_writable(container) {
+        // The layout is one we could replace; the permissions are not. This
+        // is a non-admin account on a /Applications owned by someone else,
+        // and telling them to use a package manager would be nonsense.
         return InstallKind::Managed {
-            hint: ManagedHint::SystemPrefix,
+            hint: ManagedHint::NotWritable,
         };
     }
 
@@ -410,7 +423,7 @@ mod tests {
         assert_eq!(
             classify_str("/Applications/crt.app/Contents/MacOS/crt", &fs),
             InstallKind::Managed {
-                hint: ManagedHint::SystemPrefix
+                hint: ManagedHint::NotWritable
             }
         );
     }
@@ -421,7 +434,7 @@ mod tests {
         assert_eq!(
             classify_str("/home/dev/.local/bin/crt", &fs),
             InstallKind::Managed {
-                hint: ManagedHint::SystemPrefix
+                hint: ManagedHint::NotWritable
             }
         );
     }
@@ -475,9 +488,33 @@ mod tests {
                     .unwritable("/Users/other/.cargo/bin")
             ),
             InstallKind::Managed {
-                hint: ManagedHint::SystemPrefix
+                hint: ManagedHint::NotWritable
             }
         );
+    }
+
+    /// Regression, found by updating a real bundle in a directory the user
+    /// could not write to: this used to report `SystemPrefix`, so a
+    /// non-admin macOS account was told to update CRT with "your system
+    /// package manager" - which never installed it and cannot update it.
+    #[test]
+    fn an_unwritable_install_is_told_about_the_install_script_not_a_package_manager() {
+        let fs = FakeFs::new().unwritable("/Applications");
+        let kind = classify_str("/Applications/crt.app/Contents/MacOS/crt", &fs);
+        assert_eq!(
+            kind,
+            InstallKind::Managed {
+                hint: ManagedHint::NotWritable
+            }
+        );
+        assert_eq!(kind.upgrade_hint(), Some("the install script"));
+        // `crt --version` must not claim a package manager either.
+        assert_eq!(kind.label(), "read-only install");
+
+        // A genuine package-manager install still names its manager.
+        let system = classify_str("/usr/bin/crt", &FakeFs::new());
+        assert_eq!(system.upgrade_hint(), Some("your system package manager"));
+        assert_eq!(system.label(), "package manager install");
     }
 
     #[test]
@@ -605,6 +642,7 @@ mod tests {
             ManagedHint::Cargo,
             ManagedHint::Homebrew,
             ManagedHint::SystemPrefix,
+            ManagedHint::NotWritable,
         ] {
             assert!(!hint.command().is_empty());
             assert!(!hint.installed_via().is_empty());

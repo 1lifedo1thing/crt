@@ -18,7 +18,7 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 
 use crate::fetch::{Fetch, FetchError};
-use crate::install_kind::InstallKind;
+use crate::install_kind::{InstallKind, ManagedHint};
 use crate::manifest::{self, ReleaseManifest, UpdateStatus};
 
 /// How long to wait for the check. Short: it runs on every launch and nobody
@@ -197,6 +197,12 @@ pub fn availability_message(version: &Version, kind: &InstallKind) -> String {
         InstallKind::AppBundle { .. } | InstallKind::UserBinary { .. } => {
             format!("CRT v{version} is available — update from the menu")
         }
+        // An install we cannot write to is not "managed" by anything; the
+        // only way forward is the install script, so say that instead of
+        // naming a package manager that was never involved.
+        InstallKind::Managed {
+            hint: ManagedHint::NotWritable,
+        } => format!("CRT v{version} is available — re-run the install script to update"),
         InstallKind::Managed { hint } => format!(
             "CRT v{version} is available — installed via {}, run `{}`",
             hint.installed_via(),
@@ -484,6 +490,16 @@ d638933a4e6f32518a86553ed529cd4c0f9d7f6e170fd69393317610a592cdbf  crt-0.1.6-linu
 
         let text = availability_message(&version, &InstallKind::Dev);
         assert!(text.contains("rebuild from source"), "{text}");
+
+        // An install we cannot write to never involved a package manager,
+        // so it must not be told to use one.
+        let unwritable = InstallKind::Managed {
+            hint: ManagedHint::NotWritable,
+        };
+        let text = availability_message(&version, &unwritable);
+        assert!(text.contains("install script"), "{text}");
+        assert!(!text.contains("package manager"), "{text}");
+        assert!(!text.contains("installed via"), "{text}");
 
         assert!(up_to_date_message("0.1.6").contains("0.1.6"));
         assert!(failure_message(&FetchError::Offline).contains("no network"));
