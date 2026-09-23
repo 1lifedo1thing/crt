@@ -135,6 +135,8 @@ pub(crate) struct App {
     /// Whether the check now running was asked for by the user, which
     /// decides whether a boring result is worth a toast.
     pub(crate) update_check_requested: bool,
+    /// First-launch cleanup after an update has run this session.
+    pub(crate) update_finished: bool,
 }
 
 impl App {
@@ -174,6 +176,7 @@ impl App {
             menu_ids: None,
             updates: updates::Updates::new(),
             update_check_requested: false,
+            update_finished: false,
         }
     }
 

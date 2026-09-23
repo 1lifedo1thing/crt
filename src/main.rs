@@ -40,6 +40,16 @@ fn main() {
             env_logger::Env::default().default_filter_or("warn,crt=info"),
         )
         .init();
+        // `--finish-install <assets dir>` is how install.sh hands the
+        // bundled themes and fonts over, so the script and the updater
+        // share one set of rules about overwriting them.
+        if let Some(index) = args.iter().position(|a| a == "--finish-install") {
+            let Some(assets_dir) = args.get(index + 1) else {
+                eprintln!("crt update --finish-install needs an assets directory");
+                std::process::exit(1);
+            };
+            std::process::exit(app::updates::run_finish_install(assets_dir));
+        }
         let check_only = args.iter().any(|a| a == "--check");
         std::process::exit(app::updates::run_cli(check_only));
     }

@@ -503,6 +503,12 @@ impl ApplicationHandler<WakeReason> for App {
         // The update check waits for the first frame to be on screen: it
         // resolves a hostname, and nobody should pay for that at startup.
         if self.windows.values().any(|w| w.render.frame_count > 0) {
+            // A frame is on screen, so this build starts: an update from
+            // last time can drop its copy of the previous version.
+            if !self.update_finished {
+                self.update_finished = true;
+                super::updates::finish_first_launch(&self.updates.kind);
+            }
             let config = self.config.updates.clone();
             let state_path = Self::update_state_path();
             self.updates

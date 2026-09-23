@@ -23,6 +23,7 @@ use semver::Version;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::assets::{AssetManifest, RefreshReport, refresh_assets};
 use crate::fetch::{Fetch, FetchError};
 use crate::install_kind::InstallKind;
 use crate::manifest::Asset;
@@ -152,6 +153,9 @@ pub struct UpdatePlan {
     pub kind: InstallKind,
     pub asset: Asset,
     pub version: Version,
+    /// Config directory to refresh bundled themes and fonts into. `None`
+    /// installs the binary only.
+    pub config_dir: Option<PathBuf>,
 }
 
 /// The result of a successful update.
@@ -161,6 +165,8 @@ pub struct Applied {
     /// Where the outgoing version was moved to. Kept until the new version
     /// has started once.
     pub previous: PathBuf,
+    /// What the bundled asset refresh did.
+    pub assets: RefreshReport,
 }
 
 /// Which layout is being replaced. The pipeline is identical; only what we
@@ -340,10 +346,56 @@ fn run_pipeline(
     strip_quarantine(&staged);
     let previous = swap(&staged, target)?;
 
+    // Installing the binary is only half an upgrade; the release also
+    // carries the themes and fonts that belong with it. This happens after
+    // the swap, so a failed install never disturbs the config directory.
+    let assets = refresh_bundled_assets(plan, layout, &unpacked, target);
+
     Ok(Applied {
         version: plan.version.clone(),
         previous,
+        assets,
     })
+}
+
+/// Copy the release's bundled assets into the config directory.
+///
+/// Where they are depends on what was just moved: a bare binary leaves the
+/// rest of the archive in staging, while a bundle takes its `Resources`
+/// with it to the install location.
+fn refresh_bundled_assets(
+    plan: &UpdatePlan,
+    layout: Layout,
+    unpacked: &Path,
+    target: &Path,
+) -> RefreshReport {
+    let Some(config_dir) = plan.config_dir.as_deref() else {
+        return RefreshReport::default();
+    };
+
+    let bundled = match layout {
+        Layout::SingleBinary => unpacked.join("assets"),
+        Layout::AppBundle => target.join("Contents").join("Resources").join("assets"),
+    };
+
+    let manifest_path = AssetManifest::path(config_dir);
+    let mut manifest = AssetManifest::load(&manifest_path);
+    let version = plan.version.to_string();
+
+    match refresh_assets(&bundled, config_dir, &mut manifest, &version) {
+        Ok(report) => {
+            if let Err(e) = manifest.save(&manifest_path) {
+                log::warn!("could not save the asset manifest: {e}");
+            }
+            report
+        }
+        Err(e) => {
+            // The binary is already installed and working; stale themes are
+            // not worth reporting as a failed update.
+            log::warn!("could not refresh bundled assets: {e}");
+            RefreshReport::default()
+        }
+    }
 }
 
 fn hex(bytes: &[u8; 32]) -> String {
@@ -635,6 +687,7 @@ mod tests {
             },
             asset,
             version: Version::parse("0.1.6").unwrap(),
+            config_dir: None,
         };
         (plan, fetch)
     }
@@ -738,6 +791,7 @@ mod tests {
             kind: InstallKind::UserBinary { path: bin.clone() },
             asset,
             version: Version::parse("0.1.6").unwrap(),
+            config_dir: None,
         };
 
         let err = apply(&plan, &fetch, &mut no_progress()).unwrap_err();
@@ -764,6 +818,7 @@ mod tests {
             kind: InstallKind::UserBinary { path: bin.clone() },
             asset,
             version: Version::parse("0.1.6").unwrap(),
+            config_dir: None,
         };
 
         let err = apply(&plan, &fetch, &mut no_progress()).unwrap_err();
@@ -977,6 +1032,7 @@ mod tests {
             },
             asset,
             version: Version::parse("0.1.6").unwrap(),
+            config_dir: None,
         };
         (plan, fetch)
     }
@@ -1083,6 +1139,74 @@ mod tests {
             previous_path(Path::new("/Applications/crt.app")),
             PathBuf::from("/Applications/crt.app.old")
         );
+    }
+
+    #[test]
+    fn an_update_also_brings_the_releases_themes_but_keeps_edited_ones() {
+        let dir = TempDir::new("assets");
+        let bin = install(dir.path(), "0.1.5");
+        let config = dir.path().join("config");
+        fs::create_dir_all(config.join("themes")).unwrap();
+        // One theme the user has made their own, one they have not touched.
+        fs::write(config.join("themes").join("dracula.css"), "my dracula").unwrap();
+
+        let tarball = make_tarball(&[
+            ("crt", b"#!/bin/sh\necho 0.1.6\n"),
+            ("assets/themes/dracula.css", b"bundled dracula v2"),
+            ("assets/themes/solarized.css", b"new in this release"),
+        ]);
+        let asset = Asset {
+            name: "crt-0.1.6-linux-x86_64.tar.gz".to_string(),
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            sha256: sha256(&tarball),
+            download_url: "https://example.invalid/crt-0.1.6-linux-x86_64.tar.gz".to_string(),
+        };
+        let fetch = MemoryFetch::new().serving("crt-0.1.6", tarball);
+        let plan = UpdatePlan {
+            kind: InstallKind::UserBinary { path: bin.clone() },
+            asset,
+            version: Version::parse("0.1.6").unwrap(),
+            config_dir: Some(config.clone()),
+        };
+
+        let applied = apply(&plan, &fetch, &mut no_progress()).expect("applies");
+
+        // The binary was replaced...
+        assert!(fs::read_to_string(&bin).unwrap().contains("0.1.6"));
+        // ...the new theme arrived...
+        assert_eq!(
+            fs::read_to_string(config.join("themes").join("solarized.css")).unwrap(),
+            "new in this release"
+        );
+        // ...and the edited one was left alone and reported.
+        assert_eq!(
+            fs::read_to_string(config.join("themes").join("dracula.css")).unwrap(),
+            "my dracula"
+        );
+        assert_eq!(
+            applied.assets.skipped,
+            vec!["themes/dracula.css".to_string()]
+        );
+        assert!(
+            applied
+                .assets
+                .written
+                .contains(&"themes/solarized.css".to_string())
+        );
+        // The manifest is saved so the next release can update what it wrote.
+        assert!(crate::assets::AssetManifest::path(&config).is_file());
+    }
+
+    #[test]
+    fn an_update_without_a_config_dir_installs_the_binary_only() {
+        let dir = TempDir::new("noconfig");
+        let bin = install(dir.path(), "0.1.5");
+        let (plan, fetch) = plan_for(&bin, b"#!/bin/sh\necho 0.1.6\n");
+        assert!(plan.config_dir.is_none());
+
+        let applied = apply(&plan, &fetch, &mut no_progress()).expect("applies");
+        assert!(applied.assets.is_empty());
     }
 
     #[test]

@@ -17,12 +17,14 @@
 //! on any platform. The I/O that acts on their output lives elsewhere.
 
 pub mod apply;
+pub mod assets;
 pub mod check;
 pub mod fetch;
 pub mod install_kind;
 pub mod manifest;
 
 pub use apply::{Applied, ApplyError, Stage, UpdatePlan, apply};
+pub use assets::{AssetManifest, RefreshReport, refresh_assets};
 pub use check::{
     CHECK_TIMEOUT, CheckConfig, UpdateEvent, UpdateState, availability_message, failure_message,
     menu_label, run_check, up_to_date_message,

@@ -469,13 +469,102 @@ fn plan_update(fetch: &dyn Fetch, kind: &InstallKind) -> Result<UpdatePlan, Appl
         kind: kind.clone(),
         version: release.version,
         asset,
+        config_dir: crate::config::Config::config_dir(),
     })
+}
+
+/// Finish an upgrade on the first launch of the new version.
+///
+/// Only one job is left by then: removing the copy of the previous version
+/// that the update kept. It is deliberately not deleted at install time,
+/// because until the new binary has actually started it is the way back.
+/// Reaching this point means it has started.
+pub(crate) fn finish_first_launch(kind: &InstallKind) {
+    let Some(config_dir) = crate::config::Config::config_dir() else {
+        return;
+    };
+    let state_path = UpdateState::path(&config_dir);
+    let mut state = UpdateState::load(&state_path);
+    let running = running_version();
+
+    if state.last_finished_version.as_deref() == Some(running.as_str()) {
+        return;
+    }
+
+    if let Some(target) = kind.swap_target() {
+        let previous = previous_version_path(target);
+        if previous.exists() {
+            let removed = if previous.is_dir() {
+                std::fs::remove_dir_all(&previous)
+            } else {
+                std::fs::remove_file(&previous)
+            };
+            match removed {
+                Ok(()) => log::info!("removed the previous version at {}", previous.display()),
+                Err(e) => log::warn!("could not remove {}: {e}", previous.display()),
+            }
+        }
+    }
+
+    state.last_finished_version = Some(running);
+    if let Err(e) = state.save(&state_path) {
+        log::warn!("could not record the finished version: {e}");
+    }
+}
+
+/// Mirror of the updater's naming for the retired copy.
+fn previous_version_path(target: &std::path::Path) -> PathBuf {
+    let mut name = target.file_name().unwrap_or_default().to_os_string();
+    name.push(".old");
+    target.with_file_name(name)
 }
 
 /// Run `crt update` without a window.
 ///
 /// Exit codes are meant for scripts: 0 did something, 2 nothing to do,
 /// 1 failed.
+/// Refresh the config directory from a bundled asset tree.
+///
+/// `scripts/install.sh` calls this after copying the binary, so that the
+/// script and the in-app updater share one implementation and one set of
+/// rules about which files may be overwritten.
+pub(crate) fn run_finish_install(assets_dir: &str) -> i32 {
+    let Some(config_dir) = crate::config::Config::config_dir() else {
+        eprintln!("Could not determine the config directory");
+        return 1;
+    };
+    let manifest_path = crt_update::AssetManifest::path(&config_dir);
+    let mut manifest = crt_update::AssetManifest::load(&manifest_path);
+
+    match crt_update::refresh_assets(
+        std::path::Path::new(assets_dir),
+        &config_dir,
+        &mut manifest,
+        &running_version(),
+    ) {
+        Ok(report) => {
+            if let Err(e) = manifest.save(&manifest_path) {
+                eprintln!("Could not save the asset manifest: {e}");
+                return 1;
+            }
+            println!(
+                "{} file(s) written, {} unchanged, {} kept as you edited them",
+                report.written.len(),
+                report.unchanged,
+                report.skipped.len()
+            );
+            for path in &report.skipped {
+                println!("  kept: {path}");
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("Could not refresh bundled assets: {e}");
+            1
+        }
+    }
+}
+
 pub(crate) fn run_cli(check_only: bool) -> i32 {
     let running = running_version();
     let kind = current_install_kind();
