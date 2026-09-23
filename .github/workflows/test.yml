@@ -1,4 +1,4 @@
-name: CI
+        run: cargo test --workspace --lib --bins --tests ${{ runner.os == 'Linux' && '-- --skip visual_' || '' }}name: CI
 
 on:
   push:
@@ -57,10 +57,15 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build --all-targets
+        run: cargo build --workspace --all-targets
 
+      # --workspace, or only the root package is tested: the member crates
+      # (crt-core, crt-renderer, crt-theme, crt-update) hold well over half
+      # the suite and were silently never run here.
+      # --lib --bins --tests rather than --all-targets: the latter also runs
+      # the criterion benches, which reject the --skip argument below.
       - name: Run tests
-        run: cargo test --all-targets ${{ runner.os == 'Linux' && '-- --skip visual_' || '' }}
+        run: cargo test --workspace --lib --bins --tests ${{ runner.os == 'Linux' && '-- --skip visual_' || '' }}
 
   visual-tests:
     # Visual/golden tests only run on macOS where golden images were generated
@@ -113,10 +118,10 @@ jobs:
 
       - name: Generate coverage report
         # --ignore-run-fail: visual tests may fail on Linux (golden images from macOS)
-        run: cargo llvm-cov --all-targets --ignore-run-fail --lcov --output-path lcov.info
+        run: cargo llvm-cov --workspace --all-targets --ignore-run-fail --lcov --output-path lcov.info
 
       - name: Print coverage summary
-        run: cargo llvm-cov --all-targets --no-run
+        run: cargo llvm-cov --workspace --all-targets --no-run
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v4
