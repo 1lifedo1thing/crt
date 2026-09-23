@@ -962,6 +962,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crt-update"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "semver 1.0.27",
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "crunchy"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
