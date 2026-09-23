@@ -374,7 +374,16 @@ fn refresh_bundled_assets(
     };
 
     let bundled = match layout {
-        Layout::SingleBinary => unpacked.join("assets"),
+        Layout::SingleBinary => {
+            // Same asymmetry as the payload: the Linux archive has assets at
+            // its root, the macOS one carries them inside the bundle.
+            let at_root = unpacked.join("assets");
+            if at_root.is_dir() {
+                at_root
+            } else {
+                bundle_resources(unpacked).join("assets")
+            }
+        }
         Layout::AppBundle => target.join("Contents").join("Resources").join("assets"),
     };
 
@@ -464,6 +473,21 @@ fn check_safe_path(path: &Path) -> Result<(), ApplyError> {
     Ok(())
 }
 
+/// `<unpacked>/crt.app/Contents/MacOS/crt`, the executable inside a bundle
+/// the archive happens to carry.
+fn bundled_executable(unpacked: &Path) -> PathBuf {
+    bundle_contents(unpacked).join("MacOS").join("crt")
+}
+
+/// `<unpacked>/crt.app/Contents/Resources`.
+fn bundle_resources(unpacked: &Path) -> PathBuf {
+    bundle_contents(unpacked).join("Resources")
+}
+
+fn bundle_contents(unpacked: &Path) -> PathBuf {
+    unpacked.join("crt.app").join("Contents")
+}
+
 /// Find the thing to install inside the unpacked archive.
 fn locate_payload(unpacked: &Path, layout: Layout, target: &Path) -> Result<PathBuf, ApplyError> {
     match layout {
@@ -475,7 +499,15 @@ fn locate_payload(unpacked: &Path, layout: Layout, target: &Path) -> Result<Path
                 .file_name()
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("crt"));
-            for candidate in [unpacked.join("crt"), unpacked.join(&name)] {
+            for candidate in [
+                unpacked.join("crt"),
+                unpacked.join(&name),
+                // macOS ships an app bundle even to someone running a bare
+                // binary — a developer who copied their own build into
+                // ~/.local/bin, say. Take the executable out of the bundle
+                // rather than failing after a 16 MB download.
+                bundled_executable(unpacked),
+            ] {
                 if candidate.is_file() {
                     return Ok(candidate);
                 }
@@ -1196,6 +1228,52 @@ mod tests {
         );
         // The manifest is saved so the next release can update what it wrote.
         assert!(crate::assets::AssetManifest::path(&config).is_file());
+    }
+
+    /// Regression, found by updating a bare binary from the real v0.1.6
+    /// release: on macOS every release asset is an app bundle, so a bare
+    /// binary install downloaded 16 MB and then failed with "the archive did
+    /// not contain crt". Take the executable and the assets out of the
+    /// bundle instead.
+    #[test]
+    fn a_bare_binary_can_be_updated_from_an_archive_containing_a_bundle() {
+        let dir = TempDir::new("frombundle");
+        let bin = install(dir.path(), "0.1.5");
+        let config = dir.path().join("config");
+
+        let tarball = make_tarball(&[
+            ("crt.app/Contents/MacOS/crt", b"#!/bin/sh\necho 0.1.6\n"),
+            ("crt.app/Contents/Info.plist", b"<plist/>"),
+            (
+                "crt.app/Contents/Resources/assets/themes/solarized.css",
+                b"new theme",
+            ),
+        ]);
+        let asset = Asset {
+            name: "crt-0.1.6-macos-aarch64.tar.gz".to_string(),
+            os: "macos".to_string(),
+            arch: "aarch64".to_string(),
+            sha256: sha256(&tarball),
+            download_url: "https://example.invalid/crt-0.1.6-macos-aarch64.tar.gz".to_string(),
+        };
+        let fetch = MemoryFetch::new().serving("crt-0.1.6", tarball);
+        let plan = UpdatePlan {
+            kind: InstallKind::UserBinary { path: bin.clone() },
+            asset,
+            version: Version::parse("0.1.6").unwrap(),
+            config_dir: Some(config.clone()),
+        };
+
+        let applied = apply(&plan, &fetch, &mut no_progress()).expect("applies");
+
+        // The binary from inside the bundle is now the install...
+        assert!(fs::read_to_string(&bin).unwrap().contains("0.1.6"));
+        assert_eq!(applied.previous, dir.path().join("crt.old"));
+        // ...and its themes came from the bundle's Resources.
+        assert_eq!(
+            fs::read_to_string(config.join("themes").join("solarized.css")).unwrap(),
+            "new theme"
+        );
     }
 
     #[test]
