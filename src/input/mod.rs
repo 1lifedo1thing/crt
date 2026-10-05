@@ -679,15 +679,52 @@ pub fn alternate_scroll_active(shell: &ShellTerminal) -> bool {
     mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL)
 }
 
-/// Check if the terminal has mouse reporting enabled
-pub fn should_report_mouse(shell: &ShellTerminal) -> bool {
-    let mode = shell.terminal().inner().mode();
+/// Whether a terminal mode has any kind of mouse reporting enabled.
+fn mode_reports_mouse(mode: TermMode) -> bool {
     mode.intersects(
         TermMode::MOUSE_REPORT_CLICK
             | TermMode::MOUSE_DRAG
             | TermMode::MOUSE_MOTION
             | TermMode::SGR_MOUSE,
     )
+}
+
+/// Check if the terminal has mouse reporting enabled
+pub fn should_report_mouse(shell: &ShellTerminal) -> bool {
+    mode_reports_mouse(shell.terminal().mode())
+}
+
+/// How a mouse button event is split between the application and local
+/// text selection. Both can be true at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MouseButtonPolicy {
+    /// Encode the event as an xterm mouse report and send it to the app.
+    pub report: bool,
+    /// Run local text selection for the event.
+    pub select: bool,
+}
+
+/// Decide whether a button event is reported to the app, used for local
+/// selection, or both.
+///
+/// Shift always forces local selection. Otherwise an app that asked for
+/// mouse events gets them. An app that only enabled click reporting
+/// (DECSET 1000, e.g. Claude Code) never sees a drag, so local selection
+/// runs alongside the report there and a plain drag still selects text.
+/// Apps that track drags or motion (DECSET 1002 / 1003, e.g. tmux or vim)
+/// keep the mouse to themselves.
+pub fn mouse_button_policy(mode: TermMode, shift: bool) -> MouseButtonPolicy {
+    if shift || !mode_reports_mouse(mode) {
+        return MouseButtonPolicy {
+            report: false,
+            select: true,
+        };
+    }
+    let tracks_drag = mode.intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION);
+    MouseButtonPolicy {
+        report: true,
+        select: !tracks_drag,
+    }
 }
 
 /// Check if the terminal is tracking mouse motion
@@ -1178,6 +1215,8 @@ pub fn screen_to_cell_clamped(state: &WindowState, x: f32, y: f32) -> (usize, us
 ///
 /// `mods` supplies the xterm modifier bits for reports; while Shift is held
 /// mouse reporting is bypassed so local selection works under tmux/vim.
+/// See [`mouse_button_policy`] for when an event is reported, selected
+/// locally, or both.
 /// Returns true if the event was handled (was in terminal area)
 pub fn handle_terminal_mouse_button(
     state: &mut WindowState,
@@ -1214,8 +1253,9 @@ pub fn handle_terminal_mouse_button(
         return false;
     };
 
-    // Check if we should report mouse events to the terminal
-    if should_report_mouse(shell) && !mods.shift_key() {
+    let policy = mouse_button_policy(shell.terminal().mode(), mods.shift_key());
+
+    if policy.report {
         // Don't report a left release whose press never reached the app
         // (e.g. the press landed on the tab bar).
         let report = pressed || button != MOUSE_BUTTON_LEFT || state.interaction.mouse_pressed;
@@ -1236,15 +1276,17 @@ pub fn handle_terminal_mouse_button(
             state.interaction.mouse_pressed = pressed;
         }
 
-        state.render.dirty = true;
-        state.window.request_redraw();
-        return true;
-    }
-
-    // Local selection handling (mouse mode not enabled)
-    if button != MOUSE_BUTTON_LEFT {
+        if !policy.select || button != MOUSE_BUTTON_LEFT {
+            state.render.dirty = true;
+            state.window.request_redraw();
+            return true;
+        }
+        // Click-only reporting: fall through so a plain drag selects text.
+    } else if button != MOUSE_BUTTON_LEFT {
         return false; // Only left button for selection
     }
+
+    // Local selection handling
 
     if pressed {
         // Determine click count for multi-click selection
@@ -2555,6 +2597,73 @@ mod tests {
         // col+33 and row+33 should be clamped to 255
         assert_eq!(seq[4], 255);
         assert_eq!(seq[5], 255);
+    }
+
+    // ── Mouse button policy tests ──────────────────────────────────
+
+    #[test]
+    fn policy_no_mouse_mode_selects_locally() {
+        let p = mouse_button_policy(TermMode::empty(), false);
+        assert_eq!(
+            p,
+            MouseButtonPolicy {
+                report: false,
+                select: true
+            }
+        );
+    }
+
+    #[test]
+    fn policy_click_only_reports_and_selects() {
+        // DECSET 1000 + 1006, as Claude Code enables: the app sees the
+        // click but a plain drag still selects text.
+        let mode = TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE;
+        let p = mouse_button_policy(mode, false);
+        assert_eq!(
+            p,
+            MouseButtonPolicy {
+                report: true,
+                select: true
+            }
+        );
+    }
+
+    #[test]
+    fn policy_drag_tracking_reports_only() {
+        let mode = TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_DRAG | TermMode::SGR_MOUSE;
+        let p = mouse_button_policy(mode, false);
+        assert_eq!(
+            p,
+            MouseButtonPolicy {
+                report: true,
+                select: false
+            }
+        );
+    }
+
+    #[test]
+    fn policy_motion_tracking_reports_only() {
+        let p = mouse_button_policy(TermMode::MOUSE_MOTION, false);
+        assert_eq!(
+            p,
+            MouseButtonPolicy {
+                report: true,
+                select: false
+            }
+        );
+    }
+
+    #[test]
+    fn policy_shift_bypasses_drag_tracking() {
+        let mode = TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_DRAG;
+        let p = mouse_button_policy(mode, true);
+        assert_eq!(
+            p,
+            MouseButtonPolicy {
+                report: false,
+                select: true
+            }
+        );
     }
 
     // ── URL merge tests ────────────────────────────────────────────

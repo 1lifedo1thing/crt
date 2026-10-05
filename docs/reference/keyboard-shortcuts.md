@@ -106,6 +106,8 @@ These shortcuts are always active and cannot be changed in `config.toml`.
 |---|---|
 | `Cmd+Click` on URL | Open URL in default browser |
 | Double-click tab title | Begin inline tab rename |
+| Drag | Select text. When an app only reports clicks (e.g. Claude Code) the click is also sent to the app |
+| `Shift+Drag` | Select text while an app tracks mouse drags or motion (tmux, vim) |
 | Right-click terminal | Open context menu (includes theme switching) |
 
 ---

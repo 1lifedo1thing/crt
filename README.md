@@ -146,6 +146,7 @@ Create your own at `~/.config/crt/themes/mytheme.css` and set `name = "mytheme"`
 | Cmd+C | Copy selection |
 | Cmd+V | Paste |
 | Cmd+A | Select all |
+| Shift+Drag | Select text while an app tracks the mouse (tmux, vim) |
 | Cmd+K | Clear scrollback |
 | Cmd+, | Open settings (config file) |
 | Cmd+Option+P | Toggle profiling |

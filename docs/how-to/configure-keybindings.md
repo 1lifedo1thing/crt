@@ -250,6 +250,7 @@ The following shortcuts are built into CRT and cannot be changed via config:
 | Cmd+Click | Open URL |
 | Double-click tab | Rename tab |
 | Right-click | Context menu |
+| Shift+Drag | Select text while an app tracks the mouse |
 
 ## Troubleshooting
 
