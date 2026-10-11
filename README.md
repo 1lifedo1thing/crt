@@ -41,7 +41,7 @@ curl -sSL https://raw.githubusercontent.com/colliery-io/crt/main/scripts/install
 
 CRT tells you when a new release is out and can install it for you, from
 the menu or with `crt update` — your shells keep running. See
-[Updating CRT](docs/how-to/update.md) for what it checks, how to turn the
+[Updating CRT](https://colliery-io.github.io/crt/how-to/update/) for what it checks, how to turn the
 check off, and how to go back a version.
 
 > Windows support coming [Soon™](https://wowpedia.fandom.com/wiki/Soon)
@@ -56,9 +56,20 @@ check off, and how to go back a version.
    ```
 3. Save and press `Cmd+N` for a new window with your theme
 
+## Documentation
+
+The docs are at https://colliery-io.github.io/crt/: tutorials, how-to
+guides, reference and explanation.
+
+Their source is in `docs/`. To work on them, with Node 22 or later:
+
+```sh
+cd docs && npm ci && npm run dev
+```
+
 ## Themes
 
-CRT includes 16 built-in themes. See the [Theme Gallery](docs/gallery/README.md) for screenshots.
+CRT includes 16 built-in themes. See the [Theme Gallery](https://colliery-io.github.io/crt/reference/gallery/) for screenshots.
 
 | Theme | Description |
 |-------|-------------|
@@ -83,9 +94,9 @@ CRT includes 16 built-in themes. See the [Theme Gallery](docs/gallery/README.md)
 
 Create your own at `~/.config/crt/themes/mytheme.css` and set `name = "mytheme"` in config.
 
-- [How to Create a Custom Theme](docs/how-to/create-custom-theme.md)
-- [CSS Properties Reference](docs/reference/theme-css-properties.md)
-- [Full Theming Guide](docs/theming.md)
+- [How to Create a Custom Theme](https://colliery-io.github.io/crt/how-to/create-custom-theme/)
+- [CSS Properties Reference](https://colliery-io.github.io/crt/reference/theme-css-properties/)
+- [Full Theming Guide](https://colliery-io.github.io/crt/explanation/theming/)
 
 ---
 
@@ -227,7 +238,7 @@ Themes with multiple effects use more resources. Try `minimal` or `dracula` for 
 <details>
 <summary>Reactive themes not working</summary>
 
-See the [Troubleshooting Guide](docs/troubleshooting.md) for shell integration setup.
+See the [Troubleshooting Guide](https://colliery-io.github.io/crt/how-to/troubleshooting/) for shell integration setup.
 
 </details>
 

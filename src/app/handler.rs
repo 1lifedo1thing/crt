@@ -549,7 +549,8 @@ impl ApplicationHandler<WakeReason> for App {
         //
         // Redraws are capped at ~60 fps for the focused window and 10 fps for
         // the others (this cap is what keeps Metal's drawable allocations
-        // bounded on macOS; see the review notes in docs/explanation). Unlike
+        // bounded on macOS; see the review notes in
+        // docs/src/content/docs/explanation). Unlike
         // a polling loop, the wait below actually sleeps: PTY output and
         // watcher events wake us through a user event, and animations wake us
         // at their next deadline.
