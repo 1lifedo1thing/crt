@@ -17,9 +17,6 @@ export default defineConfig({
 		starlight({
 			title: PROJECT,
 			favicon: '/favicon.png',
-			// Keep a first-line comment in a code block as code. Otherwise Expressive
-			// Code makes a comment with a path the block's title, and drops it.
-			expressiveCode: { frames: { extractFileNameFromCode: false } },
 			social: [{ icon: 'github', label: 'GitHub', href: REPO }],
 			plugins: [starlightAurora({ hyper: true })],
 			sidebar: [
