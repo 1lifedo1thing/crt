@@ -37,7 +37,7 @@ const DEFAULT_CONFIG_TEMPLATE: &str = r#"# CRT configuration
 # open_file_command = "code -g {file}:{line}:{col}"
 
 # Custom keybindings replace the defaults entirely — see
-# docs/how-to/configure-keybindings.md
+# https://colliery-io.github.io/crt/how-to/configure-keybindings/
 # [[keybindings.bindings]]
 # key = "t"
 # mods = ["super"]

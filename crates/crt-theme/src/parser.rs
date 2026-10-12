@@ -4617,8 +4617,8 @@ mod tests {
     // ------------------------------------------------------------------
 
     /// `text-shadow: none` in an event block is straight from
-    /// docs/how-to/set-up-reactive-themes.md. It used to be ignored; the
-    /// rewrite made it reject the whole theme.
+    /// docs/src/content/docs/how-to/set-up-reactive-themes.md. It used to be
+    /// ignored; the rewrite made it reject the whole theme.
     #[test]
     fn regression_event_block_text_shadow_none_keeps_the_theme() {
         let theme = parse_theme(
